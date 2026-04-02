@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use std::io::BufRead;
-use zcash_key_derive::{derive_keys, PoolViewingKeys, ZcashNetwork};
+use zcash_key_derive::{derive_keys_with_options, DeriveOptions, PoolViewingKeys, ZcashNetwork};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Network {
@@ -20,14 +20,15 @@ enum Format {
     about = "Derive all Zcash viewing keys from a BIP-39 mnemonic",
     long_about = "\
 Derives for a given account:
-  - UFVK     Unified Full Viewing Key (ZIP-316, all pools)
+  - UFVK     Unified Full Viewing Key (ZIP-316, all pools by default)
   - xpub     Transparent extended public key (BIP-32)
   - sapling  FVK / IVK / OVK (hex)
   - orchard  FVK / IVK / OVK (hex)
 
 No spending key material is exposed.
 Use --account to target a specific ZIP-32 account index (default: 0).
-Use --xpub-path to override the transparent derivation path independently."
+Use --xpub-path to override the transparent derivation path independently.
+Use --no-sapling to omit the Sapling FVK from the generated UFVK."
 )]
 struct Args {
     /// BIP-39 mnemonic phrase (reads from stdin if not provided)
@@ -46,6 +47,11 @@ struct Args {
     /// Target network
     #[arg(long, value_enum, default_value_t = Network::Mainnet)]
     network: Network,
+
+    /// Exclude the Sapling FVK from the generated UFVK.
+    /// Sapling pool keys are still derived and printed separately.
+    #[arg(long)]
+    no_sapling: bool,
 
     /// Output format
     #[arg(long, value_enum, default_value_t = Format::Human)]
@@ -80,7 +86,15 @@ fn main() {
         Network::Testnet => ZcashNetwork::Testnet,
     };
 
-    match derive_keys(&mnemonic, args.account, network, args.xpub_path.as_deref()) {
+    match derive_keys_with_options(
+        &mnemonic,
+        args.account,
+        network,
+        args.xpub_path.as_deref(),
+        DeriveOptions {
+            include_sapling_in_ufvk: !args.no_sapling,
+        },
+    ) {
         Ok(keys) => match args.format {
             Format::Human => {
                 println!("ufvk      : {}", keys.ufvk);

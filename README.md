@@ -20,6 +20,7 @@ Derives all Zcash viewing keys for a given account from a BIP-39 mnemonic:
 - **Orchard** — FVK / IVK / OVK (hex, external scope)
 
 No spending key material is exposed.
+Pass `--no-sapling` to omit the Sapling FVK from the generated UFVK while still deriving Sapling pool keys separately.
 
 ### Usage
 
@@ -31,6 +32,7 @@ Options:
   --account <N>           ZIP-32 account index [default: 0]
   --xpub-path <PATH>      BIP-32 path for transparent xpub [default: m/44'/133'/{account}']
   --network <NET>         mainnet | testnet [default: mainnet]
+  --no-sapling            Exclude the Sapling FVK from the generated UFVK
   --format <FMT>          human | json [default: human]
   -h, --help
 ```
@@ -46,6 +48,9 @@ zcash-key-derive --mnemonic "..." --account 1 --format json
 
 # Testnet with custom transparent derivation path
 zcash-key-derive --mnemonic "..." --network testnet --xpub-path "m/44'/133'/5'"
+
+# Build a UFVK without the Sapling component
+zcash-key-derive --mnemonic "..." --no-sapling
 
 # Pipe mnemonic from a file
 cat mnemonic.txt | zcash-key-derive --network testnet --format json

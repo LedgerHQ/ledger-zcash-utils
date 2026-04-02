@@ -8,6 +8,7 @@ use bitcoin::{
 };
 use orchard::keys::{FullViewingKey as OrchardFvk, Scope as OrchardScope};
 use sapling_crypto::zip32::DiversifiableFullViewingKey as SaplingDfvk;
+use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_protocol::consensus::Network as ZcashConsensusNetwork;
 use zip32::{AccountId, Scope};
@@ -37,7 +38,7 @@ pub struct PoolViewingKeys {
 #[derive(Debug, Clone)]
 pub struct DerivedKeys {
     /// Bech32m Unified Full Viewing Key (HRP "uview1" / "uviewtest1").
-    /// Bundles transparent + Sapling + Orchard FVKs per ZIP-316.
+    /// Bundles transparent + Orchard FVKs, and Sapling by default, per ZIP-316.
     pub ufvk: String,
     /// BIP-32 transparent extended public key (Base58Check).
     pub xpub: String,
@@ -47,6 +48,21 @@ pub struct DerivedKeys {
     pub sapling: Option<PoolViewingKeys>,
     /// Orchard pool viewing keys (None if not available for this account).
     pub orchard: Option<PoolViewingKeys>,
+}
+
+/// Options that control UFVK composition during key derivation.
+#[derive(Debug, Clone, Copy)]
+pub struct DeriveOptions {
+    /// Whether to include the Sapling FVK inside the generated UFVK.
+    pub include_sapling_in_ufvk: bool,
+}
+
+impl Default for DeriveOptions {
+    fn default() -> Self {
+        Self {
+            include_sapling_in_ufvk: true,
+        }
+    }
 }
 
 fn extract_sapling(dfvk: &SaplingDfvk) -> PoolViewingKeys {
@@ -66,7 +82,11 @@ fn extract_orchard(fvk: &OrchardFvk) -> PoolViewingKeys {
     let ivk = hex::encode(fvk.to_ivk(OrchardScope::External).to_bytes());
     // OVK (external scope): 32 bytes
     let ovk = hex::encode(fvk.to_ovk(OrchardScope::External).as_ref());
-    PoolViewingKeys { fvk: fvk_hex, ivk, ovk }
+    PoolViewingKeys {
+        fvk: fvk_hex,
+        ivk,
+        ovk,
+    }
 }
 
 /// Derive all viewing keys from a BIP-39 mnemonic.
@@ -85,6 +105,23 @@ pub fn derive_keys(
     network: ZcashNetwork,
     xpub_path: Option<&str>,
 ) -> Result<DerivedKeys, Error> {
+    derive_keys_with_options(
+        mnemonic,
+        account,
+        network,
+        xpub_path,
+        DeriveOptions::default(),
+    )
+}
+
+/// Derive all viewing keys from a BIP-39 mnemonic with UFVK composition options.
+pub fn derive_keys_with_options(
+    mnemonic: &str,
+    account: u32,
+    network: ZcashNetwork,
+    xpub_path: Option<&str>,
+    options: DeriveOptions,
+) -> Result<DerivedKeys, Error> {
     let mnemonic = Mnemonic::parse(mnemonic)?;
     let seed = mnemonic.to_seed("");
 
@@ -99,7 +136,23 @@ pub fn derive_keys(
     let usk = UnifiedSpendingKey::from_seed(&zcash_net, &seed, account_id)
         .map_err(|e| Error::Derivation(format!("{e:?}")))?;
     let ufvk_obj = usk.to_unified_full_viewing_key();
-    let ufvk = ufvk_obj.encode(&zcash_net);
+    let ufvk = if options.include_sapling_in_ufvk {
+        ufvk_obj.encode(&zcash_net)
+    } else {
+        let (ufvk_net, ufvk_container) = Ufvk::decode(&ufvk_obj.encode(&zcash_net))
+            .map_err(|e| Error::Derivation(format!("failed to parse generated UFVK: {e}")))?;
+        let filtered_items = ufvk_container
+            .items_as_parsed()
+            .iter()
+            .filter(|item| !matches!(item, Fvk::Sapling(_)))
+            .cloned()
+            .collect();
+        Ufvk::try_from_items(filtered_items)
+            .map(|ufvk| ufvk.encode(&ufvk_net))
+            .map_err(|e| {
+                Error::Derivation(format!("failed to rebuild UFVK without sapling: {e}"))
+            })?
+    };
 
     // --- Pool-specific viewing keys ---
     let sapling = ufvk_obj.sapling().map(extract_sapling);
@@ -110,17 +163,21 @@ pub fn derive_keys(
         Some(p) => p.to_string(),
         None => format!("m/44'/133'/{account}'"),
     };
-    let path: DerivationPath = resolved_path
-        .parse()
-        .map_err(|e: bitcoin::bip32::Error| {
-            Error::Derivation(format!("invalid path '{resolved_path}': {e}"))
-        })?;
+    let path: DerivationPath = resolved_path.parse().map_err(|e: bitcoin::bip32::Error| {
+        Error::Derivation(format!("invalid path '{resolved_path}': {e}"))
+    })?;
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let root = Xpriv::new_master(btc_network_kind, &seed)?;
     let account_xprv = root.derive_priv(&secp, &path)?;
     let xpub = Xpub::from_priv(&secp, &account_xprv).to_string();
 
-    Ok(DerivedKeys { ufvk, xpub, xpub_path: resolved_path, sapling, orchard })
+    Ok(DerivedKeys {
+        ufvk,
+        xpub,
+        xpub_path: resolved_path,
+        sapling,
+        orchard,
+    })
 }
 
 #[cfg(test)]
@@ -135,7 +192,12 @@ mod tests {
 
     #[test]
     fn test_invalid_mnemonic_rejected() {
-        let result = derive_keys("not a valid bip39 mnemonic phrase", 0, ZcashNetwork::Mainnet, None);
+        let result = derive_keys(
+            "not a valid bip39 mnemonic phrase",
+            0,
+            ZcashNetwork::Mainnet,
+            None,
+        );
         assert!(matches!(result, Err(Error::Mnemonic(_))));
     }
 
@@ -163,16 +225,26 @@ mod tests {
     #[test]
     fn test_pool_keys_present() {
         let keys = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let sapling = keys.sapling.as_ref().expect("sapling keys should be present");
-        let orchard = keys.orchard.as_ref().expect("orchard keys should be present");
+        let sapling = keys
+            .sapling
+            .as_ref()
+            .expect("sapling keys should be present");
+        let orchard = keys
+            .orchard
+            .as_ref()
+            .expect("orchard keys should be present");
         // Sapling: fvk=128B, ivk=32B, ovk=32B
-        assert_eq!(sapling.fvk.len(), 256, "sapling fvk should be 128 bytes hex");
-        assert_eq!(sapling.ivk.len(), 64,  "sapling ivk should be 32 bytes hex");
-        assert_eq!(sapling.ovk.len(), 64,  "sapling ovk should be 32 bytes hex");
+        assert_eq!(
+            sapling.fvk.len(),
+            256,
+            "sapling fvk should be 128 bytes hex"
+        );
+        assert_eq!(sapling.ivk.len(), 64, "sapling ivk should be 32 bytes hex");
+        assert_eq!(sapling.ovk.len(), 64, "sapling ovk should be 32 bytes hex");
         // Orchard: fvk=96B, ivk=64B, ovk=32B
         assert_eq!(orchard.fvk.len(), 192, "orchard fvk should be 96 bytes hex");
         assert_eq!(orchard.ivk.len(), 128, "orchard ivk should be 64 bytes hex");
-        assert_eq!(orchard.ovk.len(), 64,  "orchard ovk should be 32 bytes hex");
+        assert_eq!(orchard.ovk.len(), 64, "orchard ovk should be 32 bytes hex");
     }
 
     #[test]
@@ -189,8 +261,14 @@ mod tests {
     fn test_pool_keys_deterministic() {
         let ka = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
         let kb = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        assert_eq!(ka.sapling.as_ref().unwrap().fvk, kb.sapling.as_ref().unwrap().fvk);
-        assert_eq!(ka.orchard.as_ref().unwrap().ivk, kb.orchard.as_ref().unwrap().ivk);
+        assert_eq!(
+            ka.sapling.as_ref().unwrap().fvk,
+            kb.sapling.as_ref().unwrap().fvk
+        );
+        assert_eq!(
+            ka.orchard.as_ref().unwrap().ivk,
+            kb.orchard.as_ref().unwrap().ivk
+        );
     }
 
     #[test]
@@ -212,9 +290,40 @@ mod tests {
     #[test]
     fn test_explicit_path_overrides_account() {
         let default = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let custom = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, Some("m/44'/133'/5'")).unwrap();
+        let custom = derive_keys(
+            KNOWN_MNEMONIC,
+            0,
+            ZcashNetwork::Mainnet,
+            Some("m/44'/133'/5'"),
+        )
+        .unwrap();
         assert_eq!(default.ufvk, custom.ufvk);
         assert_ne!(default.xpub, custom.xpub);
         assert_eq!(custom.xpub_path, "m/44'/133'/5'");
+    }
+
+    #[test]
+    fn test_ufvk_can_exclude_sapling_component() {
+        let keys = derive_keys_with_options(
+            KNOWN_MNEMONIC,
+            0,
+            ZcashNetwork::Mainnet,
+            None,
+            DeriveOptions {
+                include_sapling_in_ufvk: false,
+            },
+        )
+        .unwrap();
+
+        let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
+        let items = ufvk.items();
+
+        assert!(items.iter().any(|item| matches!(item, Fvk::Orchard(_))));
+        assert!(items.iter().any(|item| matches!(item, Fvk::P2pkh(_))));
+        assert!(!items.iter().any(|item| matches!(item, Fvk::Sapling(_))));
+        assert!(
+            keys.sapling.is_some(),
+            "sapling pool keys should still be derived"
+        );
     }
 }

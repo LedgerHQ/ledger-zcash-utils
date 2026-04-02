@@ -1516,6 +1516,7 @@ dependencies = [
  "sapling-crypto",
  "serde_json",
  "thiserror 1.0.69",
+ "zcash_address",
  "zcash_keys",
  "zcash_protocol",
  "zip32",

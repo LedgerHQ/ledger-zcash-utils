@@ -18,6 +18,8 @@ path = "src/lib.rs"
 # transparent-inputs enables transparent key derivation (BIP-44 inside USK).
 # sapling + orchard enable those pools in the UFVK.
 zcash_keys = { version = "0.12", features = ["orchard", "sapling", "transparent-inputs"] }
+# ZIP-316 UFVK encoding/decoding helpers.
+zcash_address = "0.10"
 # Must match the version pulled by zcash_keys 0.12.0 (0.7.x)
 zcash_protocol = "0.7"
 # Must match the version pulled by zcash_keys 0.12.0 (0.2.x)
