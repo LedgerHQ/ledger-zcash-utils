@@ -1,0 +1,27 @@
+# Per-target linker configuration for cross-compilation.
+# Android targets require the NDK clang linkers.
+# Set ANDROID_NDK_HOME before using build-android.sh.
+
+# ─── Android targets ──────────────────────────────────────────────────────────
+# Uncomment and adjust the NDK path to match your installation.
+# Example: ~/Library/Android/sdk/ndk/26.3.11579264/toolchains/llvm/prebuilt/darwin-x86_64
+
+# [target.aarch64-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang"
+
+# [target.armv7-linux-androideabi]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/armv7a-linux-androideabi21-clang"
+
+# [target.i686-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/i686-linux-android21-clang"
+
+# [target.x86_64-linux-android]
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/x86_64-linux-android21-clang"
+
+# Note: cargo-ndk (used in build-android.sh) automatically sets these linkers
+# from ANDROID_NDK_HOME, so manual configuration here is usually not needed.
+
+# ─── Linux musl (local musl-cross toolchain) ──────────────────────────────────
+# brew install filosottile/musl-cross/musl-cross
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
