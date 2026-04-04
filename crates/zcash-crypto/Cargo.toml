@@ -1,0 +1,31 @@
+[package]
+name = "zcash-crypto"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Zcash cryptographic operations: key derivation, trial decryption, transaction decryption"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zcash_crypto"
+path = "src/lib.rs"
+
+[dependencies]
+# zcash_client_backend: only the `orchard` feature is needed here.
+# The `lightwalletd-tonic` feature (gRPC client + proto types) is NOT included
+# so that this crate remains free of tonic/tokio and compiles cleanly for mobile targets.
+zcash_client_backend  = { workspace = true, features = ["orchard"] }
+zcash_keys            = { workspace = true }
+zcash_address         = { workspace = true }
+zcash_note_encryption = { workspace = true }
+zcash_primitives      = { workspace = true }
+zcash_protocol        = { workspace = true }
+zip32                 = { workspace = true }
+orchard               = { workspace = true }
+sapling-crypto        = { workspace = true }
+bip39                 = { workspace = true }
+bitcoin               = { workspace = true }
+hex                   = { workspace = true }
+uuid                  = { workspace = true }
+thiserror             = { workspace = true }
+# Forces the `std` feature so zcash_client_backend can call OffsetDateTime::now_utc().
+time                  = { workspace = true }

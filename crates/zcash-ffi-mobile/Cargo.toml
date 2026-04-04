@@ -1,0 +1,28 @@
+[package]
+name = "zcash-ffi-mobile"
+version = "0.1.0"
+edition = "2021"
+description = "UniFFI bindings for Zcash crypto operations on Android (Kotlin) and iOS (Swift)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# cdylib: Android JNI shared library (.so)
+# staticlib: iOS static library linked into XCFramework (.a)
+crate-type = ["cdylib", "staticlib"]
+
+# uniffi-bindgen: generates Kotlin/Swift bindings from zcash.udl
+# Usage: cargo run --bin uniffi-bindgen generate crates/zcash-ffi-mobile/src/zcash.udl --language kotlin ...
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+zcash-crypto = { path = "../zcash-crypto" }
+zcash-grpc   = { path = "../zcash-grpc" }
+uniffi       = { workspace = true }
+thiserror    = { workspace = true }
+tokio        = { workspace = true }
+
+[build-dependencies]
+# The `build` feature enables uniffi::generate_scaffolding used in build.rs.
+uniffi = { workspace = true, features = ["build"] }

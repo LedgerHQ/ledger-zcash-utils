@@ -1,5 +1,4 @@
-mod error;
-pub use error::Error;
+use crate::error::Error;
 
 use bip39::Mnemonic;
 use bitcoin::{
@@ -37,7 +36,7 @@ pub struct PoolViewingKeys {
 /// All keys derived from a BIP-39 mnemonic for a given Zcash account.
 #[derive(Debug, Clone)]
 pub struct DerivedKeys {
-    /// Bech32m Unified Full Viewing Key (HRP "uview1" / "uviewtest1").
+    /// Bech32m Unified Full Viewing Key (HRP `"uview1"` / `"uviewtest1"`).
     /// Bundles transparent + Orchard FVKs, and Sapling by default, per ZIP-316.
     pub ufvk: String,
     /// BIP-32 transparent extended public key (Base58Check).
@@ -96,9 +95,15 @@ fn extract_orchard(fvk: &OrchardFvk) -> PoolViewingKeys {
 ///   Defaults to `m/44'/133'/{account}'`.
 ///
 /// # Security
+///
 /// No spending key material is returned. The UFVK and per-pool FVKs reveal
 /// the full transaction history of the account. Share IVK for incoming-only
 /// visibility, OVK for proving outgoing payments.
+///
+/// # Errors
+///
+/// Returns an error if the mnemonic is invalid, the account index exceeds the
+/// ZIP-32 range, the xpub path is malformed, or key derivation fails.
 pub fn derive_keys(
     mnemonic: &str,
     account: u32,
@@ -115,6 +120,8 @@ pub fn derive_keys(
 }
 
 /// Derive all viewing keys from a BIP-39 mnemonic with UFVK composition options.
+///
+/// See [`derive_keys`] for parameter documentation.
 pub fn derive_keys_with_options(
     mnemonic: &str,
     account: u32,
@@ -234,11 +241,7 @@ mod tests {
             .as_ref()
             .expect("orchard keys should be present");
         // Sapling: fvk=128B, ivk=32B, ovk=32B
-        assert_eq!(
-            sapling.fvk.len(),
-            256,
-            "sapling fvk should be 128 bytes hex"
-        );
+        assert_eq!(sapling.fvk.len(), 256, "sapling fvk should be 128 bytes hex");
         assert_eq!(sapling.ivk.len(), 64, "sapling ivk should be 32 bytes hex");
         assert_eq!(sapling.ovk.len(), 64, "sapling ovk should be 32 bytes hex");
         // Orchard: fvk=96B, ivk=64B, ovk=32B
@@ -272,6 +275,14 @@ mod tests {
     }
 
     #[test]
+    fn test_ufvk_deterministic_across_derive_calls() {
+        let k0 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let k1 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        assert_eq!(k0.ufvk, k1.ufvk);
+        assert_eq!(k0.xpub, k1.xpub);
+    }
+
+    #[test]
     fn test_alice_testnet_known_vectors() {
         let keys = derive_keys(ALICE_MNEMONIC, 0, ZcashNetwork::Testnet, None).unwrap();
         assert_eq!(
@@ -282,7 +293,6 @@ mod tests {
             keys.xpub,
             "tpubDDpDzVtfYFxaQ2nz9EpgviZ2wwezS1oFBDVDNUdZsmmACrgt3rnqxxLeq6JSi4w3pnmFaSVMGbpcH2oard5QfY8RpNK3qPXqAKfwRhShZFA",
         );
-        // Pool keys should be present and non-empty
         assert!(keys.sapling.is_some());
         assert!(keys.orchard.is_some());
     }
@@ -325,5 +335,35 @@ mod tests {
             keys.sapling.is_some(),
             "sapling pool keys should still be derived"
         );
+    }
+
+    #[test]
+    fn test_default_xpub_path_uses_account_index() {
+        let k0 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let k5 = derive_keys(KNOWN_MNEMONIC, 5, ZcashNetwork::Mainnet, None).unwrap();
+        assert_eq!(k0.xpub_path, "m/44'/133'/0'");
+        assert_eq!(k5.xpub_path, "m/44'/133'/5'");
+        assert_ne!(k0.xpub, k5.xpub);
+    }
+
+    #[test]
+    fn test_mainnet_testnet_ufvks_differ() {
+        let mainnet = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let testnet = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Testnet, None).unwrap();
+        assert_ne!(mainnet.ufvk, testnet.ufvk);
+    }
+
+    #[test]
+    fn test_account1_produces_different_ufvk() {
+        let k0 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let k1 = derive_keys(KNOWN_MNEMONIC, 1, ZcashNetwork::Mainnet, None).unwrap();
+        assert_ne!(k0.ufvk, k1.ufvk);
+        assert_eq!(k1.xpub_path, "m/44'/133'/1'");
+    }
+
+    #[test]
+    fn test_options_default_includes_sapling() {
+        let opts = DeriveOptions::default();
+        assert!(opts.include_sapling_in_ufvk);
     }
 }

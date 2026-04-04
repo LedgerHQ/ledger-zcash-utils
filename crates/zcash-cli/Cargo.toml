@@ -1,0 +1,23 @@
+[package]
+name = "zcash-cli"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for Zcash key derivation and block scanning"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "ledger-zcash-cli"
+path = "src/main.rs"
+
+[dependencies]
+zcash-crypto = { path = "../zcash-crypto" }
+zcash-grpc   = { path = "../zcash-grpc" }
+
+clap       = { workspace = true }
+serde_json = { workspace = true }
+tokio      = { workspace = true }
+indicatif  = "0.17"
+
+[dev-dependencies]
+assert_cmd  = { workspace = true }
+predicates  = "3"

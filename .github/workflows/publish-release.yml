@@ -1,0 +1,170 @@
+name: Publish Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  # ── Step 1a: Build .node binaries (NAPI — Node.js/Electron) ─────────────────
+  build-napi:
+    name: NAPI ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+            rust_target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+          - os: macos-latest
+            target: darwin-x64
+            rust_target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: linux-x64-gnu
+            rust_target: x86_64-unknown-linux-gnu
+            args: --target x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: linux-arm64-gnu
+            rust_target: aarch64-unknown-linux-gnu
+            args: --target aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: win32-x64-msvc
+            rust_target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: win32-arm64-msvc
+            rust_target: aarch64-pc-windows-msvc
+            args: --target aarch64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ vars.PNPM_VERSION || '10' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Build NAPI addon
+        run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node ${{ matrix.args }}
+
+      - name: Upload .node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}
+          path: "*.node"
+          if-no-files-found: error
+
+  # ── Step 1b: Build CLI binaries ──────────────────────────────────────────────
+  build-cli:
+    name: CLI ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-universal
+            script: build-cli-macos.sh
+            artifact: dist/ledger-zcash-cli-macos-universal
+          - os: ubuntu-latest
+            name: linux-x86_64
+            script: build-cli-linux.sh
+            artifact: dist/ledger-zcash-cli-linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.name }}
+
+      - name: Build CLI
+        run: ./scripts/${{ matrix.script }}
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # ── Step 2: Publish npm + attach CLI binaries to GitHub Release ──────────────
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [build-napi, build-cli]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ vars.PNPM_VERSION || '10' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Download all .node binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: napi-*
+          merge-multiple: true
+
+      - name: Download CLI binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Cargo tests (host only)
+        run: cargo test --workspace
+
+      - name: Create Release PR or Publish
+        id: changesets
+        uses: changesets/action@v1
+        with:
+          publish: pnpm changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Attach CLI binaries to the GitHub Release created by changesets
+      - name: Attach CLI binaries to GitHub Release
+        if: steps.changesets.outputs.published == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ fromJson(steps.changesets.outputs.publishedPackages)[0].version }}
+          files: |
+            dist/ledger-zcash-cli-macos-universal
+            dist/ledger-zcash-cli-linux-x86_64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

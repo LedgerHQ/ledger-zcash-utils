@@ -1,0 +1,20 @@
+[package]
+name = "zcash-ffi-node"
+version = "0.1.0"
+edition = "2021"
+description = "Node.js / Electron native addon (napi-rs) for Zcash key derivation and shielded block scanning"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zcash-crypto = { path = "../zcash-crypto" }
+zcash-grpc   = { path = "../zcash-grpc" }
+
+napi        = { workspace = true }
+napi-derive = { workspace = true }
+tokio       = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
