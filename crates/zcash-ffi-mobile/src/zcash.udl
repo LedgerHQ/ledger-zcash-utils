@@ -1,0 +1,173 @@
+// Zcash UniFFI interface
+// Generates Kotlin bindings for Android and Swift bindings for iOS.
+
+namespace zcash {
+
+  // ── Key derivation ──────────────────────────────────────────────────────────
+
+  /// Derive all Zcash viewing keys from a BIP-39 mnemonic.
+  ///
+  /// - mnemonic: space-separated BIP-39 words (12 or 24)
+  /// - account: ZIP-32 account index
+  /// - network: "mainnet" or "testnet"
+  [Throws=ZcashError]
+  DerivedKeys derive_zcash_keys(string mnemonic, u32 account, string network);
+
+  /// Derive keys with extra options (e.g. exclude Sapling from UFVK).
+  [Throws=ZcashError]
+  DerivedKeys derive_zcash_keys_with_options(
+      string mnemonic,
+      u32 account,
+      string network,
+      boolean include_sapling_in_ufvk
+  );
+
+  // ── Transaction decryption ──────────────────────────────────────────────────
+
+  /// Prepare IVKs from a UFVK for repeated trial decryption.
+  ///
+  /// The returned handle is stateful and thread-safe. Create it once and reuse
+  /// across many calls to trial_decrypt_compact_txs for best performance.
+  [Throws=ZcashError]
+  PreparedIvksHandle prepare_ivks_from_ufvk(string ufvk);
+
+  /// Trial-decrypt a batch of compact transactions.
+  ///
+  /// Returns the txids (big-endian hex) of transactions matching the IVKs.
+  /// Mobile callers parse the compact block proto using their own proto library
+  /// and pass the raw field bytes here.
+  sequence<string> trial_decrypt_compact_txs(
+      PreparedIvksHandle handle,
+      sequence<CompactTransactionData> transactions
+  );
+
+  /// Full-decrypt a raw transaction to extract notes with amounts and memos.
+  ///
+  /// - tx_hex: raw transaction bytes as hex
+  /// - ufvk: UFVK string for the account
+  /// - height: block height (needed to select the correct consensus branch ID)
+  /// - network: "mainnet" or "testnet"
+  [Throws=ZcashError]
+  DecryptedTxResult full_decrypt_transaction(
+      string tx_hex,
+      string ufvk,
+      u32 height,
+      string network
+  );
+
+  // ── gRPC block sync ─────────────────────────────────────────────────────────
+
+  /// Scan a range of compact blocks for shielded transactions matching the UFVK.
+  ///
+  /// Connects to a lightwalletd / Zaino gRPC endpoint, streams compact blocks,
+  /// runs trial decryption in Rust, and fully decrypts matched transactions.
+  ///
+  /// This call blocks the calling thread — invoke it from a background thread
+  /// (e.g. Kotlin coroutine with Dispatchers.IO, Swift Task with background priority).
+  [Throws=ZcashError]
+  SyncResult sync_shielded(SyncParams params);
+
+  /// Return the current chain tip height from a gRPC endpoint.
+  ///
+  /// Blocks the calling thread — invoke from a background thread.
+  [Throws=ZcashError]
+  u32 get_chain_tip(string grpc_url);
+};
+
+// ── Error type ──────────────────────────────────────────────────────────────
+
+[Error]
+interface ZcashError {
+    Mnemonic(string message);
+    Derivation(string message);
+    Bip32(string message);
+    Decrypt(string message);
+    Sync(string message);
+};
+
+// ── Key derivation types ────────────────────────────────────────────────────
+
+dictionary PoolViewingKeys {
+    string fvk;
+    string ivk;
+    string ovk;
+};
+
+dictionary DerivedKeys {
+    string ufvk;
+    string xpub;
+    string xpub_path;
+    PoolViewingKeys? sapling;
+    PoolViewingKeys? orchard;
+};
+
+// ── Compact transaction types ───────────────────────────────────────────────
+
+dictionary CompactSaplingOutputData {
+    bytes cmu;
+    bytes ephemeral_key;
+    bytes ciphertext;
+};
+
+dictionary CompactOrchardActionData {
+    bytes cmx;
+    bytes ephemeral_key;
+    bytes ciphertext;
+};
+
+dictionary CompactTransactionData {
+    string txid;
+    sequence<CompactSaplingOutputData> sapling_outputs;
+    sequence<CompactOrchardActionData> orchard_actions;
+};
+
+// ── Decrypted output types ──────────────────────────────────────────────────
+
+dictionary DecryptedOutputData {
+    u64 amount;
+    string memo;
+    string transfer_type;
+};
+
+dictionary DecryptedTxResult {
+    sequence<DecryptedOutputData> sapling_outputs;
+    sequence<DecryptedOutputData> orchard_outputs;
+};
+
+// ── gRPC sync types ──────────────────────────────────────────────────────────
+
+dictionary SyncParams {
+    string grpc_url;
+    string viewing_key;
+    u32 start_height;
+    u32 end_height;
+    /// "mainnet" or "testnet" — defaults to "testnet" if null.
+    string? network;
+};
+
+dictionary ShieldedNote {
+    u64 amount;
+    string transfer_type;
+    string memo;
+};
+
+dictionary ShieldedTransaction {
+    string txid;
+    string hex;
+    u32 block_height;
+    string block_hash;
+    u32 block_time;
+    sequence<ShieldedNote> sapling_notes;
+    sequence<ShieldedNote> orchard_notes;
+};
+
+dictionary SyncResult {
+    sequence<ShieldedTransaction> transactions;
+    u32 blocks_scanned;
+    u64 elapsed_ms;
+};
+
+// ── Opaque handles ──────────────────────────────────────────────────────────
+
+/// Opaque handle to pre-computed IVKs. Thread-safe via Arc.
+interface PreparedIvksHandle {};
