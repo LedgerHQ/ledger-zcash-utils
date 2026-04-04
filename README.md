@@ -1,124 +1,89 @@
 # ledger-zcash-utils
 
-Rust utilities for Zcash key management, used in Ledger Live integration testing.
+Rust workspace for Zcash cryptographic operations. Provides key derivation,
+shielded transaction decryption, and compact block scanning across multiple
+runtime targets.
 
-## Crates
+## Build targets
 
-| Crate                                          | Description                                             |
-| ---------------------------------------------- | ------------------------------------------------------- |
-| [`zcash-key-derive`](crates/zcash-key-derive/) | Derive UFVK and all viewing keys from a BIP-39 mnemonic |
+| Target | Script | Output |
+|--------|--------|--------|
+| Node.js / Electron | `./scripts/build-napi.sh` | `index.*.node` |
+| Android | `./scripts/build-android.sh` | `dist/android/` |
+| iOS | `./scripts/build-ios.sh` | `dist/ios/ZcashFFI.xcframework` |
+| macOS CLI (universal) | `./scripts/build-cli-macos.sh` | `dist/ledger-zcash-cli-macos-universal` |
+| Linux CLI (static) | `./scripts/build-cli-linux.sh` | `dist/ledger-zcash-cli-linux-x86_64` |
 
----
+See [`docs/build-targets.md`](docs/build-targets.md) for prerequisites and details.
 
-## `zcash-key-derive`
-
-Derives all Zcash viewing keys for a given account from a BIP-39 mnemonic:
-
-- **UFVK** — Unified Full Viewing Key (ZIP-316, Bech32m)
-- **xpub** — Transparent extended public key (BIP-32, Base58Check)
-- **Sapling** — FVK / IVK / OVK (hex, external scope)
-- **Orchard** — FVK / IVK / OVK (hex, external scope)
-
-No spending key material is exposed.
-Pass `--no-sapling` to omit the Sapling FVK from the generated UFVK while still deriving Sapling pool keys separately.
-
-### Usage
+## Crate structure
 
 ```
-zcash-key-derive [OPTIONS]
-
-Options:
-  --mnemonic <WORDS>      BIP-39 mnemonic phrase (reads from stdin if omitted)
-  --account <N>           ZIP-32 account index [default: 0]
-  --xpub-path <PATH>      BIP-32 path for transparent xpub [default: m/44'/133'/{account}']
-  --network <NET>         mainnet | testnet [default: mainnet]
-  --no-sapling            Exclude the Sapling FVK from the generated UFVK
-  --format <FMT>          human | json [default: human]
-  -h, --help
+zcash-crypto     Pure cryptographic logic (key derivation, trial/full decryption)
+zcash-grpc       Async gRPC sync engine (lightwalletd / Zaino)
+zcash-ffi-node   Node.js / Electron native addon (napi-rs)
+zcash-ffi-mobile Android + iOS bindings (UniFFI)
+zcash-cli        CLI binary (ledger-zcash-cli)
 ```
 
-### Examples
+See [`docs/architecture.md`](docs/architecture.md) for the dependency graph and
+design decisions.
+
+## CLI usage
 
 ```bash
-# Derive keys for account 0, mainnet, human-readable output
-zcash-key-derive --mnemonic "abandon abandon ... about"
+# Key derivation
+ledger-zcash-cli derive --mnemonic "abandon abandon ... about" --format json
 
-# JSON output for account 1
-zcash-key-derive --mnemonic "..." --account 1 --format json
+# Query chain tip
+ledger-zcash-cli tip --grpc-url https://testnet.zec.rocks:443
 
-# Testnet with custom transparent derivation path
-zcash-key-derive --mnemonic "..." --network testnet --xpub-path "m/44'/133'/5'"
-
-# Build a UFVK without the Sapling component
-zcash-key-derive --mnemonic "..." --no-sapling
-
-# Pipe mnemonic from a file
-cat mnemonic.txt | zcash-key-derive --network testnet --format json
+# Scan a block range
+ledger-zcash-cli sync \
+    --grpc-url https://testnet.zec.rocks:443 \
+    --viewing-key uviewtest1... \
+    --start-height 280000 \
+    --end-height 285000 \
+    --network testnet \
+    --format json
 ```
 
-### Output (human format)
+### `derive` options
 
 ```
-ufvk      : uview1...
-xpub      : xpub6...
-xpub path : m/44'/133'/0'
-  sapling:
-    fvk : <256 hex chars>
-    ivk : <64 hex chars>
-    ovk : <64 hex chars>
-  orchard:
-    fvk : <192 hex chars>
-    ivk : <128 hex chars>
-    ovk : <64 hex chars>
+--mnemonic <WORDS>      BIP-39 mnemonic (reads from stdin if omitted)
+--account <N>           ZIP-32 account index [default: 0]
+--xpub-path <PATH>      BIP-32 xpub path [default: m/44'/133'/{account}']
+--network mainnet|testnet [default: mainnet]
+--no-sapling            Exclude Sapling FVK from UFVK
+--format human|json     [default: human]
 ```
-
----
-
-## Building
-
-### macOS (universal binary — arm64 + x86_64)
-
-Requires Rust toolchain (`rustup`) and Xcode command line tools. If Rust is not installed:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then build:
-
-```bash
-./scripts/build-macos.sh
-# Binary: dist/zcash-key-derive-macos-universal
-```
-
-The output is a [universal binary](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary) that runs natively on both Apple Silicon (M1/M2/M3) and Intel Macs.
-
-### Linux (via Docker)
-
-Requires Docker. Produces a static `x86_64-unknown-linux-musl` binary:
-
-```bash
-./scripts/build-linux.sh
-# Binary: dist/zcash-key-derive-linux-x86_64
-```
-
----
 
 ## Development
 
 ```bash
-# Run tests
-cargo test
+# Run all logic tests
+cargo test --package zcash-crypto
 
-# Run tests with coverage (requires cargo-llvm-cov)
-cargo llvm-cov --summary-only
+# Run CLI integration tests
+cargo test --package zcash-cli
 
-# Run the binary directly
-cargo run --bin zcash-key-derive -- --mnemonic "..." --format json
+# Coverage (requires cargo install cargo-llvm-cov)
+./scripts/coverage.sh
+
+# Type-check everything
+cargo check --workspace
 ```
 
----
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — workspace design
+- [`docs/key-derivation.md`](docs/key-derivation.md) — BIP-39 → UFVK pipeline
+- [`docs/block-sync.md`](docs/block-sync.md) — gRPC trial + full decryption
+- [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
+- [`docs/ffi-mobile.md`](docs/ffi-mobile.md) — Android/iOS UniFFI integration
+- [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
 
 ## License
 
-MIT
+MIT OR Apache-2.0
