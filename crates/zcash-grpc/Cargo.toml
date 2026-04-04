@@ -1,0 +1,25 @@
+[package]
+name = "zcash-grpc"
+version = "0.1.0"
+edition = "2021"
+description = "Async gRPC sync engine for Zcash: streams compact blocks from lightwalletd and decrypts matching transactions"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zcash_grpc"
+path = "src/lib.rs"
+
+[dependencies]
+zcash-crypto = { path = "../zcash-crypto" }
+
+# lightwalletd-tonic adds the CompactTxStreamer gRPC client and all proto types.
+# This is intentionally kept out of zcash-crypto so mobile targets are unaffected.
+zcash_client_backend = { workspace = true, features = ["orchard", "lightwalletd-tonic"] }
+
+tokio  = { workspace = true }
+tonic  = { workspace = true }
+anyhow = { workspace = true }
+hex    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
