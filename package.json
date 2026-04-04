@@ -1,9 +1,21 @@
 {
-  "name": "ledger-zcash-utils",
+  "name": "@ledgerhq/zcash-utils",
   "version": "0.1.0",
-  "description": "Native Node.js addon for Zcash key derivation and shielded sync via napi-rs",
+  "description": "Native Zcash key derivation and shielded sync — Node.js (NAPI), Android (JNI), iOS (XCFramework)",
   "main": "index.js",
   "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LedgerHQ/ledger-zcash-utils.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "// ── NAPI (Node.js / Electron) ──────────────────────────────────────": "",
     "build": "./scripts/build-napi.sh",
@@ -37,6 +49,7 @@
     "bench": "tsx examples/bench.ts --start-height 280000 --end-height 285000"
   },
   "devDependencies": {
+    "@changesets/cli": "^2.29.8",
     "@napi-rs/cli": "^2.18.0",
     "@types/node": "^25.5.2",
     "tsx": "^4.21.0",

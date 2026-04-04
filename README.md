@@ -1,4 +1,4 @@
-# ledger-zcash-utils
+# @ledgerhq/zcash-utils
 
 Rust workspace for Zcash cryptographic operations. Provides key derivation,
 shielded transaction decryption, and compact block scanning across multiple
@@ -83,6 +83,48 @@ cargo check --workspace
 - [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
 - [`docs/ffi-mobile.md`](docs/ffi-mobile.md) — Android/iOS UniFFI integration
 - [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
+
+## Release
+
+Versioning is managed with [Changesets](https://github.com/changesets/action). Every merge to `main` triggers the CI workflow, which:
+
+1. Builds all artifacts in parallel on their respective platforms
+2. Either opens/updates a **"Version Packages"** PR if changesets are pending
+3. Or publishes immediately if the "Version Packages" PR has already been merged
+
+### Publishing a new version
+
+```bash
+# 1. Describe the change (patch / minor / major)
+pnpm changeset
+
+# 2. Commit the generated .changeset file and push
+git add .changeset/
+git commit -m "chore: add changeset"
+git push
+
+# 3. Merge the PR → CI automatically opens a "Version Packages" PR
+# 4. Merge the "Version Packages" PR → CI publishes
+```
+
+### Artifacts produced per release
+
+| Artifact | Distribution | Platforms |
+|----------|-------------|-----------|
+| `@ledgerhq/zcash-utils` | npm | All (bundled `.node` files) |
+| `ledger-zcash-cli-macos-universal` | GitHub Release | macOS arm64 + x64 |
+| `ledger-zcash-cli-linux-x86_64` | GitHub Release | Linux x64 (static musl) |
+
+The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
+
+CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are not part of the npm package.
+
+### Required secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `NPM_TOKEN` | npm authentication for `pnpm publish` |
+| `GITHUB_TOKEN` | Automatically provided by GitHub Actions |
 
 ## License
 
