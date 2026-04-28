@@ -81,6 +81,14 @@ export declare function startSync(params: SyncParams): Promise<TransactionStream
 /** Returns the current chain tip height from the gRPC endpoint. */
 export declare function getChainTip(grpcUrl: string): Promise<number>
 /**
+ * Find the block height closest to the given Unix timestamp via binary search.
+ *
+ * Returns the height of the first block whose timestamp is ≥ the target.
+ * If the timestamp is before genesis, returns the genesis height.
+ * If the timestamp is after the chain tip, returns the tip height.
+ */
+export declare function findBlockHeight(grpcUrl: string, timestamp: number): Promise<number>
+/**
  * Async iterator over matched shielded transactions.
  *
  * Usage (TypeScript):

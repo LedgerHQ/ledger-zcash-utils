@@ -3050,6 +3050,7 @@ dependencies = [
  "indicatif",
  "predicates",
  "serde_json",
+ "time",
  "tokio",
  "zcash-crypto",
  "zcash-sync",

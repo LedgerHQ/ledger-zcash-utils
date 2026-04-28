@@ -20,6 +20,7 @@ fn help_lists_subcommands() {
         .success()
         .stdout(contains("derive"))
         .stdout(contains("tip"))
+        .stdout(contains("height-at"))
         .stdout(contains("sync"));
 }
 
@@ -139,6 +140,34 @@ fn tip_help_exits_zero() {
 #[test]
 fn tip_missing_grpc_url_exits_nonzero() {
     cmd().arg("tip").assert().failure();
+}
+
+// ─── height-at subcommand ────────────────────────────────────────────────
+
+#[test]
+fn height_at_help_exits_zero() {
+    cmd().args(["height-at", "--help"]).assert().success();
+}
+
+#[test]
+fn height_at_missing_args_exits_nonzero() {
+    cmd().arg("height-at").assert().failure();
+}
+
+#[test]
+fn height_at_missing_date_exits_nonzero() {
+    cmd()
+        .args(["height-at", "--grpc-url", "https://example.com"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn height_at_missing_grpc_url_exits_nonzero() {
+    cmd()
+        .args(["height-at", "--date", "2024-01-15"])
+        .assert()
+        .failure();
 }
 
 // ─── sync subcommand ─────────────────────────────────────────────────────────

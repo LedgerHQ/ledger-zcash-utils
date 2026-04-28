@@ -47,6 +47,11 @@ enum Commands {
     ///
     /// Requires a running lightwalletd / Zaino endpoint.
     Sync(SyncArgs),
+
+    /// Find the block height closest to a given date or Unix timestamp.
+    ///
+    /// Performs a binary search over block timestamps via gRPC.
+    HeightAt(HeightAtArgs),
 }
 
 // ─── derive subcommand ────────────────────────────────────────────────────────
@@ -87,6 +92,20 @@ struct TipArgs {
     /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
     #[arg(long)]
     grpc_url: String,
+}
+
+// ─── height-at subcommand ────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+struct HeightAtArgs {
+    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
+    #[arg(long)]
+    grpc_url: String,
+
+    /// Target date (YYYY-MM-DD) or Unix timestamp (integer).
+    /// Returns the latest block at or before this time.
+    #[arg(long)]
+    date: String,
 }
 
 // ─── sync subcommand ──────────────────────────────────────────────────────────
@@ -155,6 +174,7 @@ async fn main() {
     match cli.command {
         Commands::Derive(args) => cmd_derive(args),
         Commands::Tip(args) => cmd_tip(args).await,
+        Commands::HeightAt(args) => cmd_height_at(args).await,
         Commands::Sync(args) => cmd_sync(args).await,
     }
 }
@@ -232,6 +252,50 @@ async fn cmd_tip(args: TipArgs) {
             std::process::exit(1);
         }
     }
+}
+
+async fn cmd_height_at(args: HeightAtArgs) {
+    let timestamp = match parse_date_or_timestamp(&args.date) {
+        Ok(ts) => ts,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    };
+    match zcash_sync::client::find_block_height(args.grpc_url, timestamp).await {
+        Ok(height) => println!("{height}"),
+        Err(e) => {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse a date string (`YYYY-MM-DD`, midnight UTC) or a raw Unix timestamp.
+fn parse_date_or_timestamp(input: &str) -> Result<u32, String> {
+    // Try as integer first.
+    if let Ok(ts) = input.parse::<u32>() {
+        return Ok(ts);
+    }
+
+    // Try as YYYY-MM-DD → midnight UTC.
+    let parts: Vec<&str> = input.split('-').collect();
+    if parts.len() == 3 {
+        let year: i32 = parts[0].parse().map_err(|_| format!("invalid year: {}", parts[0]))?;
+        let month_num: u8 = parts[1].parse().map_err(|_| format!("invalid month: {}", parts[1]))?;
+        let day: u8 = parts[2].parse().map_err(|_| format!("invalid day: {}", parts[2]))?;
+        let month = time::Month::try_from(month_num)
+            .map_err(|_| format!("month out of range: {month_num}"))?;
+        let date = time::Date::from_calendar_date(year, month, day)
+            .map_err(|_| format!("invalid date: {input}"))?;
+        let ts = date.with_hms(0, 0, 0).unwrap().assume_utc().unix_timestamp();
+        if ts >= 0 {
+            return Ok(ts as u32);
+        }
+        return Err(format!("date '{input}' is before Unix epoch"));
+    }
+
+    Err(format!("cannot parse '{input}' as YYYY-MM-DD or Unix timestamp"))
 }
 
 async fn cmd_sync(args: SyncArgs) {

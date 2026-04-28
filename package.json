@@ -1,6 +1,6 @@
 {
   "name": "@ledgerhq/zcash-utils",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Native Zcash key derivation and shielded sync — Node.js (NAPI)",
   "main": "index.js",
   "types": "index.d.ts",
@@ -39,6 +39,7 @@
     "cli": "cargo run -q -p zcash-cli",
     "cli:derive": "cargo run -q -p zcash-cli -- derive --help",
     "cli:tip": "cargo run -q -p zcash-cli -- tip --help",
+    "cli:height-at": "cargo run -q -p zcash-cli -- height-at --help",
     "cli:sync": "cargo run -q -p zcash-cli -- sync --help",
     "// ── Node.js validation & benchmarks ───────────────────────────────": "",
     "sync-tx": "tsx examples/sync-tx.node.ts --start-height 1130000 --end-height 1180000",

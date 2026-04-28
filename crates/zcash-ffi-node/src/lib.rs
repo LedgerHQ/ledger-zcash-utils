@@ -200,6 +200,18 @@ pub async fn get_chain_tip(grpc_url: String) -> napi::Result<u32> {
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
+/// Find the block height closest to the given Unix timestamp via interpolation search.
+///
+/// Returns the height of the latest block whose timestamp is ≤ the target.
+/// If the timestamp is before genesis, returns the genesis height.
+/// If the timestamp is after the chain tip, returns the tip height.
+#[napi]
+pub async fn find_block_height(grpc_url: String, timestamp: u32) -> napi::Result<u32> {
+    zcash_sync::client::find_block_height(grpc_url, timestamp)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
