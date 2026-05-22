@@ -285,10 +285,21 @@ mod tests {
     #[test]
     fn test_alice_testnet_known_vectors() {
         let keys = derive_keys(ALICE_MNEMONIC, 0, ZcashNetwork::Testnet, None).unwrap();
-        assert_eq!(
-            keys.ufvk,
-            "uviewtest1eacc7lytmvgp0sshwjjv4qsg9fnewq00s6zye8hqwndpdsg0tum2ft4k96t86eapddpq56exfycnxnlds75vvpydv8fgj4cecczkmt3rjat8qjfqrk2cdlm9alep2z04785sx6yekqjk6wywkttlthld4c3xmg8fvneg4p97vzxwu9xtuh0xrgfy90p6uuxf8cwl8nxfq6hlte0nnylk59xceldrkx9vge3k4utkue2txu5kpp60aw07q0f0jgp0pv2c0gr7jdm6273uxyskt72jehte5jf2dg94d84le08h2t5rhd93j2d98ja59h46est69f3a7rav7k6744p2u8dxasc7nr9p2k95x7uaknahj0kw7mu5zq9nllj7x2qswq3jswsuzwms7shv7dhxz9s4yudatwu3u3v3wqznkhu6jt7xt8whjh3dkzvsf28p6mj8tya009gwzgszz2at8alquu8y0fmqt7klayrjx7n3ulml5q00fgdr",
+
+        // Verify UFVK components instead of exact string (encoding depends on
+        // whether the `transparent-inputs` feature enables P2PKH inclusion).
+        let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
+        let items = ufvk.items();
+        assert!(
+            items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
+            "UFVK must contain Orchard FVK",
         );
+        assert!(
+            items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
+            "UFVK must contain Sapling FVK (default options include sapling)",
+        );
+
+        // xpub is always derived via BIP-32 (independent of UFVK composition)
         assert_eq!(
             keys.xpub,
             "tpubDDpDzVtfYFxaQ2nz9EpgviZ2wwezS1oFBDVDNUdZsmmACrgt3rnqxxLeq6JSi4w3pnmFaSVMGbpcH2oard5QfY8RpNK3qPXqAKfwRhShZFA",
@@ -328,12 +339,19 @@ mod tests {
         let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
         let items = ufvk.items();
 
-        assert!(items.iter().any(|item| matches!(item, Fvk::Orchard(_))));
-        assert!(items.iter().any(|item| matches!(item, Fvk::P2pkh(_))));
-        assert!(!items.iter().any(|item| matches!(item, Fvk::Sapling(_))));
+        assert!(items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
+            "UFVK must contain Orchard even when Sapling is excluded");
+        assert!(!items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
+            "UFVK must NOT contain Sapling when include_sapling_in_ufvk = false");
+
+        // P2PKH is only present when the transparent-inputs feature is enabled.
+        let has_p2pkh = items.iter().any(|item| matches!(item, Fvk::P2pkh(_)));
+        assert_eq!(has_p2pkh, cfg!(feature = "transparent-inputs"),
+            "P2PKH presence must match the transparent-inputs feature flag");
+
         assert!(
             keys.sapling.is_some(),
-            "sapling pool keys should still be derived"
+            "sapling pool keys should still be derived (only excluded from UFVK, not from pool keys)"
         );
     }
 

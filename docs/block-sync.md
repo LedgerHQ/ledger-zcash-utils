@@ -31,9 +31,31 @@ transaction from the server.
 │  GetTransaction(txid) ──► raw tx bytes                              │
 │                                                                      │
 │  decrypt_transaction(network, height, tx, ufvk_map)                 │
-│    → DecryptedOutput { amount, memo, transfer_type }                │
+│    → DecryptedOutput { amount, memo, transfer_type, nullifier,      │
+│                         rseed, cmx, recipient, action_index }       │
 │                                                                      │
 │  transfer_type: "incoming" | "outgoing" | "internal"                │
+│  Spending fields (rseed, cmx, recipient, action_index) are          │
+│  populated for incoming/internal Orchard notes only.                │
+└──────────────────────────────────────────────────────────────────────┘
+                              │ matched txids + our_nullifiers
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Phase 4: Outgoing transaction detection (nullifier matching)        │
+│                                                                      │
+│  For each block, check if any transaction spends a nullifier from   │
+│  our_nullifiers. If so, fetch and full-decrypt that transaction.    │
+│  This detects spending txs invisible to trial decryption.           │
+└──────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│ Phase 5: Spent-note marking                                         │
+│                                                                      │
+│  For each received note, if its nullifier was spent in any block    │
+│  within the scanned range, set is_spent = true.                    │
+│  Position is computed from chain_metadata.orchard_commitment_tree_  │
+│  size and the note's action_index within its block.                │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 

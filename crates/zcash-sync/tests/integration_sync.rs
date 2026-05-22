@@ -32,6 +32,7 @@ fn params_for_block(height: u32) -> SyncParams {
         on_transaction: None,
         orchard_only: true,
         max_retries: None,
+        known_nullifiers: vec![],
     }
 }
 
@@ -47,6 +48,7 @@ fn params_for_range(start: u32, end: u32) -> SyncParams {
         on_transaction: None,
         orchard_only: true,
         max_retries: None,
+        known_nullifiers: vec![],
     }
 }
 
@@ -62,6 +64,7 @@ fn params_for_block_testnet(height: u32) -> SyncParams {
         on_transaction: None,
         orchard_only: false, // must scan Sapling
         max_retries: None,
+        known_nullifiers: vec![],
     }
 }
 
@@ -77,6 +80,7 @@ fn params_for_range_testnet(start: u32, end: u32) -> SyncParams {
         on_transaction: None,
         orchard_only: false,
         max_retries: None,
+        known_nullifiers: vec![],
     }
 }
 
@@ -440,6 +444,97 @@ async fn testnet_range_scan_finds_sapling_txs_s1_and_s2() {
         assert!(txids.contains(&expected), "missing {expected}\nfound: {txids:?}");
     }
 }
+
+// ── enrichment: spending fields and isSpent ─────────────────────────
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn full_scan_enriches_incoming_note_with_spending_fields() {
+    let result = run_sync(params_for_block(TX1_HEIGHT)).await.unwrap();
+    let tx1 = find_tx(&result.transactions, TX1_TXID);
+    assert_eq!(tx1.orchard_notes.len(), 1);
+    let note = &tx1.orchard_notes[0];
+
+    // Incoming note must have all spending fields populated
+    assert!(note.nullifier.is_some(), "incoming note must have nullifier");
+    assert!(note.rseed.is_some(), "incoming note must have rseed");
+    assert!(note.cmx.is_some(), "incoming note must have cmx");
+    assert!(note.position.is_some(), "incoming note must have position");
+    assert!(note.recipient.is_some(), "incoming note must have recipient");
+
+    // Field sizes: nullifier/rseed/cmx = 64 hex chars (32 bytes), recipient = 86 hex chars (43 bytes)
+    assert_eq!(note.nullifier.as_ref().unwrap().len(), 64, "nullifier must be 32 bytes hex");
+    assert_eq!(note.rseed.as_ref().unwrap().len(), 64, "rseed must be 32 bytes hex");
+    assert_eq!(note.cmx.as_ref().unwrap().len(), 64, "cmx must be 32 bytes hex");
+    assert_eq!(note.recipient.as_ref().unwrap().len(), 86, "recipient must be 43 bytes hex");
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn full_scan_marks_spent_note_when_spending_tx_is_in_range() {
+    // TX1 (height 3,047,167) is an incoming note. TX2 (height 3,055,407) is a change
+    // note from a tx that SPENDS TX1's note. Scanning the full range should detect
+    // that TX1's note is spent.
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX2_HEIGHT)).await.unwrap();
+
+    let tx1 = find_tx(&result.transactions, TX1_TXID);
+    let note = &tx1.orchard_notes[0];
+    assert!(note.is_spent, "TX1's note must be is_spent=true (spent by the tx creating TX2)");
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn single_block_scan_note_is_unspent_when_spending_tx_outside_range() {
+    // Scanning only TX1's block: the spending tx is at a later height,
+    // so is_spent must be false (spending not visible in this range).
+    let result = run_sync(params_for_block(TX1_HEIGHT)).await.unwrap();
+    let tx1 = find_tx(&result.transactions, TX1_TXID);
+    assert!(!tx1.orchard_notes[0].is_spent, "TX1 unspent when scanned alone");
+}
+
+// ── Incremental sync: known_nullifiers → spent_known_nullifiers ──────────────
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn incremental_scan_returns_spent_known_nullifiers() {
+    // Phase 1: scan TX1's block to discover its nullifier
+    let result1 = run_sync(params_for_block(TX1_HEIGHT)).await.unwrap();
+    let tx1 = find_tx(&result1.transactions, TX1_TXID);
+    let nf1 = tx1.orchard_notes[0]
+        .nullifier
+        .clone()
+        .expect("TX1 incoming note must have nullifier");
+
+    // The note is unspent when scanned alone
+    assert!(!tx1.orchard_notes[0].is_spent);
+
+    // Phase 2: incremental scan AFTER TX1's block, with NF1 as known
+    let mut params = params_for_range(TX1_HEIGHT + 1, TX2_HEIGHT);
+    params.known_nullifiers = vec![nf1.clone()];
+    let result2 = run_sync(params).await.unwrap();
+
+    // Rust must report NF1 in spent_known_nullifiers
+    assert!(
+        result2.spent_known_nullifiers.contains(&nf1),
+        "NF1 must be in spent_known_nullifiers.\n\
+         NF1 = {nf1}\n\
+         spent_known_nullifiers = {:?}",
+        result2.spent_known_nullifiers,
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn incremental_scan_with_empty_known_nullifiers_returns_empty_spent() {
+    // Without known_nullifiers, spent_known_nullifiers must be empty.
+    let result = run_sync(params_for_range(TX1_HEIGHT + 1, TX2_HEIGHT)).await.unwrap();
+    assert!(
+        result.spent_known_nullifiers.is_empty(),
+        "without known_nullifiers, spent_known_nullifiers must be empty"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "requires network access"]

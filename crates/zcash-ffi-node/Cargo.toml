@@ -15,5 +15,8 @@ napi        = { workspace = true }
 napi-derive = { workspace = true }
 tokio       = { workspace = true }
 
+[dev-dependencies]
+hex = { workspace = true }
+
 [build-dependencies]
 napi-build = "2"

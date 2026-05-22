@@ -3082,6 +3082,7 @@ dependencies = [
 name = "zcash-ffi-node"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "napi",
  "napi-build",
  "napi-derive",

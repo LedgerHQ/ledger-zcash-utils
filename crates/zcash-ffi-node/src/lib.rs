@@ -33,9 +33,17 @@ pub struct SyncParams {
     pub max_retries: Option<u32>,
     /// Emit per-phase timing diagnostics to stderr every 10 seconds.
     pub verbose: Option<bool>,
+    /// Hex-encoded nullifiers of notes received in previous scans that are still
+    /// unspent. Enables spent detection across incremental sync boundaries.
+    pub known_nullifiers: Option<Vec<String>>,
 }
 
 /// A single shielded note found during decryption.
+///
+/// Shared between Orchard and Sapling. The spending fields (`nullifier`,
+/// `rseed`, `cmx`, `position`, `recipient`) are Orchard-specific and `None`
+/// for Sapling notes. A dedicated Sapling type is deferred until Sapling
+/// spending is needed.
 #[napi(object)]
 pub struct ShieldedNote {
     /// Amount in zatoshis (f64 for JS Number compatibility).
@@ -44,6 +52,23 @@ pub struct ShieldedNote {
     pub transfer_type: String,
     /// Memo text decoded from the note.
     pub memo: String,
+
+    /// Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT.
+    pub nullifier: Option<String>,
+    /// rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts.
+    pub rho: Option<String>,
+    /// Random seed (64-char hex = 32 bytes). Required for spending.
+    pub rseed: Option<String>,
+    /// Extracted note commitment cmx (64-char hex = 32 bytes). Required for Merkle witness.
+    pub cmx: Option<String>,
+    /// Leaf position in the Orchard commitment tree (decimal string).
+    /// None when ChainMetadata is absent.
+    /// String avoids f64 precision loss on u64 -> f64 -> u64 round-trips.
+    pub position: Option<String>,
+    /// Recipient bytes (86-char hex = 43 bytes: 11-byte d + 32-byte pk_d). For note reconstruction.
+    pub recipient: Option<String>,
+    /// True if this note was spent in a later block within the scanned range.
+    pub is_spent: bool,
 }
 
 /// A matched and fully-decrypted shielded transaction.
@@ -73,6 +98,9 @@ pub struct ShieldedTransaction {
 pub struct SyncStats {
     pub blocks_scanned: u32,
     pub elapsed_ms: f64,
+    /// Hex-encoded nullifiers from `knownNullifiers` that were spent in the scanned range.
+    /// JS uses this to mark previously-stored notes as spent.
+    pub spent_known_nullifiers: Vec<String>,
 }
 
 // ─── stream ───────────────────────────────────────────────────────────────────
@@ -99,7 +127,9 @@ pub struct TransactionStream {
 impl TransactionStream {
     /// Returns the next matched transaction, or `null` when the scan is complete.
     ///
-    /// Safety: napi-rs requires `unsafe` for `&mut self` in async methods.
+    /// # Safety
+    ///
+    /// napi-rs requires `unsafe` for `&mut self` in async methods.
     /// This method is safe to call — it only mutates the internal channel receiver.
     #[napi]
     pub async unsafe fn next(&mut self) -> napi::Result<Option<ShieldedTransaction>> {
@@ -125,7 +155,9 @@ impl TransactionStream {
     /// returns `null`). Calling this before the stream is done will wait until
     /// the background sync task finishes.
     ///
-    /// Safety: napi-rs requires `unsafe` for `&mut self` in async methods.
+    /// # Safety
+    ///
+    /// napi-rs requires `unsafe` for `&mut self` in async methods.
     #[napi]
     pub async unsafe fn stats(&mut self) -> napi::Result<SyncStats> {
         let rx = self
@@ -141,6 +173,7 @@ impl TransactionStream {
         Ok(SyncStats {
             blocks_scanned: grpc_result.blocks_scanned,
             elapsed_ms: grpc_result.elapsed_ms as f64,
+            spent_known_nullifiers: grpc_result.spent_known_nullifiers,
         })
     }
 }
@@ -177,6 +210,7 @@ pub async fn start_sync(params: SyncParams) -> napi::Result<TransactionStream> {
         max_retries: params.max_retries,
         on_block_done: None,
         on_transaction: Some(on_transaction),
+        known_nullifiers: params.known_nullifiers.unwrap_or_default(),
     };
 
     let task_handle = tokio::spawn(async move {
@@ -222,6 +256,9 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
         block_hash: tx.block_hash,
         block_time: tx.block_time,
         fee: tx.fee_zatoshis as f64,
+        // Sapling notes: spending fields are always None (Orchard-only).
+        // We hardcode None here rather than forwarding from the Rust struct
+        // to make the Orchard-only intent explicit.
         sapling_notes: tx
             .sapling_notes
             .into_iter()
@@ -229,6 +266,13 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
                 amount: n.amount as f64,
                 transfer_type: n.transfer_type,
                 memo: n.memo,
+                nullifier: None,
+                rho: None,
+                rseed: None,
+                cmx: None,
+                position: None,
+                recipient: None,
+                is_spent: false,
             })
             .collect(),
         orchard_notes: tx
@@ -238,6 +282,13 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
                 amount: n.amount as f64,
                 transfer_type: n.transfer_type,
                 memo: n.memo,
+                nullifier: n.nullifier,
+                rho: n.rho,
+                rseed: n.rseed,
+                cmx: n.cmx,
+                position: n.position.map(|p| p.to_string()),
+                recipient: n.recipient,
+                is_spent: n.is_spent,
             })
             .collect(),
     }
@@ -270,6 +321,13 @@ mod tests {
             amount,
             transfer_type: transfer_type.to_string(),
             memo: memo.to_string(),
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            position: None,
+            recipient: None,
+            is_spent: false,
         }
     }
 
@@ -283,6 +341,7 @@ mod tests {
             orchard_only: Some(false),
             max_retries: None,
             verbose: None,
+            known_nullifiers: None,
         }
     }
 
@@ -459,5 +518,103 @@ mod tests {
             "expected 'called more than once' error, got: {}",
             err.reason
         );
+    }
+
+    // ── grpc_tx_to_napi — new spending fields ─────────────────────────────────
+
+    /// A note with all 6 spending fields populated must have them preserved after
+    /// conversion through `grpc_tx_to_napi`.
+    #[test]
+    fn test_grpc_tx_to_napi_note_with_spending_fields() {
+        let nullifier_hex = hex::encode([0xAAu8; 32]);
+        let rseed_hex = hex::encode([0xBBu8; 32]);
+        let cmx_hex = hex::encode([0xCCu8; 32]);
+        let recipient_hex = hex::encode([0xDDu8; 43]);
+        let position_u64: u64 = 42;
+
+        let grpc = GrpcTx {
+            orchard_notes: vec![GrpcNote {
+                amount: 100_000_000,
+                transfer_type: "incoming".to_string(),
+                memo: "test".to_string(),
+                nullifier: Some(nullifier_hex.clone()),
+                rho: Some("dd".repeat(32)),
+                rseed: Some(rseed_hex.clone()),
+                cmx: Some(cmx_hex.clone()),
+                position: Some(position_u64),
+                recipient: Some(recipient_hex.clone()),
+                is_spent: true,
+            }],
+            ..make_grpc_tx()
+        };
+
+        let napi = grpc_tx_to_napi(grpc);
+        let note = &napi.orchard_notes[0];
+
+        assert_eq!(note.nullifier.as_deref(), Some(nullifier_hex.as_str()), "nullifier must be preserved");
+        assert_eq!(note.rseed.as_deref(), Some(rseed_hex.as_str()), "rseed must be preserved");
+        assert_eq!(note.cmx.as_deref(), Some(cmx_hex.as_str()), "cmx must be preserved");
+        assert_eq!(note.position.as_deref(), Some(position_u64.to_string().as_str()), "position must be decimal string");
+        assert_eq!(note.recipient.as_deref(), Some(recipient_hex.as_str()), "recipient must be preserved");
+        assert!(note.is_spent, "is_spent must be true");
+    }
+
+    /// An outgoing note with all spending fields `None`/`false` must produce a
+    /// NAPI note where all those fields are `None`/`false`.
+    #[test]
+    fn test_grpc_tx_to_napi_outgoing_note_has_null_fields() {
+        let grpc = GrpcTx {
+            orchard_notes: vec![GrpcNote {
+                amount: 50_000,
+                transfer_type: "outgoing".to_string(),
+                memo: String::new(),
+                nullifier: None,
+                rho: None,
+                rseed: None,
+                cmx: None,
+                position: None,
+                recipient: None,
+                is_spent: false,
+            }],
+            ..make_grpc_tx()
+        };
+
+        let napi = grpc_tx_to_napi(grpc);
+        let note = &napi.orchard_notes[0];
+
+        assert!(note.nullifier.is_none(), "outgoing: nullifier must be None");
+        assert!(note.rseed.is_none(), "outgoing: rseed must be None");
+        assert!(note.cmx.is_none(), "outgoing: cmx must be None");
+        assert!(note.position.is_none(), "outgoing: position must be None");
+        assert!(note.recipient.is_none(), "outgoing: recipient must be None");
+        assert!(!note.is_spent, "outgoing: is_spent must be false");
+    }
+
+    /// `position = 2_100_000_000u64` must convert to exactly `2_100_000_000.0f64`
+    /// without precision loss (well within the safe integer range of f64).
+    #[test]
+    fn test_grpc_tx_to_napi_position_as_decimal_string() {
+        let position_u64: u64 = 2_100_000_000;
+        let grpc = GrpcTx {
+            orchard_notes: vec![GrpcNote {
+                amount: 1,
+                transfer_type: "incoming".to_string(),
+                memo: String::new(),
+                nullifier: None,
+                rho: None,
+                rseed: None,
+                cmx: None,
+                position: Some(position_u64),
+                recipient: None,
+                is_spent: false,
+            }],
+            ..make_grpc_tx()
+        };
+
+        let napi = grpc_tx_to_napi(grpc);
+        let pos_str = napi.orchard_notes[0].position.as_deref().unwrap();
+        assert_eq!(pos_str, "2100000000", "position must be decimal string");
+        // Round-trip: string → u64 must give back the original value.
+        assert_eq!(pos_str.parse::<u64>().unwrap(), position_u64, "string → u64 round-trip must be lossless");
     }
 }

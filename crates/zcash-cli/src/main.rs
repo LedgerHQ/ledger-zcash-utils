@@ -348,7 +348,7 @@ async fn cmd_sync(args: SyncArgs) {
     }
     let max_retries = args.max_retries.unwrap_or(3);
     let total_blocks = end_height.saturating_sub(start_height) + 1;
-    let n_chunks = (total_blocks + chunk_size - 1) / chunk_size;
+    let n_chunks = total_blocks.div_ceil(chunk_size);
     let verbose = args.verbose;
 
     // ── Params summary (always printed) ──────────────────────────────────────
@@ -444,6 +444,7 @@ async fn cmd_sync(args: SyncArgs) {
                         orchard_only,
                         on_block_done,
                         on_transaction: None,
+                        known_nullifiers: vec![],
                     })
                     .await;
                     (idx, s, e, r)
@@ -524,6 +525,7 @@ async fn cmd_sync(args: SyncArgs) {
         trial_decrypt_ms: 0,
         get_transaction_ms: 0,
         full_decrypt_ms: 0,
+        spent_known_nullifiers: vec![],
     };
 
     match args.format {
@@ -651,6 +653,13 @@ async fn cmd_sync(args: SyncArgs) {
                                 "amount": n.amount,
                                 "transfer_type": n.transfer_type,
                                 "memo": n.memo,
+                                "nullifier": n.nullifier,
+                                "rho": n.rho,
+                                "rseed": n.rseed,
+                                "cmx": n.cmx,
+                                "position": n.position,
+                                "recipient": n.recipient,
+                                "is_spent": n.is_spent,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -730,7 +739,7 @@ fn build_chunks(start: u32, end: u32, chunk_size: u32) -> Vec<(u32, u32)> {
         return Vec::new();
     }
     let total = end - start + 1;
-    let n = ((total + chunk_size - 1) / chunk_size) as usize;
+    let n = total.div_ceil(chunk_size) as usize;
     let mut v = Vec::with_capacity(n);
     let mut h = start;
     while h <= end {
