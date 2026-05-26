@@ -33,8 +33,20 @@ export interface SyncParams {
   maxRetries?: number
   /** Emit per-phase timing diagnostics to stderr every 10 seconds. */
   verbose?: boolean
+  /**
+   * Hex-encoded nullifiers of notes received in previous scans that are still
+   * unspent. Enables spent detection across incremental sync boundaries.
+   */
+  knownNullifiers?: Array<string>
 }
-/** A single shielded note found during decryption. */
+/**
+ * A single shielded note found during decryption.
+ *
+ * Shared between Orchard and Sapling. The spending fields (`nullifier`,
+ * `rseed`, `cmx`, `position`, `recipient`) are Orchard-specific and `None`
+ * for Sapling notes. A dedicated Sapling type is deferred until Sapling
+ * spending is needed.
+ */
 export interface ShieldedNote {
   /** Amount in zatoshis (f64 for JS Number compatibility). */
   amount: number
@@ -42,6 +54,24 @@ export interface ShieldedNote {
   transferType: string
   /** Memo text decoded from the note. */
   memo: string
+  /** Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
+  nullifier?: string
+  /** rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts. */
+  rho?: string
+  /** Random seed (64-char hex = 32 bytes). Required for spending. */
+  rseed?: string
+  /** Extracted note commitment cmx (64-char hex = 32 bytes). Required for Merkle witness. */
+  cmx?: string
+  /**
+   * Leaf position in the Orchard commitment tree (decimal string).
+   * None when ChainMetadata is absent.
+   * String avoids f64 precision loss on u64 -> f64 -> u64 round-trips.
+   */
+  position?: string
+  /** Recipient bytes (86-char hex = 43 bytes: 11-byte d + 32-byte pk_d). For note reconstruction. */
+  recipient?: string
+  /** True if this note was spent in a later block within the scanned range. */
+  isSpent: boolean
 }
 /** A matched and fully-decrypted shielded transaction. */
 export interface ShieldedTransaction {
@@ -66,6 +96,11 @@ export interface ShieldedTransaction {
 export interface SyncStats {
   blocksScanned: number
   elapsedMs: number
+  /**
+   * Hex-encoded nullifiers from `knownNullifiers` that were spent in the scanned range.
+   * JS uses this to mark previously-stored notes as spent.
+   */
+  spentKnownNullifiers: Array<string>
 }
 /**
  * Start scanning a range of compact blocks and return a transaction stream.
@@ -81,9 +116,9 @@ export declare function startSync(params: SyncParams): Promise<TransactionStream
 /** Returns the current chain tip height from the gRPC endpoint. */
 export declare function getChainTip(grpcUrl: string): Promise<number>
 /**
- * Find the block height closest to the given Unix timestamp via binary search.
+ * Find the block height closest to the given Unix timestamp via interpolation search.
  *
- * Returns the height of the first block whose timestamp is ≥ the target.
+ * Returns the height of the latest block whose timestamp is ≤ the target.
  * If the timestamp is before genesis, returns the genesis height.
  * If the timestamp is after the chain tip, returns the tip height.
  */
@@ -105,7 +140,9 @@ export declare class TransactionStream {
   /**
    * Returns the next matched transaction, or `null` when the scan is complete.
    *
-   * Safety: napi-rs requires `unsafe` for `&mut self` in async methods.
+   * # Safety
+   *
+   * napi-rs requires `unsafe` for `&mut self` in async methods.
    * This method is safe to call — it only mutates the internal channel receiver.
    */
   next(): Promise<ShieldedTransaction | null>
@@ -123,7 +160,9 @@ export declare class TransactionStream {
    * returns `null`). Calling this before the stream is done will wait until
    * the background sync task finishes.
    *
-   * Safety: napi-rs requires `unsafe` for `&mut self` in async methods.
+   * # Safety
+   *
+   * napi-rs requires `unsafe` for `&mut self` in async methods.
    */
   stats(): Promise<SyncStats>
 }

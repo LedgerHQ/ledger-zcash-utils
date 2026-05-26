@@ -131,6 +131,52 @@ fn tx1_incoming_note_has_nullifier_for_phase4_tracking() {
     );
 }
 
+// ── TX1: spending fields populated by full_decrypt_tx ─────────────────────────
+
+#[test]
+fn tx1_incoming_note_has_rseed() {
+    let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    let note = &tx.orchard_outputs[0];
+    assert_eq!(note.transfer_type, "incoming");
+    let rseed = note.rseed.expect("incoming Orchard note must have rseed");
+    assert_eq!(rseed.len(), 32, "rseed must be 32 bytes");
+}
+
+#[test]
+fn tx1_incoming_note_has_cmx() {
+    let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    let note = &tx.orchard_outputs[0];
+    let cmx = note.cmx.expect("incoming Orchard note must have cmx");
+    assert_eq!(cmx.len(), 32, "cmx must be 32 bytes");
+}
+
+#[test]
+fn tx1_incoming_note_has_recipient() {
+    let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    let note = &tx.orchard_outputs[0];
+    let recipient = note.recipient.expect("incoming Orchard note must have recipient");
+    assert_eq!(recipient.len(), 43, "recipient must be 43 bytes (11-byte diversifier + 32-byte pk_d)");
+}
+
+#[test]
+fn tx1_incoming_note_has_action_index() {
+    let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    let note = &tx.orchard_outputs[0];
+    // action_index is the 0-based position of this note within the Orchard bundle.
+    assert!(note.action_index.is_some(), "incoming Orchard note must have action_index");
+}
+
+#[test]
+fn tx1_spending_fields_are_deterministic() {
+    // Decrypting the same fixture twice must yield identical spending fields.
+    let a = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    let b = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    assert_eq!(a.orchard_outputs[0].rseed, b.orchard_outputs[0].rseed);
+    assert_eq!(a.orchard_outputs[0].cmx, b.orchard_outputs[0].cmx);
+    assert_eq!(a.orchard_outputs[0].recipient, b.orchard_outputs[0].recipient);
+    assert_eq!(a.orchard_outputs[0].action_index, b.orchard_outputs[0].action_index);
+}
+
 // ── TX2: internal (change) note ───────────────────────────────────────────────
 
 #[test]
@@ -162,6 +208,19 @@ fn tx2_orchard_note_amount_is_122504_zatoshis() {
 fn tx2_orchard_note_has_no_memo() {
     let tx = decrypt_mainnet(TX2_HEX, TX2_HEIGHT);
     assert_eq!(tx.orchard_outputs[0].memo, "");
+}
+
+// ── TX2: spending fields on internal (change) notes ───────────────────────────
+
+#[test]
+fn tx2_internal_note_has_all_spending_fields() {
+    let tx = decrypt_mainnet(TX2_HEX, TX2_HEIGHT);
+    let note = &tx.orchard_outputs[0];
+    assert_eq!(note.transfer_type, "internal");
+    assert!(note.rseed.is_some(), "internal note must have rseed");
+    assert!(note.cmx.is_some(), "internal note must have cmx");
+    assert!(note.recipient.is_some(), "internal note must have recipient");
+    assert!(note.action_index.is_some(), "internal note must have action_index");
 }
 
 // ── TX3: internal (change) note, smaller amount ───────────────────────────────
@@ -233,6 +292,28 @@ fn wrong_ufvk_yields_empty_outputs_but_no_error() {
     if let Ok(tx) = result {
         assert!(tx.orchard_outputs.is_empty(), "wrong-network UFVK must not decrypt our notes");
     }
+}
+
+// ── Sapling notes must not carry spending fields ─────────────────────────────
+
+#[test]
+fn txs1_sapling_note_has_no_spending_fields() {
+    let tx = decrypt_testnet(TX_S1_HEX, TX_S1_HEIGHT);
+    let note = &tx.sapling_outputs[0];
+    assert!(note.rseed.is_none(), "Sapling note must not have rseed");
+    assert!(note.cmx.is_none(), "Sapling note must not have cmx");
+    assert!(note.recipient.is_none(), "Sapling note must not have recipient");
+    assert!(note.action_index.is_none(), "Sapling note must not have action_index");
+}
+
+#[test]
+fn txs2_outgoing_sapling_note_has_no_spending_fields() {
+    let tx = decrypt_testnet(TX_S2_HEX, TX_S2_HEIGHT);
+    let note = note_with_type(&tx.sapling_outputs, "outgoing");
+    assert!(note.rseed.is_none(), "outgoing Sapling note must not have rseed");
+    assert!(note.cmx.is_none(), "outgoing Sapling note must not have cmx");
+    assert!(note.recipient.is_none(), "outgoing Sapling note must not have recipient");
+    assert!(note.action_index.is_none(), "outgoing Sapling note must not have action_index");
 }
 
 // ── Testnet Sapling: TX_S1 — pure incoming ───────────────────────────────────

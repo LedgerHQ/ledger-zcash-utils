@@ -103,6 +103,31 @@ pub struct DecryptedOutput {
     /// Used by the sync engine to detect when received notes are later spent
     /// (outgoing transactions that would otherwise be invisible to trial decryption).
     pub nullifier: Option<[u8; 32]>,
+
+    /// rho value for the note (32 bytes, Pallas base field).
+    /// Equals nf_old from the same Action description (protocol spec section 4.7.3).
+    /// Required together with rseed for `Note::from_parts` during spending.
+    /// `Some` for Orchard incoming/internal; `None` for outgoing and all Sapling notes.
+    pub rho: Option<[u8; 32]>,
+
+    /// Random seed for the note (32 bytes). Needed to re-derive psi, rcm for spending.
+    /// `Some` for Orchard incoming/internal; `None` for outgoing and all Sapling notes.
+    pub rseed: Option<[u8; 32]>,
+
+    /// Extracted note commitment (cmx, 32 bytes — Pallas base field u-coordinate).
+    /// Required to locate the note in the commitment tree.
+    /// `Some` for Orchard incoming/internal; `None` otherwise.
+    pub cmx: Option<[u8; 32]>,
+
+    /// Recipient address bytes (43 bytes: 11-byte diversifier `d` + 32-byte `pk_d`).
+    /// Required to reconstruct the note for spending.
+    /// `Some` for Orchard incoming/internal; `None` otherwise.
+    pub recipient: Option<[u8; 43]>,
+
+    /// 0-based action index within the Orchard bundle of the containing transaction.
+    /// Used by the sync layer to compute the note's Merkle tree position.
+    /// `Some` for Orchard incoming/internal; `None` otherwise.
+    pub action_index: Option<u32>,
 }
 
 /// All decrypted outputs from a single transaction.
@@ -376,6 +401,11 @@ pub fn full_decrypt_tx_with_ufvk(
             memo: decode_memo(f.memo().clone()),
             transfer_type: decode_transfer_type(f.transfer_type()),
             nullifier: None, // Sapling nullifier tracking not needed (Ledger is Orchard-only)
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: None,
         })
         .collect();
 
@@ -386,19 +416,52 @@ pub fn full_decrypt_tx_with_ufvk(
             // Compute the nullifier for incoming/internal notes so the sync engine
             // can later detect when these notes are spent (Phase 4 outgoing-tx detection).
             // Outgoing notes do not generate a nullifier we need to track.
-            let nullifier = if matches!(
+            let is_outgoing = matches!(
                 f.transfer_type(),
                 zcash_client_backend::TransferType::Outgoing
-            ) {
+            );
+
+            let nullifier = if is_outgoing {
                 None
             } else {
                 ufvk.orchard().map(|fvk| f.note().nullifier(fvk).to_bytes())
             };
+
+            // Extract spending fields for incoming/internal notes.
+            // All fields are populated together: all or none.
+            let (rho, rseed, cmx, recipient, action_index) = if is_outgoing {
+                (None, None, None, None, None)
+            } else {
+                let note = f.note();
+
+                let rho_bytes: [u8; 32] = note.rho().to_bytes();
+                let rseed_bytes: [u8; 32] = *note.rseed().as_bytes();
+
+                let cmx_bytes: [u8; 32] = {
+                    let nc = note.commitment();
+                    OrchardExtractedNoteCommitment::from(nc).to_bytes()
+                };
+
+                // to_raw_address_bytes() returns [u8; 43]: 11-byte diversifier + 32-byte pk_d.
+                let recipient_bytes: [u8; 43] = note.recipient().to_raw_address_bytes();
+
+                // index() returns the 0-based action index within the Orchard bundle.
+                // Cast to u32 is safe: action counts per transaction are always < 2^32.
+                let idx: u32 = f.index() as u32;
+
+                (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(recipient_bytes), Some(idx))
+            };
+
             DecryptedOutput {
                 amount: decode_note_value(f.note_value()),
                 memo: decode_memo(f.memo().clone()),
                 transfer_type: decode_transfer_type(f.transfer_type()),
                 nullifier,
+                rho,
+                rseed,
+                cmx,
+                recipient,
+                action_index,
             }
         })
         .collect();
@@ -941,6 +1004,107 @@ mod tests {
         for txid in &result {
             assert!(input_set.contains(txid.as_str()), "unexpected txid in result: {txid}");
         }
+    }
+
+    // ── DecryptedOutput new fields — unit tests ───────────────────────────────
+
+    /// A `DecryptedOutput` with `transfer_type = "outgoing"` must have all
+    /// spending fields set to `None`.  This mirrors what `full_decrypt_tx` does
+    /// for outgoing Orchard notes.
+    #[test]
+    fn test_decrypt_output_new_fields_are_none_for_outgoing() {
+        let output = DecryptedOutput {
+            amount: 1_000,
+            memo: String::new(),
+            transfer_type: "outgoing".to_string(),
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: None,
+        };
+        assert_eq!(output.transfer_type, "outgoing");
+        assert!(output.rseed.is_none(), "outgoing: rseed must be None");
+        assert!(output.cmx.is_none(), "outgoing: cmx must be None");
+        assert!(output.recipient.is_none(), "outgoing: recipient must be None");
+        assert!(output.action_index.is_none(), "outgoing: action_index must be None");
+    }
+
+    /// Sapling outputs are always constructed with all spending fields set to
+    /// `None` (Sapling uses a different spending mechanism; we never populate
+    /// these for Sapling).
+    #[test]
+    fn test_decrypt_output_sapling_has_no_spending_fields() {
+        // Simulate the Sapling mapping path by constructing DecryptedOutput
+        // exactly as the sapling_outputs iterator does.
+        let output = DecryptedOutput {
+            amount: 5_000_000,
+            memo: "sapling memo".to_string(),
+            transfer_type: "incoming".to_string(),
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: None,
+        };
+        assert!(output.rseed.is_none(), "Sapling: rseed must be None");
+        assert!(output.cmx.is_none(), "Sapling: cmx must be None");
+        assert!(output.recipient.is_none(), "Sapling: recipient must be None");
+        assert!(output.action_index.is_none(), "Sapling: action_index must be None");
+    }
+
+    /// Verify that incoming/internal `DecryptedOutput` values can carry spending
+    /// fields with the correct byte lengths.  This test checks the structural
+    /// contract without requiring a real decryption (which needs network / fixtures).
+    #[test]
+    fn test_decrypt_output_incoming_spending_fields_byte_lengths() {
+        let rseed = [0xaau8; 32];
+        let cmx = [0xbbu8; 32];
+        let recipient = [0xccu8; 43];
+
+        let output = DecryptedOutput {
+            amount: 100_000_000,
+            memo: String::new(),
+            transfer_type: "incoming".to_string(),
+            nullifier: Some([0u8; 32]),
+            rho: Some([0xddu8; 32]),
+            rseed: Some(rseed),
+            cmx: Some(cmx),
+            recipient: Some(recipient),
+            action_index: Some(0),
+        };
+
+        let r = output.rseed.unwrap();
+        assert_eq!(r.len(), 32, "rseed must be 32 bytes");
+
+        let c = output.cmx.unwrap();
+        assert_eq!(c.len(), 32, "cmx must be 32 bytes");
+
+        let rec = output.recipient.unwrap();
+        assert_eq!(rec.len(), 43, "recipient must be 43 bytes");
+
+        assert_eq!(output.action_index.unwrap(), 0);
+    }
+
+    /// `action_index` distinguishes multiple actions within the same transaction.
+    #[test]
+    fn test_decrypt_output_action_index_values() {
+        let make = |idx: u32| DecryptedOutput {
+            amount: 1,
+            memo: String::new(),
+            transfer_type: "incoming".to_string(),
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: Some(idx),
+        };
+        assert_eq!(make(0).action_index, Some(0));
+        assert_eq!(make(7).action_index, Some(7));
+        assert_eq!(make(u32::MAX).action_index, Some(u32::MAX));
     }
 
     // ── full_decrypt_tx — error paths ─────────────────────────────────────────

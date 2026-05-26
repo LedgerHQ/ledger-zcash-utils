@@ -22,8 +22,8 @@ pnpm napi typegen --cargo-cwd crates/zcash-ffi-node
 
 > **Note:** Key derivation (`derive_keys`) is available in the CLI (`zcash-cli
 > derive`) and in the `zcash-crypto` Rust crate, but is not exported by the
-> Node.js binding. Only `startSync`, `getChainTip`, and `TransactionStream` are
-> exposed.
+> Node.js binding. Exported functions: `startSync`, `getChainTip`,
+> `findBlockHeight`, and the `TransactionStream` class.
 
 ### Block scanning
 
@@ -43,7 +43,10 @@ const stream: TransactionStream = await startSync({
 let tx: ShieldedTransaction | null
 while ((tx = await stream.next()) !== null) {
   // tx.txid, tx.blockHeight, tx.blockTime, tx.fee (zatoshis)
-  // tx.saplingNotes, tx.orchardNotes
+  // tx.saplingNotes, tx.orchardNotes — each note has:
+  //   amount, transferType, memo
+  //   nullifier, rseed, cmx, position, recipient (hex | null)
+  //   isSpent (boolean)
   console.log(tx)
 }
 

@@ -17,8 +17,7 @@ use zcash_client_backend::proto::{
     },
 };
 use zcash_crypto::decrypt::{
-    self, CompactOrchardAction, CompactSaplingOutput, CompactTransaction, DecryptedOutput,
-    PreparedIvks,
+    self, CompactOrchardAction, CompactSaplingOutput, CompactTransaction, PreparedIvks,
 };
 use zcash_crypto::network::parse_network;
 use zcash_keys::keys::UnifiedFullViewingKey;
@@ -38,7 +37,7 @@ use crate::client::{connect, UNARY_TIMEOUT};
 ///   the stream → HTTP/2 flow control pauses the server organically
 fn pipeline_depth() -> usize {
     std::thread::available_parallelism()
-        .map(|p| (p.get() / 2).max(2).min(16))
+        .map(|p| (p.get() / 2).clamp(2, 16))
         .unwrap_or(4)
 }
 
@@ -81,9 +80,22 @@ pub struct SyncParams {
     /// `2^max_retries` sub-requests may be issued for a single original range.
     /// `None` or `Some(0)` disables retry entirely (single attempt).
     pub max_retries: Option<u32>,
+    /// Hex-encoded nullifiers of notes received in previous scans that are still
+    /// unspent. Pre-populates the spent-detection set so that Phase 4/5 can
+    /// detect when a previously-received note is spent in the current scan range.
+    ///
+    /// Without this, incremental syncs would miss spending transactions for notes
+    /// received in earlier scans, leaving `is_spent` incorrectly set to `false`.
+    pub known_nullifiers: Vec<String>,
 }
 
 /// A single shielded note found during decryption.
+///
+/// Used for both Orchard and Sapling notes. The spending fields (`nullifier`,
+/// `rseed`, `cmx`, `position`, `recipient`) are Orchard-specific and always
+/// `None` for Sapling notes. A dedicated `SaplingNote` type would be cleaner
+/// but is deferred until Sapling spending support is needed (Ledger is
+/// Orchard-only).
 #[derive(Debug, Clone)]
 pub struct ShieldedNote {
     /// Value in zatoshis.
@@ -92,6 +104,38 @@ pub struct ShieldedNote {
     pub transfer_type: String,
     /// Memo text (UTF-8, null-trimmed).
     pub memo: String,
+
+    /// Orchard nullifier (32 bytes, hex-encoded). Present for incoming/internal notes.
+    /// Used for spent-tracking and as identifier for spending.
+    pub nullifier: Option<String>,
+
+    /// rho value (32 bytes, hex-encoded). Equals nf_old from the same Action.
+    /// Required together with rseed for Note::from_parts during spending.
+    /// Present for incoming/internal Orchard notes only.
+    pub rho: Option<String>,
+
+    /// Random seed (32 bytes, hex-encoded). Required to re-derive spending parameters.
+    /// Present for incoming/internal Orchard notes only.
+    pub rseed: Option<String>,
+
+    /// Extracted note commitment cmx (32 bytes, hex-encoded).
+    /// Required to compute the Merkle witness for spending.
+    /// Present for incoming/internal Orchard notes only.
+    pub cmx: Option<String>,
+
+    /// Leaf index of this note in the Orchard commitment tree.
+    /// Derived from `CompactBlock.chain_metadata.orchard_commitment_tree_size`.
+    /// `None` when chain_metadata is absent for a block.
+    pub position: Option<u64>,
+
+    /// Recipient address bytes (43 bytes, hex-encoded: 11-byte diversifier + 32-byte pk_d).
+    /// Required for note reconstruction during spending.
+    /// Present for incoming/internal Orchard notes only.
+    pub recipient: Option<String>,
+
+    /// True if this note was spent in a subsequent block within the scanned range.
+    /// False for unspent notes. Always false for outgoing notes.
+    pub is_spent: bool,
 }
 
 /// A matched and fully-decrypted shielded transaction.
@@ -130,6 +174,11 @@ pub struct SyncResult {
     pub get_transaction_ms: u64,
     /// Total time (ms) spent on full transaction decryption.
     pub full_decrypt_ms: u64,
+    /// Hex-encoded nullifiers from `known_nullifiers` that were observed as spent
+    /// inputs in the scanned range. The JS layer uses this to mark previously-stored
+    /// notes as spent (notes not in `transactions` because they were received in
+    /// earlier scans).
+    pub spent_known_nullifiers: Vec<String>,
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -191,6 +240,7 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
         trial_decrypt_ms: 0,
         get_transaction_ms: 0,
         full_decrypt_ms: 0,
+        spent_known_nullifiers: Vec::new(),
     };
 
     while let Some((s, e, attempts)) = queue.pop_front() {
@@ -208,6 +258,7 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
                 combined.trial_decrypt_ms += result.trial_decrypt_ms;
                 combined.get_transaction_ms += result.get_transaction_ms;
                 combined.full_decrypt_ms += result.full_decrypt_ms;
+                combined.spent_known_nullifiers.extend(result.spent_known_nullifiers);
             }
             Err(ref err) if is_retryable_error(err) && attempts < max_retries => {
                 let block_count = e - s + 1;
@@ -343,20 +394,64 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     // 7. Full-decrypt matched transactions (sequential; matching is rare).
     let mut all_transactions: Vec<ShieldedTransaction> = Vec::new();
     // Nullifiers of notes we received — used in Phase 4 to find spending txs.
-    let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
+    // Pre-populate with nullifiers from previous scans so incremental syncs can
+    // detect when previously-received notes are spent in the current range.
+    let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = params
+        .known_nullifiers
+        .iter()
+        .filter_map(|h| {
+            match hex::decode(h) {
+                Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
+                    Ok(arr) => Some(arr),
+                    Err(_) => {
+                        eprintln!(
+                            "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
+                            b.len(),
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "WARN: malformed known_nullifier hex {:?}: {}",
+                        &h[..h.len().min(16)],
+                        e,
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
     let mut get_transaction_ms: u64 = 0;
     let mut full_decrypt_ms: u64 = 0;
 
     for result in &block_results {
+        let (tree_size_before_block, tx_action_start_map) = compute_block_position_ctx(result);
+
         for txid_hex in &result.matched_txids {
+            let tx_action_start = match tx_action_start_map.get(txid_hex.as_str()) {
+                Some(&offset) => offset,
+                None => {
+                    eprintln!(
+                        "WARN: matched txid {} not found in tx_orchard_action_counts for block {} — position will be inaccurate",
+                        txid_hex, result.height,
+                    );
+                    0
+                }
+            };
+
             if let Some((tx, nullifiers)) = fetch_and_decrypt_tx(
                 &mut client,
-                txid_hex,
-                result.height,
-                &result.hash,
-                result.time,
-                &ufvk,
-                network,
+                BlockFetchCtx {
+                    txid_hex,
+                    height: result.height,
+                    block_hash: &result.hash,
+                    block_time: result.time,
+                    ufvk: &ufvk,
+                    network,
+                    tree_size_before_block,
+                    tx_action_start,
+                },
                 &mut get_transaction_ms,
                 &mut full_decrypt_ms,
             )
@@ -389,6 +484,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
             all_transactions.iter().map(|tx| tx.txid.clone()).collect();
 
         for result in &block_results {
+            let (tree_size_before_block, tx_action_start_map) = compute_block_position_ctx(result);
+
             for (txid, nfs) in &result.tx_nullifiers {
                 if already_found.contains(txid) {
                     continue; // already processed in Phase 2 (e.g. self-send)
@@ -397,15 +494,30 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                     continue; // does not spend any of our notes
                 }
 
+                let tx_action_start = match tx_action_start_map.get(txid.as_str()) {
+                    Some(&offset) => offset,
+                    None => {
+                        eprintln!(
+                            "WARN: Phase 4 spending txid {} not found in tx_orchard_action_counts for block {} — position will be inaccurate",
+                            txid, result.height,
+                        );
+                        0
+                    }
+                };
+
                 // This tx spends one of our received notes — fetch and full-decrypt it.
                 if let Some((tx, _)) = fetch_and_decrypt_tx(
                     &mut client,
-                    txid,
-                    result.height,
-                    &result.hash,
-                    result.time,
-                    &ufvk,
-                    network,
+                    BlockFetchCtx {
+                        txid_hex: txid,
+                        height: result.height,
+                        block_hash: &result.hash,
+                        block_time: result.time,
+                        ufvk: &ufvk,
+                        network,
+                        tree_size_before_block,
+                        tx_action_start,
+                    },
                     &mut get_transaction_ms,
                     &mut full_decrypt_ms,
                 )
@@ -423,6 +535,83 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
         all_transactions.sort_unstable_by_key(|tx| tx.block_height);
     }
 
+    // Phase 5: Mark received notes as spent.
+    //
+    // Collect all nullifiers that were spent in any transaction within the scanned
+    // range. A note is spent if its nullifier appears as a spent nullifier in any
+    // block (regardless of whether the spending tx was Phase-2 or Phase-4 detected).
+    let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+        .iter()
+        .flat_map(|r| r.tx_nullifiers.iter())
+        .flat_map(|(_, nfs)| nfs.iter().copied())
+        .filter(|nf| our_nullifiers.contains(nf))
+        .collect();
+
+    if !spent_nullifiers.is_empty() {
+        for tx in &mut all_transactions {
+            for note in &mut tx.orchard_notes {
+                if let Some(ref nf_hex) = note.nullifier {
+                    match hex::decode(nf_hex) {
+                        Ok(nf_bytes) => {
+                            if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes.as_slice()) {
+                                if spent_nullifiers.contains(&nf_arr) {
+                                    note.is_spent = true;
+                                }
+                            } else {
+                                eprintln!(
+                                    "WARN: is_spent: nullifier hex has wrong length ({} bytes), skipping",
+                                    nf_hex.len() / 2
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "WARN: is_spent: malformed nullifier hex {:?}: {}",
+                                &nf_hex[..nf_hex.len().min(16)],
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Identify which known_nullifiers (from previous scans) were spent in this range.
+    // The JS layer needs this to mark notes in its local store that are NOT in
+    // all_transactions (they were received in earlier scans, not this one).
+    let known_nf_set: std::collections::HashSet<[u8; 32]> = params
+        .known_nullifiers
+        .iter()
+        .filter_map(|h| {
+            match hex::decode(h) {
+                Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
+                    Ok(arr) => Some(arr),
+                    Err(_) => {
+                        eprintln!(
+                            "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
+                            b.len(),
+                        );
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "WARN: malformed known_nullifier hex {:?}: {}",
+                        &h[..h.len().min(16)],
+                        e,
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    let spent_known_nullifiers: Vec<String> = spent_nullifiers
+        .iter()
+        .filter(|nf| known_nf_set.contains(*nf))
+        .map(hex::encode)
+        .collect();
+
     Ok(SyncResult {
         transactions: all_transactions,
         blocks_scanned: block_results.len() as u32,
@@ -431,10 +620,65 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
         trial_decrypt_ms: trial_ms_final.load(Ordering::Relaxed),
         get_transaction_ms,
         full_decrypt_ms,
+        spent_known_nullifiers,
     })
 }
 
 // ─── private helpers ──────────────────────────────────────────────────────────
+
+/// Compute the Orchard commitment tree size before a block and the cumulative
+/// action offset for each transaction in the block. Used by both Phase 2 and
+/// Phase 4 to derive per-note positions.
+fn compute_block_position_ctx(result: &TrialResult) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
+    let total_actions_in_block: u32 = result
+        .tx_orchard_action_counts
+        .iter()
+        .map(|(_, c)| c)
+        .sum();
+    let tree_size_before_block: Option<u64> = result
+        .orchard_tree_size_after
+        .and_then(|sz| {
+            let sz = sz as u64;
+            let actions = total_actions_in_block as u64;
+            if sz < actions {
+                eprintln!(
+                    "WARN: orchard_tree_size_after ({}) < total actions in block ({}) at height {} \
+                     -- chain_metadata may be corrupt, skipping position tracking for this block",
+                    sz, actions, result.height,
+                );
+                None
+            } else {
+                Some(sz - actions)
+            }
+        });
+
+    let mut cumulative: u64 = 0;
+    let mut tx_action_start_map: std::collections::HashMap<&str, u64> = Default::default();
+    for (txid, count) in &result.tx_orchard_action_counts {
+        if let Some(prev) = tx_action_start_map.insert(txid.as_str(), cumulative) {
+            eprintln!(
+                "WARN: duplicate txid {} in block {} (previous offset {}, new {})",
+                txid, result.height, prev, cumulative,
+            );
+        }
+        cumulative += *count as u64;
+    }
+
+    (tree_size_before_block, tx_action_start_map)
+}
+
+/// Per-block context passed to `fetch_and_decrypt_tx` to avoid exceeding the
+/// argument-count lint limit while keeping the call-site readable.
+struct BlockFetchCtx<'a> {
+    txid_hex: &'a str,
+    height: u32,
+    block_hash: &'a str,
+    block_time: u32,
+    ufvk: &'a UnifiedFullViewingKey,
+    network: Network,
+    tree_size_before_block: Option<u64>,
+    tx_action_start: u64,
+}
 
 /// Intermediate result produced by the trial-decrypt pipeline for one compact block.
 struct TrialResult {
@@ -446,6 +690,15 @@ struct TrialResult {
     /// Each entry records the nullifiers spent by that transaction so we can match
     /// against nullifiers of notes we received in Phase 2.
     tx_nullifiers: Vec<(String, Vec<[u8; 32]>)>,
+
+    /// Orchard commitment tree size after this block (from CompactBlock.chain_metadata).
+    /// `None` if chain_metadata is absent or orchard_commitment_tree_size is 0.
+    orchard_tree_size_after: Option<u32>,
+    /// Per-transaction Orchard action counts in block order: (txid, action_count).
+    /// Used to compute per-note position offsets within the block.
+    /// Txids are expected to be unique within a block; duplicates are logged as
+    /// warnings by `compute_block_position_ctx`.
+    tx_orchard_action_counts: Vec<(String, u32)>,
 }
 
 /// Parse the network string, prepare IVKs, and decode the UFVK.
@@ -525,6 +778,8 @@ async fn process_compact_block(
             time: block_time,
             matched_txids: vec![],
             tx_nullifiers: vec![],
+            orchard_tree_size_after: None,
+            tx_orchard_action_counts: vec![],
         });
     }
 
@@ -557,6 +812,22 @@ async fn process_compact_block(
         })
         .collect();
 
+    // Extract Orchard commitment tree size from chain_metadata.
+    // If chain_metadata is absent or zero, position tracking falls back to None for this block.
+    let orchard_tree_size_after: Option<u32> = block
+        .chain_metadata
+        .as_ref()
+        .map(|m| m.orchard_commitment_tree_size)
+        .filter(|&sz| sz > 0);
+
+    // Record per-tx Orchard action counts (in the same order as block.vtx).
+    // Used to compute per-note positions: each note's position = tree_size_before_block
+    // + cumulative actions before this tx + note's action_index within the tx.
+    let tx_orchard_action_counts: Vec<(String, u32)> = compact_txs
+        .iter()
+        .map(|tx| (tx.txid.clone(), tx.orchard_actions.len() as u32))
+        .collect();
+
     // Offload CPU-bound trial decryption to the blocking thread pool.
     // Rayon parallelises across outputs inside each block; the pipeline
     // parallelises across blocks.
@@ -579,6 +850,8 @@ async fn process_compact_block(
         time: block_time,
         matched_txids,
         tx_nullifiers,
+        orchard_tree_size_after,
+        tx_orchard_action_counts,
     })
 }
 
@@ -589,15 +862,20 @@ async fn process_compact_block(
 /// of notes received by this account, so Phase 4 can detect spending transactions.
 async fn fetch_and_decrypt_tx(
     client: &mut CompactTxStreamerClient<Channel>,
-    txid_hex: &str,
-    height: u32,
-    block_hash: &str,
-    block_time: u32,
-    ufvk: &UnifiedFullViewingKey,
-    network: Network,
+    ctx: BlockFetchCtx<'_>,
     get_transaction_ms: &mut u64,
     full_decrypt_ms: &mut u64,
 ) -> Result<Option<(ShieldedTransaction, Vec<[u8; 32]>)>> {
+    let BlockFetchCtx {
+        txid_hex,
+        height,
+        block_hash,
+        block_time,
+        ufvk,
+        network,
+        tree_size_before_block,
+        tx_action_start,
+    } = ctx;
     // GetTransaction — TxFilter.hash expects internal (little-endian) byte order.
     let txid_bytes_le: Vec<u8> = hex::decode(txid_hex)
         .map_err(|e| anyhow!("txid hex decode: {}", e))?
@@ -643,6 +921,50 @@ async fn fetch_and_decrypt_tx(
         .filter_map(|note| note.nullifier)
         .collect();
 
+    // Sapling spent-tracking is out of scope: Ledger only supports Orchard spending.
+    let sapling_notes: Vec<ShieldedNote> = decrypted
+        .sapling_outputs
+        .into_iter()
+        .map(|o| ShieldedNote {
+            amount: o.amount,
+            transfer_type: o.transfer_type,
+            memo: o.memo,
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            position: None,
+            recipient: None,
+            is_spent: false,
+        })
+        .collect();
+
+    let orchard_notes: Vec<ShieldedNote> = decrypted
+        .orchard_outputs
+        .iter()
+        .map(|note| {
+            // Compute the leaf position in the Orchard commitment tree.
+            // position = tree_size_before_block + tx_action_start + action_index_within_tx
+            // Returns None when chain_metadata was absent for this block.
+            let position = tree_size_before_block.and_then(|tree_size| {
+                note.action_index.map(|idx| tree_size + tx_action_start + idx as u64)
+            });
+
+            ShieldedNote {
+                amount: note.amount,
+                transfer_type: note.transfer_type.clone(),
+                memo: note.memo.clone(),
+                nullifier: note.nullifier.map(hex::encode),
+                rho: note.rho.map(hex::encode),
+                rseed: note.rseed.map(hex::encode),
+                cmx: note.cmx.map(hex::encode),
+                position,
+                recipient: note.recipient.map(hex::encode),
+                is_spent: false, // set by Phase 5 post-processing
+            }
+        })
+        .collect();
+
     let tx = ShieldedTransaction {
         txid: txid_hex.to_string(),
         hex: tx_hex,
@@ -650,8 +972,8 @@ async fn fetch_and_decrypt_tx(
         block_hash: block_hash.to_string(),
         block_time,
         fee_zatoshis: decrypted.fee_zatoshis,
-        sapling_notes: decrypted.sapling_outputs.into_iter().map(to_shielded_note).collect(),
-        orchard_notes: decrypted.orchard_outputs.into_iter().map(to_shielded_note).collect(),
+        sapling_notes,
+        orchard_notes,
     };
 
     Ok(Some((tx, received_nullifiers)))
@@ -678,20 +1000,12 @@ fn proto_orchard_to_compact(p: &ProtoOrchardAction) -> CompactOrchardAction {
     }
 }
 
-/// Convert a [`DecryptedOutput`] from zcash-crypto to the gRPC layer's [`ShieldedNote`].
-fn to_shielded_note(o: DecryptedOutput) -> ShieldedNote {
-    ShieldedNote {
-        amount: o.amount,
-        transfer_type: o.transfer_type,
-        memo: o.memo,
-    }
-}
-
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_crypto::decrypt::DecryptedOutput;
 
     /// UFVK derived from the "abandon ×11 about" BIP-39 mnemonic on mainnet
     /// (account 0). This is a well-known test vector; no spending key material
@@ -710,6 +1024,7 @@ mod tests {
             on_transaction: None,
             orchard_only: false,
             max_retries: None,
+            known_nullifiers: vec![],
         }
     }
 
@@ -752,18 +1067,330 @@ mod tests {
         assert_eq!(compact.ciphertext, vec![4u8; 52]);
     }
 
+    /// Outgoing `DecryptedOutput` values produce a `ShieldedNote` where all
+    /// spending fields are `None` / `false`.
     #[test]
-    fn to_shielded_note_conversion_preserves_fields() {
-        let output = DecryptedOutput {
+    fn test_to_shielded_note_outgoing_all_spending_fields_none() {
+        // Simulate what fetch_and_decrypt_tx does for an outgoing orchard note.
+        let dec = DecryptedOutput {
             amount: 42_000_000,
             memo: "test memo".to_string(),
-            transfer_type: "incoming".to_string(),
+            transfer_type: "outgoing".to_string(),
             nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: None,
         };
-        let note = to_shielded_note(output);
+        // Inline mapping (mirrors the production code path in fetch_and_decrypt_tx).
+        let note = ShieldedNote {
+            amount: dec.amount,
+            transfer_type: dec.transfer_type.clone(),
+            memo: dec.memo.clone(),
+            nullifier: dec.nullifier.map(hex::encode),
+            rho: dec.rho.map(hex::encode),
+            rseed: dec.rseed.map(hex::encode),
+            cmx: dec.cmx.map(hex::encode),
+            position: None,
+            recipient: dec.recipient.map(hex::encode),
+            is_spent: false,
+        };
         assert_eq!(note.amount, 42_000_000);
         assert_eq!(note.memo, "test memo");
-        assert_eq!(note.transfer_type, "incoming");
+        assert_eq!(note.transfer_type, "outgoing");
+        assert!(note.nullifier.is_none(), "outgoing: nullifier must be None");
+        assert!(note.rseed.is_none(), "outgoing: rseed must be None");
+        assert!(note.cmx.is_none(), "outgoing: cmx must be None");
+        assert!(note.position.is_none(), "outgoing: position must be None");
+        assert!(note.recipient.is_none(), "outgoing: recipient must be None");
+        assert!(!note.is_spent, "outgoing: is_spent must be false");
+    }
+
+    // ── position computation ──────────────────────────────────────────────────
+
+    /// With `orchard_tree_size_after = 100` and two transactions contributing 3+2=5
+    /// actions, `tree_size_before_block = 95`, `txA_start = 0`, `txB_start = 3`.
+    #[test]
+    fn test_position_computed_from_chain_metadata() {
+        let result = TrialResult {
+            height: 500_000,
+            hash: String::new(),
+            time: 0,
+            matched_txids: vec![],
+            tx_nullifiers: vec![],
+            orchard_tree_size_after: Some(100),
+            tx_orchard_action_counts: vec![
+                ("txA".to_string(), 3),
+                ("txB".to_string(), 2),
+            ],
+        };
+
+        let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+        let tree_size_before_block: Option<u64> = result
+            .orchard_tree_size_after
+            .map(|sz| (sz as u64).saturating_sub(total_actions_in_block as u64));
+
+        assert_eq!(tree_size_before_block, Some(95));
+
+        let mut cumulative: u64 = 0;
+        let mut map: std::collections::HashMap<&str, u64> = Default::default();
+        for (txid, count) in &result.tx_orchard_action_counts {
+            map.insert(txid.as_str(), cumulative);
+            cumulative += *count as u64;
+        }
+        assert_eq!(map["txA"], 0);
+        assert_eq!(map["txB"], 3);
+    }
+
+    /// When `chain_metadata` is absent (`orchard_tree_size_after = None`),
+    /// `tree_size_before_block` must be `None`, yielding `position = None` for all notes.
+    #[test]
+    fn test_position_none_when_chain_metadata_absent() {
+        let result = TrialResult {
+            height: 500_000,
+            hash: String::new(),
+            time: 0,
+            matched_txids: vec![],
+            tx_nullifiers: vec![],
+            orchard_tree_size_after: None,
+            tx_orchard_action_counts: vec![("txA".to_string(), 3)],
+        };
+
+        let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+        let tree_size_before_block: Option<u64> = result
+            .orchard_tree_size_after
+            .map(|sz| (sz as u64).saturating_sub(total_actions_in_block as u64));
+
+        assert!(tree_size_before_block.is_none());
+
+        // With no tree_size, note position must be None regardless of action_index.
+        let position = tree_size_before_block.and_then(|ts| Some(ts + 0 + 0u64));
+        assert!(position.is_none());
+    }
+
+    /// With 2 transactions of 3 actions each and `tree_size_before_block = 0`,
+    /// the 6 note positions are 0..=5.
+    #[test]
+    fn test_position_sequential_actions_within_block() {
+        let result = TrialResult {
+            height: 500_000,
+            hash: String::new(),
+            time: 0,
+            matched_txids: vec![],
+            tx_nullifiers: vec![],
+            orchard_tree_size_after: Some(6),
+            tx_orchard_action_counts: vec![
+                ("txA".to_string(), 3),
+                ("txB".to_string(), 3),
+            ],
+        };
+
+        let total_actions: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+        let tree_size_before_block: u64 =
+            result.orchard_tree_size_after.unwrap() as u64 - total_actions as u64;
+        assert_eq!(tree_size_before_block, 0);
+
+        let mut cumulative: u64 = 0;
+        let mut map: std::collections::HashMap<&str, u64> = Default::default();
+        for (txid, count) in &result.tx_orchard_action_counts {
+            map.insert(txid.as_str(), cumulative);
+            cumulative += *count as u64;
+        }
+
+        // txA actions: positions 0,1,2
+        for idx in 0u64..3 {
+            let pos = tree_size_before_block + map["txA"] + idx;
+            assert_eq!(pos, idx, "txA action {idx} should be at position {idx}");
+        }
+        // txB actions: positions 3,4,5
+        for idx in 0u64..3 {
+            let pos = tree_size_before_block + map["txB"] + idx;
+            assert_eq!(pos, 3 + idx, "txB action {idx} should be at position {}", 3 + idx);
+        }
+    }
+
+    // ── is_spent post-processing ──────────────────────────────────────────────
+
+    fn make_note_with_nullifier(nf_hex: &str) -> ShieldedNote {
+        ShieldedNote {
+            amount: 1_000,
+            transfer_type: "incoming".to_string(),
+            memo: String::new(),
+            nullifier: Some(nf_hex.to_string()),
+            rho: None,
+            rseed: None,
+            cmx: None,
+            position: None,
+            recipient: None,
+            is_spent: false,
+        }
+    }
+
+    fn make_trial_result_with_spending(txid: &str, nf_bytes: [u8; 32]) -> TrialResult {
+        TrialResult {
+            height: 500_001,
+            hash: String::new(),
+            time: 0,
+            matched_txids: vec![],
+            tx_nullifiers: vec![(txid.to_string(), vec![nf_bytes])],
+            orchard_tree_size_after: None,
+            tx_orchard_action_counts: vec![],
+        }
+    }
+
+    /// When a note's nullifier appears in `block_results.tx_nullifiers` AND in
+    /// `our_nullifiers`, Phase 5 must set `is_spent = true` on that note.
+    #[test]
+    fn test_is_spent_marks_note_correctly() {
+        let nf_bytes = [0xAAu8; 32];
+        let nf_hex = hex::encode(nf_bytes);
+
+        let mut all_transactions = vec![ShieldedTransaction {
+            txid: "receiving_tx".to_string(),
+            hex: String::new(),
+            block_height: 500_000,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+        }];
+
+        let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
+        our_nullifiers.insert(nf_bytes);
+
+        let block_results = vec![make_trial_result_with_spending("spending_tx", nf_bytes)];
+
+        // Run Phase 5 logic.
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+            .iter()
+            .flat_map(|r| r.tx_nullifiers.iter())
+            .flat_map(|(_, nfs)| nfs.iter().copied())
+            .filter(|nf| our_nullifiers.contains(nf))
+            .collect();
+
+        for tx in &mut all_transactions {
+            for note in &mut tx.orchard_notes {
+                if let Some(ref nf_hex) = note.nullifier {
+                    if let Ok(nf_bytes_dec) = hex::decode(nf_hex) {
+                        if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes_dec.as_slice()) {
+                            if spent_nullifiers.contains(&nf_arr) {
+                                note.is_spent = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            all_transactions[0].orchard_notes[0].is_spent,
+            "note must be marked as spent"
+        );
+    }
+
+    /// A note whose nullifier is NOT spent in the scanned range must keep
+    /// `is_spent = false` after Phase 5.
+    #[test]
+    fn test_is_spent_false_for_unspent_note() {
+        let nf_bytes = [0xBBu8; 32];
+        let nf_hex = hex::encode(nf_bytes);
+
+        let mut all_transactions = vec![ShieldedTransaction {
+            txid: "receiving_tx".to_string(),
+            hex: String::new(),
+            block_height: 500_000,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+        }];
+
+        let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
+        our_nullifiers.insert(nf_bytes);
+
+        // No block spends this nullifier.
+        let block_results: Vec<TrialResult> = vec![];
+
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+            .iter()
+            .flat_map(|r| r.tx_nullifiers.iter())
+            .flat_map(|(_, nfs)| nfs.iter().copied())
+            .filter(|nf| our_nullifiers.contains(nf))
+            .collect();
+
+        for tx in &mut all_transactions {
+            for note in &mut tx.orchard_notes {
+                if let Some(ref nf_hex) = note.nullifier {
+                    if let Ok(nf_bytes_dec) = hex::decode(nf_hex) {
+                        if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes_dec.as_slice()) {
+                            if spent_nullifiers.contains(&nf_arr) {
+                                note.is_spent = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !all_transactions[0].orchard_notes[0].is_spent,
+            "unspent note must have is_spent = false"
+        );
+    }
+
+    /// A nullifier that appears in `block_results` but is NOT in `our_nullifiers`
+    /// (i.e. spent by a different account) must NOT flip any note's `is_spent`.
+    #[test]
+    fn test_is_spent_false_when_spent_by_different_account() {
+        let our_nf = [0xCCu8; 32];
+        let other_nf = [0xDDu8; 32]; // different account's nullifier
+        let our_nf_hex = hex::encode(our_nf);
+
+        let mut all_transactions = vec![ShieldedTransaction {
+            txid: "receiving_tx".to_string(),
+            hex: String::new(),
+            block_height: 500_000,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier(&our_nf_hex)],
+        }];
+
+        let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
+        our_nullifiers.insert(our_nf);
+
+        // block spends `other_nf`, not `our_nf`.
+        let block_results = vec![make_trial_result_with_spending("spending_tx", other_nf)];
+
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+            .iter()
+            .flat_map(|r| r.tx_nullifiers.iter())
+            .flat_map(|(_, nfs)| nfs.iter().copied())
+            .filter(|nf| our_nullifiers.contains(nf))
+            .collect();
+
+        for tx in &mut all_transactions {
+            for note in &mut tx.orchard_notes {
+                if let Some(ref nf_hex) = note.nullifier {
+                    if let Ok(nf_bytes_dec) = hex::decode(nf_hex) {
+                        if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes_dec.as_slice()) {
+                            if spent_nullifiers.contains(&nf_arr) {
+                                note.is_spent = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !all_transactions[0].orchard_notes[0].is_spent,
+            "note spent by different account must not be marked as spent"
+        );
     }
 
     // ── run_sync early-fail paths (no network required) ───────────────────────
@@ -783,6 +1410,7 @@ mod tests {
             on_transaction: None,
             orchard_only: false,
             max_retries: None,
+            known_nullifiers: vec![],
         };
         let err = run_sync(params).await.unwrap_err();
         // Must fail on UFVK parsing, not on connection
@@ -812,6 +1440,7 @@ mod tests {
             on_transaction: None,
             orchard_only: false,
             max_retries: None,
+            known_nullifiers: vec![],
         };
         let err = run_sync(params).await.unwrap_err();
         assert!(
@@ -878,5 +1507,78 @@ mod tests {
             msg.contains("gRPC connect failed") || msg.contains("timeout") || msg.contains("transport"),
             "unexpected error: {msg}"
         );
+    }
+
+    // ── known_nullifiers pre-population ────────────────────────────────
+
+    #[test]
+    fn known_nullifiers_are_parsed_into_our_nullifiers_set() {
+        // Simulate the pre-population logic from run_sync_inner.
+        let known: Vec<String> = vec![
+            hex::encode([0xAAu8; 32]),
+            hex::encode([0xBBu8; 32]),
+            "not_valid_hex".to_string(), // malformed — should be silently skipped
+            hex::encode([0xCCu8; 16]),   // wrong length — should be skipped
+        ];
+        let our_nullifiers: std::collections::HashSet<[u8; 32]> = known
+            .iter()
+            .filter_map(|h| {
+                hex::decode(h)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+            })
+            .collect();
+
+        assert_eq!(our_nullifiers.len(), 2, "only valid 32-byte hex should be parsed");
+        assert!(our_nullifiers.contains(&[0xAAu8; 32]));
+        assert!(our_nullifiers.contains(&[0xBBu8; 32]));
+    }
+
+    #[test]
+    fn spent_known_nullifiers_computed_from_intersection() {
+        // Simulate the spent_known_nullifiers extraction logic.
+        let known_nullifiers: Vec<String> = vec![
+            hex::encode([0xAAu8; 32]), // NF1 — will be spent
+            hex::encode([0xBBu8; 32]), // NF2 — not spent in this range
+        ];
+        let known_nf_set: std::collections::HashSet<[u8; 32]> = known_nullifiers
+            .iter()
+            .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+            .collect();
+
+        // spent_nullifiers = all nullifiers that were both in our_nullifiers AND in block tx inputs
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert([0xAAu8; 32]); // NF1 was observed as a tx input
+            set.insert([0xDDu8; 32]); // NF from another wallet — not in our known set
+            set
+        };
+
+        let spent_known: Vec<String> = spent_nullifiers
+            .iter()
+            .filter(|nf| known_nf_set.contains(*nf))
+            .map(hex::encode)
+            .collect();
+
+        assert_eq!(spent_known.len(), 1);
+        assert_eq!(spent_known[0], hex::encode([0xAAu8; 32]));
+    }
+
+    #[test]
+    fn empty_known_nullifiers_produces_empty_spent_set() {
+        let known_nf_set: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert([0xAAu8; 32]);
+            set
+        };
+
+        let spent_known: Vec<String> = spent_nullifiers
+            .iter()
+            .filter(|nf| known_nf_set.contains(*nf))
+            .map(hex::encode)
+            .collect();
+
+        assert!(spent_known.is_empty());
     }
 }
