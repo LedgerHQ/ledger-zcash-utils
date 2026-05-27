@@ -3,6 +3,7 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
+    GetSubtreeRootsArg, ShieldedProtocol, SubtreeRoot, TreeState,
 };
 
 /// Timeout for establishing the TCP+TLS connection.
@@ -181,6 +182,51 @@ async fn find_in_range(
     }
 
     Ok(candidate)
+}
+
+/// Fetch all completed Orchard shard roots starting at `start_index`.
+///
+/// `max_entries = 0` means "all". Streams via `GetSubtreeRoots` and collects
+/// the full sequence — the cap layer is small and the stream is short-lived.
+/// No per-request timeout is applied (matches `get_block_range` streaming usage).
+pub(crate) async fn get_orchard_subtree_roots(
+    client: &mut CompactTxStreamerClient<Channel>,
+    start_index: u32,
+) -> Result<Vec<SubtreeRoot>> {
+    let req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index,
+        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        max_entries: 0,
+    });
+    let mut stream = client
+        .get_subtree_roots(req)
+        .await
+        .map_err(|e| anyhow!("GetSubtreeRoots failed: {}", e))?
+        .into_inner();
+
+    let mut out = Vec::new();
+    while let Some(item) = stream
+        .message()
+        .await
+        .map_err(|e| anyhow!("GetSubtreeRoots stream error: {}", e))?
+    {
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Fetch the lightwalletd tree state at `height`.
+pub(crate) async fn get_tree_state_at(
+    client: &mut CompactTxStreamerClient<Channel>,
+    height: u32,
+) -> Result<TreeState> {
+    let mut req = tonic::Request::new(BlockId { height: height as u64, hash: vec![] });
+    req.set_timeout(UNARY_TIMEOUT);
+    client
+        .get_tree_state(req)
+        .await
+        .map(|r| r.into_inner())
+        .map_err(|e| anyhow!("GetTreeState({}) failed: {}", height, e))
 }
 
 #[cfg(test)]

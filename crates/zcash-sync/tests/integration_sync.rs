@@ -8,6 +8,12 @@
 ///   cargo test -p zcash-sync --test integration_sync -- --ignored
 ///
 /// Expected values are cross-referenced with zingo-cli output.
+use std::time::Duration;
+use tonic::transport::Channel;
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, GetSubtreeRootsArg,
+    ShieldedProtocol,
+};
 use zcash_sync::sync::{run_sync, ShieldedNote, ShieldedTransaction, SyncParams};
 
 // ── Mainnet (Orchard-only) ────────────────────────────────────────────────────
@@ -547,5 +553,114 @@ async fn testnet_full_mode_required_to_find_sapling_transactions() {
     assert!(
         !result.transactions.iter().any(|tx| tx.txid == TX_S1_TXID),
         "TX_S1 must not be found when orchard_only=true (it has no Orchard actions)"
+    );
+}
+
+// ── CUSTOM-02 prerequisite: GetTreeState & GetSubtreeRoots availability ─────
+//
+// These tests verify that the Ledger-hosted Zaino node supports the gRPC
+// calls required for Merkle witness computation (CUSTOM-02).
+//
+// Run:
+//   cargo test -p zcash-sync --test integration_sync -- --ignored get_tree_state
+//   cargo test -p zcash-sync --test integration_sync -- --ignored get_subtree_roots
+
+const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn grpc_client(url: &str) -> CompactTxStreamerClient<Channel> {
+    let channel = zcash_sync::client::connect(url)
+        .await
+        .expect("gRPC connect failed");
+    CompactTxStreamerClient::new(channel)
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_tree_state_mainnet_returns_orchard_frontier() {
+    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(BlockId {
+        height: 3_047_167,
+        hash: vec![],
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let tree_state = client
+        .get_tree_state(req)
+        .await
+        .expect("GetTreeState failed")
+        .into_inner();
+
+    eprintln!(
+        "GetTreeState(3047167): orchard_tree={} bytes",
+        tree_state.orchard_tree.len()
+    );
+    assert_eq!(tree_state.height, 3_047_167);
+    assert!(
+        !tree_state.orchard_tree.is_empty(),
+        "orchard_tree must not be empty"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_subtree_roots_orchard_mainnet() {
+    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index: 0,
+        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        max_entries: 5,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let stream = client
+        .get_subtree_roots(req)
+        .await
+        .expect("GetSubtreeRoots(Orchard) failed");
+
+    let mut stream = stream.into_inner();
+    let mut count = 0u32;
+    while let Some(root) = stream.message().await.expect("stream error") {
+        eprintln!(
+            "  subtree_root[{count}]: hash={} bytes, completing_height={}",
+            root.root_hash.len(),
+            root.completing_block_height,
+        );
+        assert_eq!(root.root_hash.len(), 32, "root_hash must be 32 bytes");
+        count += 1;
+    }
+
+    eprintln!("GetSubtreeRoots(Orchard): {count} roots received");
+    assert!(count > 0, "expected at least one Orchard subtree root");
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_subtree_roots_orchard_testnet() {
+    let mut client = grpc_client(TESTNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index: 0,
+        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        max_entries: 5,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let stream = client
+        .get_subtree_roots(req)
+        .await
+        .expect("GetSubtreeRoots(Orchard) failed on testnet");
+
+    let mut stream = stream.into_inner();
+    let mut count = 0u32;
+    while stream.message().await.expect("stream error").is_some() {
+        count += 1;
+    }
+
+    eprintln!("GetSubtreeRoots(Orchard, testnet): {count} roots received");
+    assert!(
+        count > 0,
+        "expected at least one Orchard subtree root on testnet"
     );
 }

@@ -36,3 +36,5 @@ thiserror             = { workspace = true }
 rayon                 = { workspace = true }
 # Forces the `std` feature so zcash_client_backend can call OffsetDateTime::now_utc().
 time                  = { workspace = true }
+shardtree             = { workspace = true }
+incrementalmerkletree = { workspace = true }
