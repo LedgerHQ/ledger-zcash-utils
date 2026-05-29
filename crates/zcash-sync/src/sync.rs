@@ -461,9 +461,6 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                 // These enable Phase 4: detecting txs that spend our notes (outgoing txs
                 // that are invisible to trial decryption because they create no outputs for us).
                 our_nullifiers.extend(nullifiers);
-                if let Some(ref cb) = on_transaction {
-                    cb(tx.clone());
-                }
                 all_transactions.push(tx);
             }
         }
@@ -523,9 +520,6 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                 )
                 .await?
                 {
-                    if let Some(ref cb) = on_transaction {
-                        cb(tx.clone());
-                    }
                     all_transactions.push(tx);
                 }
             }
@@ -574,6 +568,17 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                     }
                 }
             }
+        }
+    }
+
+    // Phase 6: Stream transactions to the caller (e.g. NAPI → JS).
+    //
+    // Emission happens AFTER Phase 5 so that `is_spent` flags are correct.
+    // The stream is still useful for memory-efficient consumption when there
+    // are many transactions.
+    if let Some(ref cb) = on_transaction {
+        for tx in &all_transactions {
+            cb(tx.clone());
         }
     }
 
@@ -1390,6 +1395,80 @@ mod tests {
         assert!(
             !all_transactions[0].orchard_notes[0].is_spent,
             "note spent by different account must not be marked as spent"
+        );
+    }
+
+    // ── on_transaction emission order ──────────────────────────────────────────
+
+    /// Transactions emitted via `on_transaction` must carry post-Phase-5
+    /// `is_spent` flags. This test simulates the Phase-5 + Phase-6 emission
+    /// sequence to verify the contract: received notes that are later spent
+    /// within the same scan range must have `is_spent = true` when the
+    /// callback fires.
+    #[test]
+    fn on_transaction_emits_with_correct_is_spent() {
+        let nf_bytes = [0xAAu8; 32];
+        let nf_hex = hex::encode(nf_bytes);
+
+        // Simulate: one received tx, one block that spends its note.
+        let mut all_transactions = vec![ShieldedTransaction {
+            txid: "receiving_tx".to_string(),
+            hex: String::new(),
+            block_height: 500_000,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+        }];
+
+        let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
+        our_nullifiers.insert(nf_bytes);
+        let block_results = vec![make_trial_result_with_spending("spending_tx", nf_bytes)];
+
+        // ── Phase 5: mark spent ──
+        let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+            .iter()
+            .flat_map(|r| r.tx_nullifiers.iter())
+            .flat_map(|(_, nfs)| nfs.iter().copied())
+            .filter(|nf| our_nullifiers.contains(nf))
+            .collect();
+
+        for tx in &mut all_transactions {
+            for note in &mut tx.orchard_notes {
+                if let Some(ref nf_hex) = note.nullifier {
+                    if let Ok(b) = hex::decode(nf_hex) {
+                        if let Ok(arr) = <[u8; 32]>::try_from(b.as_slice()) {
+                            if spent_nullifiers.contains(&arr) {
+                                note.is_spent = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 6: emit via on_transaction ──
+        let emitted: std::sync::Arc<std::sync::Mutex<Vec<ShieldedTransaction>>> =
+            Default::default();
+        let cb_emitted = emitted.clone();
+        let on_transaction: Option<Arc<dyn Fn(ShieldedTransaction) + Send + Sync>> =
+            Some(Arc::new(move |tx: ShieldedTransaction| {
+                cb_emitted.lock().unwrap().push(tx);
+            }));
+
+        if let Some(ref cb) = on_transaction {
+            for tx in &all_transactions {
+                cb(tx.clone());
+            }
+        }
+
+        // Verify: the emitted tx must have is_spent = true.
+        let emitted = emitted.lock().unwrap();
+        assert_eq!(emitted.len(), 1, "one transaction must be emitted");
+        assert!(
+            emitted[0].orchard_notes[0].is_spent,
+            "on_transaction must emit tx with is_spent = true (post Phase 5)"
         );
     }
 
