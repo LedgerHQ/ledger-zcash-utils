@@ -3099,12 +3099,15 @@ dependencies = [
  "anyhow",
  "futures",
  "hex",
+ "incrementalmerkletree",
+ "orchard",
  "tokio",
  "tonic",
  "zcash-crypto",
  "zcash_address",
  "zcash_client_backend",
  "zcash_keys",
+ "zcash_primitives",
  "zcash_protocol",
 ]
 

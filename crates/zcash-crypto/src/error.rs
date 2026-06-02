@@ -19,7 +19,7 @@ pub enum Error {
     #[error("decrypt error: {0}")]
     Decrypt(String),
 
-    // ── Witness / ShardTree errors (CUSTOM-02) ────────────────────────────────
+    // ── Witness / ShardTree errors ──
     /// Error produced by the underlying ShardTree store or query logic.
     #[error("shardtree error: {0}")]
     ShardTree(String),
