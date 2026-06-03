@@ -43,6 +43,12 @@ bitcoin = "0.32"
 rayon   = "1"
 futures = "0.3"
 
+# Merkle tree for on-demand witness computation.
+# Must stay version-compatible with the transitive copies pulled by orchard
+# and zcash_client_backend (locked at 0.8.2 / 0.6.2 in Cargo.lock).
+incrementalmerkletree = "0.8"
+shardtree             = "0.6"
+
 # Utilities
 anyhow     = "1"
 thiserror  = "1"

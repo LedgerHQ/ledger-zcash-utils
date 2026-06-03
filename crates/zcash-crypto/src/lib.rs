@@ -9,8 +9,10 @@
 //! - [`decrypt`]: Compact block trial decryption and full transaction decryption
 //! - [`network`]: Zcash network name parsing utilities
 //! - [`error`]: Unified error type for all operations in this crate
+//! - [`tree`]: On-demand Orchard ShardTree assembly and Merkle witness extraction
 
 pub mod decrypt;
 pub mod error;
 pub mod keys;
 pub mod network;
+pub mod tree;

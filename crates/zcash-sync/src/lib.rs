@@ -10,6 +10,8 @@
 //!
 //! - [`client`]: gRPC channel management and low-level RPC helpers
 //! - [`sync`]: High-level block range scanning and transaction decryption
+//! - [`witness`]: On-demand Orchard Merkle witness computation (async orchestrator)
 
 pub mod client;
 pub mod sync;
+pub mod witness;

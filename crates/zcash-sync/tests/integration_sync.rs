@@ -8,6 +8,12 @@
 ///   cargo test -p zcash-sync --test integration_sync -- --ignored
 ///
 /// Expected values are cross-referenced with zingo-cli output.
+use std::time::Duration;
+use tonic::transport::Channel;
+use zcash_client_backend::proto::service::{
+    compact_tx_streamer_client::CompactTxStreamerClient, BlockId, GetSubtreeRootsArg,
+    ShieldedProtocol,
+};
 use zcash_sync::sync::{run_sync, ShieldedNote, ShieldedTransaction, SyncParams};
 
 // ── Mainnet (Orchard-only) ────────────────────────────────────────────────────
@@ -547,5 +553,201 @@ async fn testnet_full_mode_required_to_find_sapling_transactions() {
     assert!(
         !result.transactions.iter().any(|tx| tx.txid == TX_S1_TXID),
         "TX_S1 must not be found when orchard_only=true (it has no Orchard actions)"
+    );
+}
+
+// Prerequisite: GetTreeState & GetSubtreeRoots availability ─────
+//
+// These tests verify that the Ledger-hosted Zaino node supports the gRPC
+// calls required for Merkle witness computation.
+//
+// Run:
+//   cargo test -p zcash-sync --test integration_sync -- --ignored get_tree_state
+//   cargo test -p zcash-sync --test integration_sync -- --ignored get_subtree_roots
+
+const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn grpc_client(url: &str) -> CompactTxStreamerClient<Channel> {
+    let channel = zcash_sync::client::connect(url)
+        .await
+        .expect("gRPC connect failed");
+    CompactTxStreamerClient::new(channel)
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_tree_state_mainnet_returns_orchard_frontier() {
+    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(BlockId {
+        height: 3_047_167,
+        hash: vec![],
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let tree_state = client
+        .get_tree_state(req)
+        .await
+        .expect("GetTreeState failed")
+        .into_inner();
+
+    eprintln!(
+        "GetTreeState(3047167): orchard_tree={} bytes",
+        tree_state.orchard_tree.len()
+    );
+    assert_eq!(tree_state.height, 3_047_167);
+    assert!(
+        !tree_state.orchard_tree.is_empty(),
+        "orchard_tree must not be empty"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_subtree_roots_orchard_mainnet() {
+    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index: 0,
+        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        max_entries: 5,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let stream = client
+        .get_subtree_roots(req)
+        .await
+        .expect("GetSubtreeRoots(Orchard) failed");
+
+    let mut stream = stream.into_inner();
+    let mut count = 0u32;
+    while let Some(root) = stream.message().await.expect("stream error") {
+        eprintln!(
+            "  subtree_root[{count}]: hash={} bytes, completing_height={}",
+            root.root_hash.len(),
+            root.completing_block_height,
+        );
+        assert_eq!(root.root_hash.len(), 32, "root_hash must be 32 bytes");
+        count += 1;
+    }
+
+    eprintln!("GetSubtreeRoots(Orchard): {count} roots received");
+    assert!(count > 0, "expected at least one Orchard subtree root");
+}
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_subtree_roots_orchard_testnet() {
+    let mut client = grpc_client(TESTNET_GRPC_URL).await;
+
+    let mut req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index: 0,
+        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        max_entries: 5,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let stream = client
+        .get_subtree_roots(req)
+        .await
+        .expect("GetSubtreeRoots(Orchard) failed on testnet");
+
+    let mut stream = stream.into_inner();
+    let mut count = 0u32;
+    while stream.message().await.expect("stream error").is_some() {
+        count += 1;
+    }
+
+    eprintln!("GetSubtreeRoots(Orchard, testnet): {count} roots received");
+    assert!(
+        count > 0,
+        "expected at least one Orchard subtree root on testnet"
+    );
+}
+
+// ── Witness computation regression benchmark ──────────────────────────────────
+//
+// Spec requirement: computing Merkle witnesses for 2 notes in the same Orchard
+// shard must complete in under 15 seconds end-to-end — including the gRPC
+// round-trips that fetch the frontier (GetTreeState), the cap roots
+// (GetSubtreeRoots), and the shard's cmx leaves (GetBlockRange).
+//
+// Both notes live in the partial frontier shard (index 2, base position
+// 131_072) of the testnet known-good vector pinned at anchor height 3,861,070.
+// Their cmxs are the first two leaves of that shard, lifted verbatim from
+// `zcash-crypto/src/tree.rs::known_good_test_vector`, so `compute_witnesses`
+// validates each path re-roots to the captured anchor before returning.
+//
+// Run:
+//   cargo test -p zcash-sync --test integration_sync -- --ignored witness_two_notes_same_shard_under_15s --nocapture
+
+const WITNESS_BENCH_ANCHOR_HEIGHT: u32 = 3_861_070;
+const WITNESS_BENCH_NOTE_0_POSITION: u64 = 131_072;
+const WITNESS_BENCH_NOTE_0_CMX: &str =
+    "c53c1944c1add04a071359f9c077aa8991f5431736b1f958270718bc1250c531";
+const WITNESS_BENCH_NOTE_1_POSITION: u64 = 131_073;
+const WITNESS_BENCH_NOTE_1_CMX: &str =
+    "5d8c2880ba85481a078f98482d9616decc89d972408747beeaffd3501c83770b";
+const WITNESS_BENCH_BUDGET: Duration = Duration::from_secs(15);
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn witness_two_notes_same_shard_under_15s() {
+    use std::time::Instant;
+    use zcash_sync::witness::{compute_witnesses, NoteRef, WitnessRequest};
+
+    fn h32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    let note0 = NoteRef {
+        position: WITNESS_BENCH_NOTE_0_POSITION,
+        cmx: h32(WITNESS_BENCH_NOTE_0_CMX),
+    };
+    let note1 = NoteRef {
+        position: WITNESS_BENCH_NOTE_1_POSITION,
+        cmx: h32(WITNESS_BENCH_NOTE_1_CMX),
+    };
+
+    // Guard the premise of the benchmark: both notes must share a shard, else
+    // we'd be timing multi-shard fetching instead of the single-shard case.
+    // Shard index = position >> ORCHARD_SHARD_HEIGHT (16 for Orchard).
+    assert_eq!(
+        note0.position >> 16,
+        note1.position >> 16,
+        "benchmark notes must live in the same Orchard shard"
+    );
+
+    let started = Instant::now();
+    let out = compute_witnesses(WitnessRequest {
+        grpc_url: TESTNET_GRPC_URL.to_string(),
+        anchor_height: Some(WITNESS_BENCH_ANCHOR_HEIGHT),
+        anchor_depth_blocks: None,
+        notes: vec![note0, note1],
+    })
+    .await
+    .expect("compute_witnesses failed");
+    let elapsed = started.elapsed();
+
+    // One witness per note, in request order, at the requested positions.
+    assert_eq!(out.witnesses.len(), 2, "expected one witness per note");
+    assert_eq!(
+        u64::from(out.witnesses[0].position()),
+        WITNESS_BENCH_NOTE_0_POSITION
+    );
+    assert_eq!(
+        u64::from(out.witnesses[1].position()),
+        WITNESS_BENCH_NOTE_1_POSITION
+    );
+
+    eprintln!(
+        "witness computation for 2 notes in shard {} took {:?} (budget {:?})",
+        note0.position >> 16,
+        elapsed,
+        WITNESS_BENCH_BUDGET
+    );
+    assert!(
+        elapsed < WITNESS_BENCH_BUDGET,
+        "witness computation regressed: took {elapsed:?}, budget is {WITNESS_BENCH_BUDGET:?}"
     );
 }
