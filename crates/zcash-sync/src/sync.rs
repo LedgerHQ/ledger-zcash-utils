@@ -323,6 +323,7 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let range = BlockRange {
         start: Some(BlockId { height: params.start_height as u64, hash: vec![] }),
         end: Some(BlockId { height: params.end_height as u64, hash: vec![] }),
+        pool_types: vec![],
     };
     let stream = client
         .get_block_range(range)
@@ -792,7 +793,7 @@ async fn process_compact_block(
         .vtx
         .iter()
         .map(|ctx| CompactTransaction {
-            txid: hex::encode(ctx.hash.iter().copied().rev().collect::<Vec<u8>>()),
+            txid: hex::encode(ctx.txid.iter().copied().rev().collect::<Vec<u8>>()),
             sapling_outputs: if orchard_only {
                 vec![]
             } else {

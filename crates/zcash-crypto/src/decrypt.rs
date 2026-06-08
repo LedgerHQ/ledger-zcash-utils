@@ -23,11 +23,12 @@ use zcash_address::unified::{Encoding, Ufvk};
 use zcash_client_backend::decrypt_transaction;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_note_encryption::{batch, EphemeralKeyBytes, COMPACT_NOTE_SIZE};
-use zcash_primitives::{
-    consensus::{BlockHeight, BranchId},
-    transaction::Transaction as ZcashTransaction,
+use zcash_primitives::transaction::Transaction as ZcashTransaction;
+use zcash_protocol::{
+    consensus::{BlockHeight, BranchId, Network},
+    memo::MemoBytes,
+    value::{BalanceError, Zatoshis},
 };
-use zcash_protocol::{consensus::Network, memo::MemoBytes, value::{BalanceError, Zatoshis}};
 
 use crate::error::Error;
 
@@ -1105,6 +1106,38 @@ mod tests {
         assert_eq!(make(0).action_index, Some(0));
         assert_eq!(make(7).action_index, Some(7));
         assert_eq!(make(u32::MAX).action_index, Some(u32::MAX));
+    }
+
+    // ── BranchId::for_height — NU6.2 activation assertions ──────────────────
+
+    #[test]
+    fn test_branch_id_nu6_2_mainnet_at_activation() {
+        // NU6.2 activates on mainnet at block 3,364,600.
+        assert_eq!(
+            BranchId::for_height(&Network::MainNetwork, BlockHeight::from(3_364_600_u32)),
+            BranchId::Nu6_2,
+            "height 3_364_600 must resolve to Nu6_2 on mainnet"
+        );
+    }
+
+    #[test]
+    fn test_branch_id_nu6_1_mainnet_one_below_activation() {
+        // One block before NU6.2 activation must still be Nu6_1.
+        assert_eq!(
+            BranchId::for_height(&Network::MainNetwork, BlockHeight::from(3_364_599_u32)),
+            BranchId::Nu6_1,
+            "height 3_364_599 must resolve to Nu6_1 on mainnet"
+        );
+    }
+
+    #[test]
+    fn test_branch_id_nu6_2_testnet_at_activation() {
+        // NU6.2 activates on testnet at block 4,052,000.
+        assert_eq!(
+            BranchId::for_height(&Network::TestNetwork, BlockHeight::from(4_052_000_u32)),
+            BranchId::Nu6_2,
+            "height 4_052_000 must resolve to Nu6_2 on testnet"
+        );
     }
 
     // ── full_decrypt_tx — error paths ─────────────────────────────────────────

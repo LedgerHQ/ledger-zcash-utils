@@ -33,6 +33,7 @@ async fn collect_cmxs(
     let range = BlockRange {
         start: Some(BlockId { height: start, hash: vec![] }),
         end: Some(BlockId { height: end, hash: vec![] }),
+        pool_types: vec![],
     };
     let mut stream = c.get_block_range(range).await.expect("block range").into_inner();
     let mut out = Vec::new();

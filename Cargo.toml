@@ -15,17 +15,17 @@ default-members = ["crates/zcash-crypto"]
 [workspace.dependencies]
 
 # Zcash ecosystem
-zcash_client_backend  = { version = "0.21", default-features = false }
-zcash_keys            = { version = "0.12", features = ["orchard", "sapling"] }
+zcash_client_backend  = { version = "0.23", default-features = false }
+zcash_keys            = { version = "0.14", features = ["orchard", "sapling"] }
 # Note: `transparent-inputs` is NOT in workspace features — it is opt-in via
 # zcash-crypto's `transparent-inputs` feature, enabled only by zcash-cli.
-zcash_address         = "0.10"
+zcash_address         = "0.12"
 zcash_note_encryption = "0.4"
-zcash_primitives      = { version = "0.26", default-features = false }
-zcash_protocol        = "0.7"
+zcash_primitives      = { version = "0.28", default-features = false }
+zcash_protocol        = "0.9"
 zip32                 = "0.2"
-orchard               = { version = "0.11", default-features = false }
-sapling-crypto        = { version = "0.5", default-features = false }
+orchard               = { version = "0.14", default-features = false }
+sapling-crypto        = { version = "0.7", default-features = false }
 
 # Async / gRPC (only zcash-sync and its dependents need these)
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
