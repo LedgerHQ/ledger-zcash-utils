@@ -1171,7 +1171,7 @@ mod tests {
         assert!(tree_size_before_block.is_none());
 
         // With no tree_size, note position must be None regardless of action_index.
-        let position = tree_size_before_block.and_then(|ts| Some(ts + 0 + 0u64));
+        let position = tree_size_before_block;
         assert!(position.is_none());
     }
 
@@ -1266,7 +1266,7 @@ mod tests {
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
         our_nullifiers.insert(nf_bytes);
 
-        let block_results = vec![make_trial_result_with_spending("spending_tx", nf_bytes)];
+        let block_results = [make_trial_result_with_spending("spending_tx", nf_bytes)];
 
         // Run Phase 5 logic.
         let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
@@ -1370,7 +1370,7 @@ mod tests {
         our_nullifiers.insert(our_nf);
 
         // block spends `other_nf`, not `our_nf`.
-        let block_results = vec![make_trial_result_with_spending("spending_tx", other_nf)];
+        let block_results = [make_trial_result_with_spending("spending_tx", other_nf)];
 
         let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
             .iter()
@@ -1425,7 +1425,7 @@ mod tests {
 
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
         our_nullifiers.insert(nf_bytes);
-        let block_results = vec![make_trial_result_with_spending("spending_tx", nf_bytes)];
+        let block_results = [make_trial_result_with_spending("spending_tx", nf_bytes)];
 
         // ── Phase 5: mark spent ──
         let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results

@@ -969,7 +969,12 @@ mod tests {
             orchard_actions: vec![],
         };
         // Below mainnet Heartwood (903_800) — ZIP-212 Off
-        let result = trial_decrypt_block(&[tx.clone()], &ivks, 500_000, &Network::MainNetwork);
+        let result = trial_decrypt_block(
+            std::slice::from_ref(&tx),
+            &ivks,
+            500_000,
+            &Network::MainNetwork,
+        );
         assert!(result.is_empty());
         // Above mainnet Heartwood + grace — ZIP-212 On
         let result = trial_decrypt_block(&[tx], &ivks, 2_000_000, &Network::MainNetwork);

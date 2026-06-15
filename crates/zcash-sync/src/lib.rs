@@ -13,5 +13,6 @@
 //! - [`witness`]: On-demand Orchard Merkle witness computation (async orchestrator)
 
 pub mod client;
+pub mod craft;
 pub mod sync;
 pub mod witness;

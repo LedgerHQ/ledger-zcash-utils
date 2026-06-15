@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { TransactionStream, startSync, getChainTip, findBlockHeight } = nativeBinding
+const { TransactionStream, startSync, getChainTip, findBlockHeight, buildTransaction } = nativeBinding
 
 module.exports.TransactionStream = TransactionStream
 module.exports.startSync = startSync
 module.exports.getChainTip = getChainTip
 module.exports.findBlockHeight = findBlockHeight
+module.exports.buildTransaction = buildTransaction

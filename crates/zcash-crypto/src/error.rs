@@ -52,6 +52,11 @@ pub enum Error {
         expected: [u8; 32],
         got: [u8; 32],
     },
+
+    /// Transaction crafting failed (invalid note components, builder error,
+    /// PCZT role error, proof generation failure, or insufficient funds).
+    #[error("craft error: {0}")]
+    Craft(String),
 }
 
 impl Error {
@@ -123,6 +128,12 @@ mod tests {
             anchor_height: 1000,
         };
         assert_eq!(e.to_string(), "no checkpoint found for anchor height 1000");
+    }
+
+    #[test]
+    fn test_craft_error_display() {
+        let e = Error::Craft("bad anchor".into());
+        assert_eq!(e.to_string(), "craft error: bad anchor");
     }
 
     #[test]

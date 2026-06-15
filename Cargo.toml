@@ -22,6 +22,9 @@ zcash_keys            = { version = "0.14", features = ["orchard", "sapling"] }
 zcash_address         = "0.12"
 zcash_note_encryption = "0.4"
 zcash_primitives      = { version = "0.28", default-features = false }
+# Transparent-pool address + script types; pulled by zcash_primitives internally
+# under the local alias `transparent`. We depend on it directly to avoid that alias.
+zcash_transparent     = "0.8"
 zcash_protocol        = "0.9"
 zip32                 = "0.2"
 orchard               = { version = "0.14", default-features = false }
@@ -48,6 +51,15 @@ futures = "0.3"
 # and zcash_client_backend (locked at 0.8.2 / 0.6.2 in Cargo.lock).
 incrementalmerkletree = "0.8"
 shardtree             = "0.6"
+
+# Partially Created Zcash Transaction format (wire format + role helpers).
+# Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
+# (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
+pczt = { version = "0.7", default-features = false, features = ["std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover"] }
+
+# RNG plumbing for build_for_pczt(rng, &fee) and the PCZT Prover.
+rand      = "0.8"
+rand_core = "0.6"
 
 # Utilities
 anyhow     = "1"
