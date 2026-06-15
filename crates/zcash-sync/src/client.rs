@@ -160,6 +160,7 @@ async fn find_in_range(
     let range = BlockRange {
         start: Some(BlockId { height: low as u64, hash: vec![] }),
         end: Some(BlockId { height: high as u64, hash: vec![] }),
+        pool_types: vec![],
     };
 
     let mut stream = client

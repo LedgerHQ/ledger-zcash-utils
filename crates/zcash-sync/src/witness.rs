@@ -253,6 +253,7 @@ async fn collect_orchard_cmxs(
             height: end as u64,
             hash: vec![],
         }),
+        pool_types: vec![],
     };
     let mut stream = client
         .get_block_range(range)

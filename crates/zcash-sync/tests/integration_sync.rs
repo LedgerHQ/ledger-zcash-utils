@@ -7,6 +7,12 @@
 /// Run them explicitly with:
 ///   cargo test -p zcash-sync --test integration_sync -- --ignored
 ///
+/// By default the suite targets the Ledger staging Zaino nodes. The endpoints
+/// can be overridden to run against any public Zaino node, e.g.:
+///   ZCASH_MAINNET_GRPC_URL=https://zec.rocks:443 \
+///   ZCASH_TESTNET_GRPC_URL=https://testnet.zec.rocks:443 \
+///     cargo test -p zcash-sync --test integration_sync -- --ignored
+///
 /// Expected values are cross-referenced with zingo-cli output.
 use std::time::Duration;
 use tonic::transport::Channel;
@@ -17,18 +23,31 @@ use zcash_client_backend::proto::service::{
 use zcash_sync::sync::{run_sync, ShieldedNote, ShieldedTransaction, SyncParams};
 
 // ── Mainnet (Orchard-only) ────────────────────────────────────────────────────
-const MAINNET_GRPC_URL: &str = "https://zaino-zec-mainnet-zebra.nodes.stg.ledger-test.com";
+const MAINNET_GRPC_URL_DEFAULT: &str = "https://zaino-zec-mainnet-zebra.nodes.stg.ledger-test.com";
+
+/// Resolves the mainnet gRPC endpoint, allowing an override via the
+/// `ZCASH_MAINNET_GRPC_URL` environment variable. This lets the suite run
+/// against a public Zaino node (e.g. `https://zec.rocks:443`) when the Ledger
+/// staging node is unavailable.
+fn mainnet_grpc_url() -> String {
+    std::env::var("ZCASH_MAINNET_GRPC_URL").unwrap_or_else(|_| MAINNET_GRPC_URL_DEFAULT.to_string())
+}
 const MAINNET_UFVK: &str = "uview1qggz6nejagvka9wtm9r7xf84kkwy4cc0cgchptr98w0cyz33cj4958q5ulkd32nz2u3s0sp9yhcw7tu2n3nlw9x6ulghyd2zgc857tnzme2zpr3vn24zhtm2rjduv9a5zxlmzz404n7l0k69gmu4tfn2g3vpcn03rhz63e3l92fn8gra37tyly7utvgveswl20vz23pu84rc2nyqess38wvlgr2xzyhgj232ne5qutpe6ql6ghzetdy7pfzcmdzd5gd5dnwk25fwv7nnzmnty7u5ax3nzzgr6pdc905ckpd0s9v2cvn7e03qm7r46e5ngax536ywz7zxjptymm90px0rhvmqtwvttuy6d7degly023lqvskclk6mezyt69dwu6c4tfzrjgq4uuh5xa9m5dclgatykgtrrw268qe5pldfkx73f2kd5yyy2tjpjql92pa6tsk2nh2h88q23nee9z379het4akl6haqmuwf9d0nl0susg4tnxyk";
 
 // ── Testnet (Sapling + Orchard) ───────────────────────────────────────────────
-const TESTNET_GRPC_URL: &str = "https://zaino-zec-testnet.nodes.stg.ledger-test.com";
+const TESTNET_GRPC_URL_DEFAULT: &str = "https://zaino-zec-testnet.nodes.stg.ledger-test.com";
+
+/// Resolves the testnet gRPC endpoint, overridable via `ZCASH_TESTNET_GRPC_URL`.
+fn testnet_grpc_url() -> String {
+    std::env::var("ZCASH_TESTNET_GRPC_URL").unwrap_or_else(|_| TESTNET_GRPC_URL_DEFAULT.to_string())
+}
 const TESTNET_UFVK: &str = "uviewtest1eacc7lytmvgp0sshwjjv4qsg9fnewq00s6zye8hqwndpdsg0tum2ft4k96t86eapddpq56exfycnxnlds75vvpydv8fgj4cecczkmt3rjat8qjfqrk2cdlm9alep2z04785sx6yekqjk6wywkttlthld4c3xmg8fvneg4p97vzxwu9xtuh0xrgfy90p6uuxf8cwl8nxfq6hlte0nnylk59xceldrkx9vge3k4utkue2txu5kpp60aw07q0f0jgp0pv2c0gr7jdm6273uxyskt72jehte5jf2dg94d84le08h2t5rhd93j2d98ja59h46est69f3a7rav7k6744p2u8dxasc7nr9p2k95x7uaknahj0kw7mu5zq9nllj7x2qswq3jswsuzwms7shv7dhxz9s4yudatwu3u3v3wqznkhu6jt7xt8whjh3dkzvsf28p6mj8tya009gwzgszz2at8alquu8y0fmqt7klayrjx7n3ulml5q00fgdr";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn params_for_block(height: u32) -> SyncParams {
     SyncParams {
-        grpc_url: MAINNET_GRPC_URL.to_string(),
+        grpc_url: mainnet_grpc_url(),
         viewing_key: MAINNET_UFVK.to_string(),
         start_height: height,
         end_height: height,
@@ -44,7 +63,7 @@ fn params_for_block(height: u32) -> SyncParams {
 
 fn params_for_range(start: u32, end: u32) -> SyncParams {
     SyncParams {
-        grpc_url: MAINNET_GRPC_URL.to_string(),
+        grpc_url: mainnet_grpc_url(),
         viewing_key: MAINNET_UFVK.to_string(),
         start_height: start,
         end_height: end,
@@ -60,7 +79,7 @@ fn params_for_range(start: u32, end: u32) -> SyncParams {
 
 fn params_for_block_testnet(height: u32) -> SyncParams {
     SyncParams {
-        grpc_url: TESTNET_GRPC_URL.to_string(),
+        grpc_url: testnet_grpc_url(),
         viewing_key: TESTNET_UFVK.to_string(),
         start_height: height,
         end_height: height,
@@ -76,7 +95,7 @@ fn params_for_block_testnet(height: u32) -> SyncParams {
 
 fn params_for_range_testnet(start: u32, end: u32) -> SyncParams {
     SyncParams {
-        grpc_url: TESTNET_GRPC_URL.to_string(),
+        grpc_url: testnet_grpc_url(),
         viewing_key: TESTNET_UFVK.to_string(),
         start_height: start,
         end_height: end,
@@ -577,7 +596,7 @@ async fn grpc_client(url: &str) -> CompactTxStreamerClient<Channel> {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn get_tree_state_mainnet_returns_orchard_frontier() {
-    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+    let mut client = grpc_client(&mainnet_grpc_url()).await;
 
     let mut req = tonic::Request::new(BlockId {
         height: 3_047_167,
@@ -605,7 +624,7 @@ async fn get_tree_state_mainnet_returns_orchard_frontier() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn get_subtree_roots_orchard_mainnet() {
-    let mut client = grpc_client(MAINNET_GRPC_URL).await;
+    let mut client = grpc_client(&mainnet_grpc_url()).await;
 
     let mut req = tonic::Request::new(GetSubtreeRootsArg {
         start_index: 0,
@@ -638,7 +657,7 @@ async fn get_subtree_roots_orchard_mainnet() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn get_subtree_roots_orchard_testnet() {
-    let mut client = grpc_client(TESTNET_GRPC_URL).await;
+    let mut client = grpc_client(&testnet_grpc_url()).await;
 
     let mut req = tonic::Request::new(GetSubtreeRootsArg {
         start_index: 0,
@@ -720,7 +739,7 @@ async fn witness_two_notes_same_shard_under_15s() {
 
     let started = Instant::now();
     let out = compute_witnesses(WitnessRequest {
-        grpc_url: TESTNET_GRPC_URL.to_string(),
+        grpc_url: testnet_grpc_url(),
         anchor_height: Some(WITNESS_BENCH_ANCHOR_HEIGHT),
         anchor_depth_blocks: None,
         notes: vec![note0, note1],
