@@ -246,6 +246,131 @@ pub async fn find_block_height(grpc_url: String, timestamp: u32) -> napi::Result
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
+// ─── V5 transaction builder (Orchard send) ────────────────────────────────────
+
+#[napi(object)]
+pub struct OrchardSpendInputJs {
+    /// 86-char hex (43 bytes: 11-byte diversifier + 32-byte pk_d).
+    pub recipient: String,
+    /// Decimal u64 (string to avoid f64 precision loss).
+    pub value_zat: String,
+    /// 64-char hex (32 bytes).
+    pub rho: String,
+    /// 64-char hex.
+    pub rseed: String,
+    /// 64-char hex.
+    pub cmx: String,
+    /// Decimal u64 leaf position in the Orchard commitment tree.
+    pub position: String,
+}
+
+#[napi(object)]
+pub struct OutputRequestJs {
+    /// Destination address: t-addr (P2PKH/P2SH) or u-addr (Orchard receiver).
+    /// Sapling z-addresses and TEX (ZIP-320) addresses are rejected.
+    pub address: String,
+    pub value_zat: String,
+    pub memo: Option<String>,
+}
+
+#[napi(object)]
+pub struct BuildTransactionParams {
+    pub grpc_url: String,
+    pub ufvk: String,
+    pub network: Option<String>,
+    /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
+    /// read from the device. Stamped onto each real spend so the device can
+    /// confirm the PCZT belongs to its seed before signing.
+    pub seed_fingerprint: String,
+    /// ZIP-32 account index the UFVK was derived at.
+    pub account_index: u32,
+    /// Caller-owned fee in zatoshis (decimal string to avoid f64 precision
+    /// loss). Per FR-4 the fee is selected by ledger-live; this
+    /// crate validates it against ZIP-317 and derives change from it rather
+    /// than computing a fee itself.
+    pub fee_zat: String,
+    pub spends: Vec<OrchardSpendInputJs>,
+    pub outputs: Vec<OutputRequestJs>,
+    pub anchor_height: Option<u32>,
+}
+
+#[napi(object)]
+pub struct BuildTransactionResult {
+    /// Hex-encoded canonical PCZT bytes (`PCZT` magic + u32 LE version +
+    /// postcard payload). Ready for the device APDU streaming layer. Carries
+    /// each real spend's ZIP-32 derivation path for on-device signing.
+    pub pczt_hex: String,
+    /// Decimal fee in zatoshis.
+    pub fee_zat: String,
+    /// Block height the Merkle paths were computed against.
+    pub anchor_height: u32,
+    /// Orchard action count after dummy padding.
+    pub n_actions_orchard: u32,
+}
+
+/// Build, prove, and serialize a PCZT for an Orchard send.
+///
+/// Halo 2 proof generation happens here (~2-5 s first call, ~hundreds of ms
+/// thereafter thanks to the process-global ProvingKey cache).
+#[napi]
+pub async fn build_transaction(
+    params: BuildTransactionParams,
+) -> napi::Result<BuildTransactionResult> {
+    let spends = params
+        .spends
+        .into_iter()
+        .map(|s| {
+            Ok(zcash_sync::craft::SpendInputDto {
+                recipient_hex: s.recipient,
+                value_zat: parse_u64(&s.value_zat, "value_zat")?,
+                rho_hex: s.rho,
+                rseed_hex: s.rseed,
+                cmx_hex: s.cmx,
+                position: parse_u64(&s.position, "position")?,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+    let outputs = params
+        .outputs
+        .into_iter()
+        .map(|o| {
+            Ok(zcash_sync::craft::OutputRequestDto {
+                address: o.address,
+                value_zat: parse_u64(&o.value_zat, "value_zat")?,
+                memo: o.memo,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+
+    let req = zcash_sync::craft::CraftRequest {
+        grpc_url: params.grpc_url,
+        ufvk: params.ufvk,
+        network: params.network,
+        seed_fingerprint_hex: params.seed_fingerprint,
+        account_index: params.account_index,
+        fee_zat: parse_u64(&params.fee_zat, "fee_zat")?,
+        anchor_height: params.anchor_height,
+        spends,
+        outputs,
+    };
+
+    let out = zcash_sync::craft::craft_orchard_transaction(req)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    Ok(BuildTransactionResult {
+        pczt_hex: hex::encode(&out.pczt_bytes),
+        fee_zat: out.fee.to_string(),
+        anchor_height: out.anchor_height,
+        n_actions_orchard: out.n_actions_orchard,
+    })
+}
+
+fn parse_u64(s: &str, field: &str) -> napi::Result<u64> {
+    s.parse::<u64>()
+        .map_err(|e| napi::Error::from_reason(format!("invalid {field}: {e}")))
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {

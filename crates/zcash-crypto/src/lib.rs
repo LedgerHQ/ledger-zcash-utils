@@ -10,7 +10,9 @@
 //! - [`network`]: Zcash network name parsing utilities
 //! - [`error`]: Unified error type for all operations in this crate
 //! - [`tree`]: On-demand Orchard ShardTree assembly and Merkle witness extraction
+//! - [`craft`]: Build, prove, and serialize a PCZT for the Orchard send flows
 
+pub mod craft;
 pub mod decrypt;
 pub mod error;
 pub mod keys;

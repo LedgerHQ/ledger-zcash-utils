@@ -13,7 +13,7 @@ path = "src/lib.rs"
 # Enables the transparent (P2PKH) key component in the UFVK produced by
 # `derive_keys`. Only needed by the CLI; the FFI node crate only does trial
 # decryption and does not need transparent key support.
-transparent-inputs = ["zcash_keys/transparent-inputs"]
+transparent-inputs = ["zcash_keys/transparent-inputs", "zcash_primitives/transparent-inputs"]
 
 [dependencies]
 # zcash_client_backend: only the `orchard` feature is needed here.
@@ -23,10 +23,12 @@ zcash_client_backend  = { workspace = true, features = ["orchard"] }
 zcash_keys            = { workspace = true }
 zcash_address         = { workspace = true }
 zcash_note_encryption = { workspace = true }
-zcash_primitives      = { workspace = true }
+# `circuits` feature exposes Builder::build_for_pczt + zip317::FeeRule (needed by craft.rs).
+zcash_primitives      = { workspace = true, features = ["circuits"] }
 zcash_protocol        = { workspace = true }
 zip32                 = { workspace = true }
-orchard               = { workspace = true }
+# `circuit` feature exposes orchard::circuit::ProvingKey (needed by craft.rs).
+orchard               = { workspace = true, features = ["circuit"] }
 sapling-crypto        = { workspace = true }
 bip39                 = { workspace = true }
 bitcoin               = { workspace = true }
@@ -38,3 +40,8 @@ rayon                 = { workspace = true }
 time                  = { workspace = true }
 shardtree             = { workspace = true }
 incrementalmerkletree = { workspace = true }
+# PCZT wrapping + role driver for the V5 transaction builder.
+pczt                  = { workspace = true }
+rand                  = { workspace = true }
+rand_core             = { workspace = true }
+zcash_transparent     = { workspace = true }

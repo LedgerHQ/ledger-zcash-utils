@@ -9,14 +9,13 @@ license = "MIT OR Apache-2.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-zcash-sync = { path = "../zcash-sync" }
+zcash-sync   = { path = "../zcash-sync" }
+zcash-crypto = { path = "../zcash-crypto" }
 
 napi        = { workspace = true }
 napi-derive = { workspace = true }
 tokio       = { workspace = true }
-
-[dev-dependencies]
-hex = { workspace = true }
+hex         = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"
