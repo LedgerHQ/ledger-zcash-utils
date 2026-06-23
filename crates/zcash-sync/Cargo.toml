@@ -25,9 +25,11 @@ anyhow  = { workspace = true }
 hex     = { workspace = true }
 futures = { workspace = true }
 # Orchestrator decodes addresses + UFVK and forwards to zcash-crypto.
-orchard          = { workspace = true }
-zcash_primitives = { workspace = true }
-pczt             = { workspace = true }
+orchard           = { workspace = true }
+zcash_primitives  = { workspace = true }
+zcash_transparent = { workspace = true }
+pczt              = { workspace = true }
+zip32             = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "net"] }

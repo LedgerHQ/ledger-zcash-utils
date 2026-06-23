@@ -10,9 +10,10 @@ name = "zcash_crypto"
 path = "src/lib.rs"
 
 [features]
-# Enables the transparent (P2PKH) key component in the UFVK produced by
-# `derive_keys`. Only needed by the CLI; the FFI node crate only does trial
-# decryption and does not need transparent key support.
+# Enables transparent (P2PKH) spend support in the V5 builder and the
+# transparent key component in the UFVK produced by `derive_keys`.
+# On by default so zcash-sync and zcash-ffi-node inherit it transitively.
+default = ["transparent-inputs"]
 transparent-inputs = ["zcash_keys/transparent-inputs", "zcash_primitives/transparent-inputs"]
 
 [dependencies]
@@ -32,6 +33,7 @@ orchard               = { workspace = true, features = ["circuit"] }
 sapling-crypto        = { workspace = true }
 bip39                 = { workspace = true }
 bitcoin               = { workspace = true }
+secp256k1             = { workspace = true }
 hex                   = { workspace = true }
 uuid                  = { workspace = true }
 thiserror             = { workspace = true }

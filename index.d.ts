@@ -151,6 +151,23 @@ export interface OutputRequestJs {
   valueZat: string;
   memo?: string;
 }
+/** One transparent (P2PKH) UTXO to spend. */
+export interface TransparentInputJs {
+  /**
+   * 64-char hex (32 bytes) prevout txid in internal (little-endian) byte order.
+   * Ledger Live surfaces txids in display (big-endian) order; callers must
+   * reverse before passing.
+   */
+  txid: string;
+  /** Output index within the origin transaction. */
+  vout: number;
+  /** Hex-encoded raw scriptPubKey bytes (no CompactSize length prefix). */
+  scriptPubkey: string;
+  /** UTXO value in zatoshis (decimal string to avoid f64 precision loss). */
+  valueZat: string;
+  /** 66-char hex (33 bytes) compressed secp256k1 pubkey controlling the UTXO. */
+  pubkey: string;
+}
 export interface BuildTransactionParams {
   grpcUrl: string;
   ufvk: string;
@@ -171,6 +188,8 @@ export interface BuildTransactionParams {
    */
   feeZat: string;
   spends: Array<OrchardSpendInputJs>;
+  /** Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows. */
+  transparentInputs: Array<TransparentInputJs>;
   outputs: Array<OutputRequestJs>;
   anchorHeight?: number;
 }
@@ -187,12 +206,18 @@ export interface BuildTransactionResult {
   anchorHeight: number;
   /** Orchard action count after dummy padding. */
   nActionsOrchard: number;
+  /** Transparent input count. */
+  nTransparentInputs: number;
+  /** Transparent output count (including change). */
+  nTransparentOutputs: number;
 }
 /**
- * Build, prove, and serialize a PCZT for an Orchard send.
+ * Build, prove, and serialize a PCZT for a send transaction.
  *
- * Halo 2 proof generation happens here (~2-5 s first call, ~hundreds of ms
- * thereafter thanks to the process-global ProvingKey cache).
+ * Supports Orchard-source (Private→*) and transparent-source (Public→*)
+ * flows. Halo 2 proof generation happens here for Orchard-bundle transactions
+ * (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
+ * ProvingKey cache). Transparent-only transactions skip the Orchard prover.
  */
 export declare function buildTransaction(
   params: BuildTransactionParams,

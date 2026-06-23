@@ -770,3 +770,58 @@ async fn witness_two_notes_same_shard_under_15s() {
         "witness computation regressed: took {elapsed:?}, budget is {WITNESS_BENCH_BUDGET:?}"
     );
 }
+
+// ── Anchor-only path regression (Public→Private) ──────────────────────────────
+//
+// The transparent-source flow (transparent inputs + Orchard output) calls
+// `fetch_orchard_anchor`, which runs `build_witnesses` with empty `notes` and
+// empty `shard_leaves` — only the on-chain frontier. In that mode the per-note
+// `root(cmx) == anchor` cross-check never runs, so a regressed implementation
+// could silently emit a bogus anchor (e.g. the all-zero sentinel) that is
+// accepted locally but rejected by validators.
+//
+// This test pins the anchor-only result against a live node to the same testnet
+// vector used by `zcash-crypto/src/tree.rs::known_good_test_vector` (anchor
+// height 3,861,070). It asserts the fetched anchor equals the canonical
+// commitment-tree root, carries no witnesses, and is never all-zero.
+//
+// Run:
+//   cargo test -p zcash-sync --test integration_sync -- --ignored anchor_only_fetch_matches_known_vector --nocapture
+
+const ANCHOR_ONLY_HEIGHT: u32 = WITNESS_BENCH_ANCHOR_HEIGHT;
+const ANCHOR_ONLY_EXPECTED: &str =
+    "a104cba07fd164a2f4432eac02ce9d4ea76749d63adc02050c7004ccb5c36014";
+
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn anchor_only_fetch_matches_known_vector() {
+    use zcash_sync::witness::fetch_orchard_anchor;
+
+    let expected: [u8; 32] = hex::decode(ANCHOR_ONLY_EXPECTED)
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let out = fetch_orchard_anchor(&testnet_grpc_url(), Some(ANCHOR_ONLY_HEIGHT), None)
+        .await
+        .expect("fetch_orchard_anchor failed");
+
+    // Anchor-only: no notes requested, so no witnesses are produced.
+    assert!(
+        out.witnesses.is_empty(),
+        "anchor-only fetch must not produce witnesses"
+    );
+
+    // The fetched anchor is the real, frontier-derived chain anchor — identical
+    // to the value the witness path re-roots to at this height.
+    assert_eq!(
+        out.anchor, expected,
+        "anchor-only fetch returned an unexpected anchor"
+    );
+
+    // And it is never the all-zero sentinel.
+    assert_ne!(
+        out.anchor, [0u8; 32],
+        "anchor-only fetch returned the all-zero anchor"
+    );
+}

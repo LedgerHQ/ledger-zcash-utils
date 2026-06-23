@@ -43,6 +43,66 @@ pub struct WitnessRequest {
     pub notes: Vec<NoteRef>,
 }
 
+/// Fetch the Orchard anchor (frontier root) at `anchor_height` without computing
+/// any per-note witnesses.
+///
+/// Used for transparent-source flows (Public→Private) whose Orchard bundle has
+/// outputs but no real spends — an anchor is still required for the dummy spends
+/// the builder injects. Reuses the tree-state + frontier path from
+/// `compute_witnesses`, then calls `zcash_crypto::tree::build_witnesses` with an
+/// empty notes list, which returns `WitnessOutput { anchor, witnesses: [] }`.
+///
+/// # Errors
+///
+/// Returns an error if the gRPC connection fails or if tree-state decoding fails.
+pub async fn fetch_orchard_anchor(
+    grpc_url: &str,
+    anchor_height: Option<u32>,
+    anchor_depth_blocks: Option<u32>,
+) -> Result<WitnessOutput> {
+    let channel = connect(grpc_url).await?;
+    let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
+
+    // Resolve anchor height.
+    let resolved_height = match anchor_height {
+        Some(h) => h,
+        None => {
+            let tip = chain_tip_with_client(&mut client).await?;
+            let depth = anchor_depth_blocks.unwrap_or(DEFAULT_ANCHOR_DEPTH_BLOCKS);
+            tip.saturating_sub(depth).max(1)
+        }
+    };
+
+    // Fetch tree state at the anchor.
+    let tree_state = get_tree_state_at(&mut client, resolved_height).await?;
+    let frontier_bytes = hex::decode(&tree_state.orchard_tree)
+        .map_err(|e| anyhow!("TreeState.orchard_tree hex decode failed: {}", e))?;
+
+    let subtree_roots = get_orchard_subtree_roots(&mut client, 0).await?;
+    let cap_roots: Vec<(u32, [u8; 32])> = subtree_roots
+        .iter()
+        .enumerate()
+        .map(|(i, sr)| {
+            let bytes: [u8; 32] = sr
+                .root_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("GetSubtreeRoots returned a root that is not 32 bytes"))?;
+            Ok((i as u32, bytes))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Build with empty notes: returns WitnessOutput { anchor, witnesses: [] }.
+    let inputs = WitnessInputs {
+        cap_roots,
+        frontier_bytes,
+        anchor_height: resolved_height,
+        shard_leaves: vec![],
+        notes: vec![],
+    };
+    build_witnesses(&inputs).map_err(|e| anyhow!("build_witnesses (anchor-only): {}", e))
+}
+
 /// Compute Merkle witnesses for every requested note against a single anchor.
 ///
 /// # Errors
@@ -387,7 +447,11 @@ mod tests {
         let (lo, hi) = shard_leaf_bounds(1, 2, total, base_offset, raw_len).unwrap();
         assert_eq!(lo, 3, "skip the 3 leading shard-0 leaves");
         assert_eq!((hi - lo) as u64, SHARD_SIZE, "exactly one full shard");
-        assert_eq!(hi as u64, 3 + SHARD_SIZE, "drop the trailing shard-2 spillover");
+        assert_eq!(
+            hi as u64,
+            3 + SHARD_SIZE,
+            "drop the trailing shard-2 spillover"
+        );
     }
 
     #[test]
@@ -463,6 +527,41 @@ mod tests {
             }],
         };
         let err = compute_witnesses(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid gRPC URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── fetch_orchard_anchor (Public→Private anchor-only) ─────────────────────
+
+    /// `fetch_orchard_anchor` is the anchor-only entry point used by the
+    /// Public→Private flow (transparent inputs + Orchard output, no spends).
+    /// It must surface a clear connection error when the endpoint is unreachable
+    /// rather than hang or panic.
+    #[tokio::test]
+    async fn fetch_orchard_anchor_fails_on_refused_port() {
+        // Bind then immediately drop to get a port guaranteed to be closed.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let err = fetch_orchard_anchor(&format!("https://127.0.0.1:{}", addr.port()), Some(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_orchard_anchor_fails_on_malformed_url() {
+        let err = fetch_orchard_anchor("definitely not a url !!!", Some(1), None)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("invalid gRPC URL"),
             "unexpected error: {err}"

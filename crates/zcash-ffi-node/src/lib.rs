@@ -246,7 +246,7 @@ pub async fn find_block_height(grpc_url: String, timestamp: u32) -> napi::Result
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
-// ─── V5 transaction builder (Orchard send) ────────────────────────────────────
+// ─── V5 transaction builder (Orchard + transparent send) ─────────────────────
 
 #[napi(object)]
 pub struct OrchardSpendInputJs {
@@ -273,6 +273,23 @@ pub struct OutputRequestJs {
     pub memo: Option<String>,
 }
 
+/// One transparent (P2PKH) UTXO to spend.
+#[napi(object)]
+pub struct TransparentInputJs {
+    /// 64-char hex (32 bytes) prevout txid in internal (little-endian) byte order.
+    /// Ledger Live surfaces txids in display (big-endian) order; callers must
+    /// reverse before passing.
+    pub txid: String,
+    /// Output index within the origin transaction.
+    pub vout: u32,
+    /// Hex-encoded raw scriptPubKey bytes (no CompactSize length prefix).
+    pub script_pubkey: String,
+    /// UTXO value in zatoshis (decimal string to avoid f64 precision loss).
+    pub value_zat: String,
+    /// 66-char hex (33 bytes) compressed secp256k1 pubkey controlling the UTXO.
+    pub pubkey: String,
+}
+
 #[napi(object)]
 pub struct BuildTransactionParams {
     pub grpc_url: String,
@@ -290,6 +307,8 @@ pub struct BuildTransactionParams {
     /// than computing a fee itself.
     pub fee_zat: String,
     pub spends: Vec<OrchardSpendInputJs>,
+    /// Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows.
+    pub transparent_inputs: Vec<TransparentInputJs>,
     pub outputs: Vec<OutputRequestJs>,
     pub anchor_height: Option<u32>,
 }
@@ -306,12 +325,18 @@ pub struct BuildTransactionResult {
     pub anchor_height: u32,
     /// Orchard action count after dummy padding.
     pub n_actions_orchard: u32,
+    /// Transparent input count.
+    pub n_transparent_inputs: u32,
+    /// Transparent output count (including change).
+    pub n_transparent_outputs: u32,
 }
 
-/// Build, prove, and serialize a PCZT for an Orchard send.
+/// Build, prove, and serialize a PCZT for a send transaction.
 ///
-/// Halo 2 proof generation happens here (~2-5 s first call, ~hundreds of ms
-/// thereafter thanks to the process-global ProvingKey cache).
+/// Supports Orchard-source (Private→*) and transparent-source (Public→*)
+/// flows. Halo 2 proof generation happens here for Orchard-bundle transactions
+/// (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
+/// ProvingKey cache). Transparent-only transactions skip the Orchard prover.
 #[napi]
 pub async fn build_transaction(
     params: BuildTransactionParams,
@@ -330,6 +355,21 @@ pub async fn build_transaction(
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
+
+    let transparent_inputs = params
+        .transparent_inputs
+        .into_iter()
+        .map(|t| {
+            Ok(zcash_sync::craft::TransparentInputDto {
+                txid_hex: t.txid,
+                vout: t.vout,
+                script_pubkey_hex: t.script_pubkey,
+                value_zat: parse_u64(&t.value_zat, "value_zat")?,
+                pubkey_hex: t.pubkey,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+
     let outputs = params
         .outputs
         .into_iter()
@@ -351,10 +391,11 @@ pub async fn build_transaction(
         fee_zat: parse_u64(&params.fee_zat, "fee_zat")?,
         anchor_height: params.anchor_height,
         spends,
+        transparent_inputs,
         outputs,
     };
 
-    let out = zcash_sync::craft::craft_orchard_transaction(req)
+    let out = zcash_sync::craft::craft_transaction(req)
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
@@ -363,6 +404,8 @@ pub async fn build_transaction(
         fee_zat: out.fee.to_string(),
         anchor_height: out.anchor_height,
         n_actions_orchard: out.n_actions_orchard,
+        n_transparent_inputs: out.n_transparent_inputs,
+        n_transparent_outputs: out.n_transparent_outputs,
     })
 }
 
@@ -484,13 +527,19 @@ mod tests {
 
     #[test]
     fn grpc_tx_to_napi_converts_fee_i64_to_f64() {
-        let napi = grpc_tx_to_napi(GrpcTx { fee_zatoshis: 1_234_567, ..make_grpc_tx() });
+        let napi = grpc_tx_to_napi(GrpcTx {
+            fee_zatoshis: 1_234_567,
+            ..make_grpc_tx()
+        });
         assert_eq!(napi.fee, 1_234_567.0_f64);
     }
 
     #[test]
     fn grpc_tx_to_napi_zero_fee() {
-        let napi = grpc_tx_to_napi(GrpcTx { fee_zatoshis: 0, ..make_grpc_tx() });
+        let napi = grpc_tx_to_napi(GrpcTx {
+            fee_zatoshis: 0,
+            ..make_grpc_tx()
+        });
         assert_eq!(napi.fee, 0.0_f64);
     }
 
@@ -598,7 +647,10 @@ mod tests {
     #[tokio::test]
     async fn start_sync_always_returns_ok_regardless_of_params() {
         let result = start_sync(make_sync_params("totally_invalid_ufvk")).await;
-        assert!(result.is_ok(), "start_sync must return Ok(stream) immediately");
+        assert!(
+            result.is_ok(),
+            "start_sync must return Ok(stream) immediately"
+        );
     }
 
     /// An invalid UFVK causes the background sync to fail. The failure is
@@ -676,11 +728,31 @@ mod tests {
         let napi = grpc_tx_to_napi(grpc);
         let note = &napi.orchard_notes[0];
 
-        assert_eq!(note.nullifier.as_deref(), Some(nullifier_hex.as_str()), "nullifier must be preserved");
-        assert_eq!(note.rseed.as_deref(), Some(rseed_hex.as_str()), "rseed must be preserved");
-        assert_eq!(note.cmx.as_deref(), Some(cmx_hex.as_str()), "cmx must be preserved");
-        assert_eq!(note.position.as_deref(), Some(position_u64.to_string().as_str()), "position must be decimal string");
-        assert_eq!(note.recipient.as_deref(), Some(recipient_hex.as_str()), "recipient must be preserved");
+        assert_eq!(
+            note.nullifier.as_deref(),
+            Some(nullifier_hex.as_str()),
+            "nullifier must be preserved"
+        );
+        assert_eq!(
+            note.rseed.as_deref(),
+            Some(rseed_hex.as_str()),
+            "rseed must be preserved"
+        );
+        assert_eq!(
+            note.cmx.as_deref(),
+            Some(cmx_hex.as_str()),
+            "cmx must be preserved"
+        );
+        assert_eq!(
+            note.position.as_deref(),
+            Some(position_u64.to_string().as_str()),
+            "position must be decimal string"
+        );
+        assert_eq!(
+            note.recipient.as_deref(),
+            Some(recipient_hex.as_str()),
+            "recipient must be preserved"
+        );
         assert!(note.is_spent, "is_spent must be true");
     }
 
@@ -715,6 +787,34 @@ mod tests {
         assert!(!note.is_spent, "outgoing: is_spent must be false");
     }
 
+    // ── TransparentInputJs → TransparentInputDto mapping ─────────────────────
+
+    /// value_zat = "50000" must map to exactly 50_000 u64.
+    #[test]
+    fn transparent_input_js_value_zat_parses_correctly() {
+        let result = parse_u64("50000", "value_zat");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 50_000u64);
+    }
+
+    /// A non-numeric value_zat must yield a NAPI error via parse_u64.
+    #[test]
+    fn transparent_input_js_non_numeric_value_zat_errors() {
+        let err = parse_u64("not_a_number", "value_zat").unwrap_err();
+        assert!(
+            err.reason.contains("invalid value_zat"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    /// zero value_zat parses to 0.
+    #[test]
+    fn transparent_input_js_zero_value_zat_parses_correctly() {
+        let result = parse_u64("0", "value_zat");
+        assert_eq!(result.unwrap(), 0u64);
+    }
+
     /// `position = 2_100_000_000u64` must convert to exactly `2_100_000_000.0f64`
     /// without precision loss (well within the safe integer range of f64).
     #[test]
@@ -740,6 +840,10 @@ mod tests {
         let pos_str = napi.orchard_notes[0].position.as_deref().unwrap();
         assert_eq!(pos_str, "2100000000", "position must be decimal string");
         // Round-trip: string → u64 must give back the original value.
-        assert_eq!(pos_str.parse::<u64>().unwrap(), position_u64, "string → u64 round-trip must be lossless");
+        assert_eq!(
+            pos_str.parse::<u64>().unwrap(),
+            position_u64,
+            "string → u64 round-trip must be lossless"
+        );
     }
 }
