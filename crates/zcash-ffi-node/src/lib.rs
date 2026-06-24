@@ -288,6 +288,16 @@ pub struct TransparentInputJs {
     pub value_zat: String,
     /// 66-char hex (33 bytes) compressed secp256k1 pubkey controlling the UTXO.
     pub pubkey: String,
+    /// BIP-44 chain (scope) the controlling key lives on: `0` = external,
+    /// `1` = internal (change). With `address_index` this identifies the UTXO's
+    /// signing key under the account. It is verified against the UFVK (the
+    /// derived pubkey must equal `pubkey`) and stamped into the PCZT as the
+    /// input's `bip32_derivation`, which the Ledger device uses as the signing
+    /// path (the PCZT sign APDU carries no path).
+    pub derivation_scope: u32,
+    /// Non-hardened BIP-44 address index of the controlling key (see
+    /// `derivation_scope`).
+    pub address_index: u32,
 }
 
 #[napi(object)]
@@ -366,6 +376,8 @@ pub async fn build_transaction(
                 script_pubkey_hex: t.script_pubkey,
                 value_zat: parse_u64(&t.value_zat, "value_zat")?,
                 pubkey_hex: t.pubkey,
+                derivation_scope: t.derivation_scope,
+                address_index: t.address_index,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;

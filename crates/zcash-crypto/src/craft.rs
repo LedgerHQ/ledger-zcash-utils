@@ -51,6 +51,31 @@
 //! exactly what the device validates and re-derives from
 //! (`app-rust-zcash` `check_bip44_compliance` / `derive_orchard_fvk`).
 //!
+//! ## Transparent BIP-44 `bip32_derivation`
+//!
+//! The transparent pool needs the analogous metadata, stamped onto the PCZT's
+//! transparent bundle by [`stamp_transparent_derivations`]:
+//!
+//!   - **Every transparent input** is stamped with its compressed pubkey and the
+//!     BIP-44 path `m/44'/coin_type'/account'/scope/address_index`. In the Ledger
+//!     PCZT signing flow this path *is* the signing-key locator — the sign APDU
+//!     (`handler_pczt_sign_transparent`) carries no path, and the device parser
+//!     rejects any transparent input whose `bip32_derivation` is missing or not
+//!     exactly one entry. The device signs with this path without re-checking it
+//!     against the pubkey, so the caller must guarantee it derives to the pubkey
+//!     (the sync layer verifies this against the UFVK before building).
+//!   - **The transparent change output** is stamped with the change pubkey and
+//!     the internal path `m/44'/coin_type'/account'/1/address_index`. Without it
+//!     the device classifies the wallet's own change as a third-party recipient
+//!     and shows it to the user; with it the device re-derives the pubkey from
+//!     the path, matches its hash against the output script, and hides it as
+//!     change. Regular (non-change) transparent recipient outputs are left
+//!     un-stamped so the device displays them as external payments.
+//!
+//! Transparent stamping runs after the IO Finalizer and Prover because
+//! `bip32_derivation` is signer metadata that does not affect the txid or
+//! sighash, and the transparent Updater role has no `tx_modifiable` gate.
+//!
 //! ## Transparent inputs — encoding conventions
 //!
 //! `txid`: The 32-byte txid is supplied in **internal (little-endian) byte
@@ -86,7 +111,9 @@ use zcash_protocol::{
     memo::MemoBytes,
     value::Zatoshis,
 };
-use zcash_transparent::address::TransparentAddress;
+use zcash_transparent::{
+    address::TransparentAddress, pczt::Bip32Derivation as TransparentBip32Derivation,
+};
 use zip32::ChildIndex;
 
 use crate::error::Error;
@@ -128,6 +155,22 @@ pub struct TransparentInput {
     pub script_pubkey: Vec<u8>,
     /// UTXO value in zatoshis.
     pub value: u64,
+    /// BIP-44 chain (scope) the controlling key was derived at: `0` = external,
+    /// `1` = internal (change). Combined with the shared `account_index` and the
+    /// network coin type into the input's signing path
+    /// `m/44'/coin_type'/account'/scope/address_index`, which is stamped into the
+    /// PCZT as this input's `bip32_derivation`.
+    ///
+    /// The Ledger device reads the signing path exclusively from this field in
+    /// the PCZT flow (`handler_pczt_sign_transparent` carries no path APDU); a
+    /// transparent input without a `bip32_derivation` is rejected by the device
+    /// parser. The path is not re-checked against `pubkey` on-device, so callers
+    /// must ensure it derives to `pubkey` (the sync layer verifies this against
+    /// the UFVK before building).
+    pub derivation_scope: u32,
+    /// Non-hardened BIP-44 address index of the controlling key (see
+    /// [`Self::derivation_scope`]).
+    pub derivation_address_index: u32,
 }
 
 /// A destination for one output.
@@ -171,6 +214,20 @@ pub struct BuildInputs {
     /// false` and `change > 0` (Public→Public flow). `None` is valid when no
     /// change is expected, or when change is taken in Orchard.
     pub transparent_change_address: Option<TransparentAddress>,
+    /// Compressed secp256k1 pubkey (33 bytes) of `transparent_change_address`.
+    /// Required (`Some`) whenever a transparent change output is produced. It is
+    /// stamped into the change output's `bip32_derivation` so the Ledger device
+    /// recognizes the output as change (and hides it) instead of displaying it as
+    /// a third-party recipient. The device re-derives this pubkey from the change
+    /// path and aborts if it does not match, so it must be the exact pubkey of
+    /// `transparent_change_address`.
+    pub transparent_change_pubkey: Option<[u8; 33]>,
+    /// Non-hardened BIP-44 address index of `transparent_change_address`.
+    /// Combined with the shared `account_index`, the internal scope (`1`), and
+    /// the network coin type into the change path
+    /// `m/44'/coin_type'/account'/1/address_index`. Required (`Some`) whenever a
+    /// transparent change output is produced.
+    pub transparent_change_address_index: Option<u32>,
     /// Anchor root (32-byte little-endian Pallas encoding) from `zcash_sync::witness::WitnessOutput`.
     /// Used only when an Orchard bundle is present; pass `[0u8; 32]` for
     /// Public→Public (no Orchard bundle).
@@ -241,6 +298,8 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         ovk,
         change_address,
         transparent_change_address,
+        transparent_change_pubkey,
+        transparent_change_address_index,
         anchor,
         seed_fingerprint,
         account_index,
@@ -345,6 +404,14 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // Route surplus change to the appropriate pool:
     // - Orchard bundle present → Orchard change output (existing behaviour).
     // - Transparent-only (Public→Public) → transparent change output.
+    //
+    // When a transparent change output is added we record its index in the
+    // transparent bundle plus the metadata needed to stamp its `bip32_derivation`
+    // (so the device can recognize it as change). The transparent builder appends
+    // outputs in insertion order without shuffling, so the change output — added
+    // here, after all caller-supplied outputs — is the last transparent output;
+    // its index equals the number of transparent outputs added before it.
+    let mut transparent_change_stamp: Option<(usize, [u8; 33], u32)> = None;
     if change > 0 {
         if has_orchard {
             let change_addr = change_address.ok_or_else(|| {
@@ -365,13 +432,30 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
                     "transparent change required but no transparent_change_address supplied".into(),
                 )
             })?;
+            let change_pubkey = transparent_change_pubkey.ok_or_else(|| {
+                Error::Craft(
+                    "transparent change required but no transparent_change_pubkey supplied — \
+                     the device needs the change output's bip32_derivation to recognize it as \
+                     change rather than a third-party recipient"
+                        .into(),
+                )
+            })?;
+            let change_address_index = transparent_change_address_index.ok_or_else(|| {
+                Error::Craft(
+                    "transparent change required but no transparent_change_address_index supplied"
+                        .into(),
+                )
+            })?;
             let change_req = OutputRequest {
                 destination: Destination::Transparent(addr),
                 value: change,
                 memo: None,
             };
+            let change_output_index = n_transparent_outputs as usize;
             add_output(&mut builder, None, &change_req)?;
             n_transparent_outputs += 1;
+            transparent_change_stamp =
+                Some((change_output_index, change_pubkey, change_address_index));
         }
     }
 
@@ -443,6 +527,26 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         prover.finish()
     };
 
+    // Stamp transparent `bip32_derivation`s. Done after IoFinalizer/Prover because
+    // these are signer metadata that do not affect the txid or sighash, and the
+    // transparent Updater role has no `tx_modifiable` gate. The device requires a
+    // `bip32_derivation` on every transparent input (it is the signing path in the
+    // PCZT flow) and on the transparent change output (so it is recognized as
+    // change). Skipped entirely for flows with no transparent inputs and no
+    // transparent change.
+    let pczt = if !transparent_inputs.is_empty() || transparent_change_stamp.is_some() {
+        stamp_transparent_derivations(
+            pczt,
+            &network,
+            seed_fingerprint,
+            account_index,
+            &transparent_inputs,
+            transparent_change_stamp,
+        )?
+    } else {
+        pczt
+    };
+
     let pczt_bytes = pczt.serialize();
 
     Ok(BuildOutput {
@@ -502,6 +606,130 @@ fn stamp_spend_derivations(
             Ok(())
         })
         .map_err(|e| Error::Craft(format!("PCZT Updater (orchard zip32): {e:?}")))
+        .map(Updater::finish)
+}
+
+/// BIP-44 internal (change) scope. Transparent change addresses live on the
+/// internal chain; the Ledger device only accepts a change output whose
+/// `bip32_derivation` path has scope `1` (`check_bip44_compliance` with
+/// `is_change_path: true`).
+const TRANSPARENT_INTERNAL_SCOPE: u32 = 1;
+
+/// Builds the transparent BIP-44 derivation path
+/// `m/44'/coin_type'/account'/scope/address_index` as raw ZIP-32 child indices
+/// (the first three hardened, the last two non-hardened).
+///
+/// This matches what the Ledger device validates via `check_bip44_compliance`
+/// (purpose `44`, the network coin type) and — for change outputs — re-derives
+/// the pubkey from.
+fn bip44_transparent_path(
+    coin_type: u32,
+    account_index: u32,
+    scope: u32,
+    address_index: u32,
+) -> Result<Vec<u32>, Error> {
+    const HARDENED_OFFSET: u32 = 1 << 31;
+    if account_index >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "account_index {account_index} exceeds the ZIP-32 hardened range"
+        )));
+    }
+    if scope >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "transparent derivation scope {scope} must be non-hardened"
+        )));
+    }
+    if address_index >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "transparent address index {address_index} must be non-hardened"
+        )));
+    }
+    Ok(vec![
+        ChildIndex::hardened(44).index(),
+        ChildIndex::hardened(coin_type).index(),
+        ChildIndex::hardened(account_index).index(),
+        scope,
+        address_index,
+    ])
+}
+
+/// Stamps the transparent bundle's `bip32_derivation`s:
+///
+/// - **Every transparent input** gets a derivation keyed by its compressed
+///   pubkey at path `m/44'/coin_type'/account'/scope/address_index`. In the
+///   Ledger PCZT signing flow this path *is* the signing key locator — the
+///   device reads it from the PCZT (the sign APDU carries no path) and rejects
+///   inputs whose `bip32_derivation` is absent or not exactly one entry.
+/// - **The transparent change output** (when present) gets a derivation keyed by
+///   the change pubkey at path `m/44'/coin_type'/account'/1/address_index`, so
+///   the device classifies it as change (re-deriving the pubkey from the path
+///   and matching its hash against the output script) instead of showing it as a
+///   third-party recipient.
+///
+/// Regular (non-change) transparent recipient outputs are intentionally left
+/// without a derivation so the device displays them as external payments.
+///
+/// Derivations are pre-computed before entering the updater closure so path and
+/// parse errors surface as [`Error::Craft`]; the closure itself can only yield
+/// the transparent `UpdaterError` (invalid index).
+fn stamp_transparent_derivations(
+    pczt: Pczt,
+    network: &Network,
+    seed_fingerprint: [u8; 32],
+    account_index: u32,
+    transparent_inputs: &[TransparentInput],
+    change: Option<(usize, [u8; 33], u32)>,
+) -> Result<Pczt, Error> {
+    let coin_type = network.coin_type();
+
+    let mut input_derivations: Vec<([u8; 33], TransparentBip32Derivation)> =
+        Vec::with_capacity(transparent_inputs.len());
+    for tin in transparent_inputs {
+        let path = bip44_transparent_path(
+            coin_type,
+            account_index,
+            tin.derivation_scope,
+            tin.derivation_address_index,
+        )?;
+        let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
+            .map_err(|e| Error::Craft(format!("transparent input bip32 derivation: {e:?}")))?;
+        input_derivations.push((tin.pubkey, derivation));
+    }
+
+    let change_derivation = match change {
+        Some((index, pubkey, address_index)) => {
+            let path = bip44_transparent_path(
+                coin_type,
+                account_index,
+                TRANSPARENT_INTERNAL_SCOPE,
+                address_index,
+            )?;
+            let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
+                .map_err(|e| {
+                    Error::Craft(format!("transparent change bip32 derivation: {e:?}"))
+                })?;
+            Some((index, pubkey, derivation))
+        }
+        None => None,
+    };
+
+    Updater::new(pczt)
+        .update_transparent_with(|mut updater| {
+            for (i, (pubkey, derivation)) in input_derivations.into_iter().enumerate() {
+                updater.update_input_with(i, |mut input| {
+                    input.set_bip32_derivation(pubkey, derivation);
+                    Ok(())
+                })?;
+            }
+            if let Some((index, pubkey, derivation)) = change_derivation {
+                updater.update_output_with(index, |mut output| {
+                    output.set_bip32_derivation(pubkey, derivation);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Craft(format!("PCZT Updater (transparent bip32): {e:?}")))
         .map(Updater::finish)
 }
 
@@ -772,6 +1000,8 @@ mod tests {
             ovk,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -832,6 +1062,8 @@ mod tests {
             vout: 0,
             script_pubkey: make_p2pkh_script(pubkey_hash160(&pubkey)),
             value,
+            derivation_scope: 0,
+            derivation_address_index: 0,
         }
     }
 
@@ -859,6 +1091,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0xff; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -895,6 +1129,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -935,6 +1171,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -967,6 +1205,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1127,6 +1367,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1138,6 +1380,8 @@ mod tests {
                 vout: 0,
                 script_pubkey: make_p2pkh_script([0x11u8; 20]),
                 value: out_value + fee,
+                derivation_scope: 0,
+                derivation_address_index: 0,
             }],
             outputs: vec![OutputRequest {
                 destination: Destination::Transparent(t_dest),
@@ -1167,6 +1411,8 @@ mod tests {
             ovk: None,
             change_address: Some(change),
             transparent_change_address: None, // intentionally missing
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1383,6 +1629,8 @@ mod tests {
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1437,6 +1685,8 @@ mod tests {
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1495,6 +1745,8 @@ mod tests {
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1553,6 +1805,8 @@ mod tests {
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(make_test_pubkey()),
+            transparent_change_address_index: Some(0),
             anchor: [0u8; 32], // ignored for transparent-only
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1577,6 +1831,122 @@ mod tests {
         assert_eq!(out.fee, fee);
     }
 
+    /// Public→Public: re-parse the serialized PCZT and assert that the device's
+    /// hard requirements are met — every transparent input carries exactly one
+    /// `bip32_derivation` (its signing path), the change output carries one (so
+    /// the device recognizes it as change), and the recipient output carries none
+    /// (so the device shows it as an external payment).
+    #[test]
+    fn public_to_public_stamps_transparent_bip32_derivations() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let input_pubkey = make_test_pubkey();
+        let change_pubkey = {
+            use secp256k1::{Secp256k1, SecretKey};
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+        };
+        let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
+        let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 2);
+        let out_value = 15_000u64;
+        let change_value = 5_000u64;
+        let total_in = out_value + change_value + fee;
+        let seed_fingerprint = [0x42u8; 32];
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(change_pubkey),
+            transparent_change_address_index: Some(7),
+            anchor: [0u8; 32],
+            seed_fingerprint,
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: input_pubkey,
+                txid: [0x01u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script(pubkey_hash160(&input_pubkey)),
+                value: total_in,
+                derivation_scope: 0,
+                derivation_address_index: 3,
+            }],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→public must succeed");
+        let parsed = Pczt::parse(&out.pczt_bytes).expect("PCZT must re-parse");
+
+        Updater::new(parsed)
+            .update_transparent_with(|updater| {
+                let bundle = updater.bundle();
+
+                // Input: exactly one derivation keyed by the input pubkey, at the
+                // expected external signing path m/44'/133'/0'/0/3.
+                let input = &bundle.inputs()[0];
+                assert_eq!(
+                    input.bip32_derivation().len(),
+                    1,
+                    "device requires exactly one transparent input bip32 derivation"
+                );
+                let in_deriv = input
+                    .bip32_derivation()
+                    .get(&input_pubkey)
+                    .expect("input derivation must be keyed by the input pubkey");
+                // `bip32::ChildNumber::index()` strips the hardened bit, so compare
+                // de-hardened indices and hardened flags separately. Expected
+                // external signing path m/44'/133'/0'/0/3.
+                let in_indices: Vec<u32> =
+                    in_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let in_hardened: Vec<bool> = in_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.is_hardened())
+                    .collect();
+                assert_eq!(in_indices, vec![44, 133, 0, 0, 3]);
+                assert_eq!(in_hardened, vec![true, true, true, false, false]);
+                assert_eq!(in_deriv.seed_fingerprint(), &seed_fingerprint);
+
+                // Outputs: recipient (index 0) has no derivation; change (index 1,
+                // appended last) has one, keyed by the change pubkey, at the
+                // internal change path m/44'/133'/0'/1/7.
+                let recipient = &bundle.outputs()[0];
+                assert!(
+                    recipient.bip32_derivation().is_empty(),
+                    "recipient output must have no bip32 derivation"
+                );
+                let change = &bundle.outputs()[1];
+                let out_deriv = change
+                    .bip32_derivation()
+                    .get(&change_pubkey)
+                    .expect("change output must carry a derivation keyed by the change pubkey");
+                // Expected internal change path m/44'/133'/0'/1/7.
+                let out_indices: Vec<u32> =
+                    out_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let out_hardened: Vec<bool> = out_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.is_hardened())
+                    .collect();
+                assert_eq!(out_indices, vec![44, 133, 0, 1, 7]);
+                assert_eq!(out_hardened, vec![true, true, true, false, false]);
+                assert_eq!(out_deriv.seed_fingerprint(), &seed_fingerprint);
+                Ok(())
+            })
+            .expect("transparent updater read-back must succeed");
+    }
+
     /// Public→Public with exact balance (no change needed).
     #[test]
     fn public_to_public_exact_balance_no_change() {
@@ -1594,6 +1964,8 @@ mod tests {
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: None, // no change needed
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1658,6 +2030,8 @@ mod tests {
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
             transparent_change_address: None, // exact balance: no change
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,

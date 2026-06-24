@@ -55,6 +55,16 @@ pub struct TransparentInputDto {
     pub value_zat: u64,
     /// 66-char hex (33 bytes) compressed secp256k1 pubkey.
     pub pubkey_hex: String,
+    /// BIP-44 chain (scope) the controlling key lives on: `0` = external,
+    /// `1` = internal (change). Together with `address_index` and the account's
+    /// path this identifies the input's signing key. Verified against the UFVK
+    /// (the derived pubkey must equal `pubkey_hex`) and stamped into the PCZT as
+    /// the input's `bip32_derivation` — the Ledger device's sole source for the
+    /// transparent signing path in the PCZT flow.
+    pub derivation_scope: u32,
+    /// Non-hardened BIP-44 address index of the controlling key (see
+    /// `derivation_scope`).
+    pub address_index: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -161,42 +171,57 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     // transparent receiver we can only proceed if the transaction produces no
     // change; if it would, fail fast here with an actionable error rather than
     // letting the deeper, generic builder error surface later.
-    let transparent_change_address: Option<zcash_transparent::address::TransparentAddress> =
-        if !has_orchard_bundle {
-            let derived = ufvk.transparent().and_then(|tpk| {
-                tpk.derive_internal_ivk().ok().map(|ivk| {
-                    use zcash_transparent::keys::IncomingViewingKey;
-                    ivk.default_address().0
-                })
-            });
-            if derived.is_none() {
-                let total_in = req
-                    .transparent_inputs
-                    .iter()
-                    .try_fold(0u64, |acc, t| acc.checked_add(t.value_zat))
-                    .ok_or_else(|| anyhow!("transparent input value overflow"))?;
-                let total_out = req
-                    .outputs
-                    .iter()
-                    .try_fold(0u64, |acc, o| acc.checked_add(o.value_zat))
-                    .ok_or_else(|| anyhow!("output value overflow"))?;
-                let outflow = total_out
-                    .checked_add(req.fee_zat)
-                    .ok_or_else(|| anyhow!("total_out + fee overflow"))?;
-                if total_in > outflow {
-                    return Err(anyhow!(
-                        "transparent change of {} zatoshis is required but the UFVK has no \
-                         transparent receiver to derive an internal change address from; \
-                         use a UFVK with a transparent component or send an exact-balance \
-                         amount (transparent inputs == outputs + fee)",
-                        total_in - outflow
-                    ));
-                }
+    // Derive the internal change address *and* the metadata the device needs to
+    // recognize it as change: the change pubkey (33 bytes) and its non-hardened
+    // address index. These flow into the change output's `bip32_derivation`.
+    let transparent_change: Option<(
+        zcash_transparent::address::TransparentAddress,
+        [u8; 33],
+        u32,
+    )> = if !has_orchard_bundle {
+        let derived = ufvk.transparent().and_then(|tpk| {
+            use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
+            let ivk = tpk.derive_internal_ivk().ok()?;
+            let (addr, index) = ivk.default_address();
+            // The change output's bip32_derivation pubkey must be the exact pubkey
+            // backing `addr` so the device's re-derive-and-match check passes.
+            let pubkey = tpk
+                .derive_address_pubkey(TransparentKeyScope::INTERNAL, index)
+                .ok()?
+                .serialize();
+            Some((addr, pubkey, index.index()))
+        });
+        if derived.is_none() {
+            let total_in = req
+                .transparent_inputs
+                .iter()
+                .try_fold(0u64, |acc, t| acc.checked_add(t.value_zat))
+                .ok_or_else(|| anyhow!("transparent input value overflow"))?;
+            let total_out = req
+                .outputs
+                .iter()
+                .try_fold(0u64, |acc, o| acc.checked_add(o.value_zat))
+                .ok_or_else(|| anyhow!("output value overflow"))?;
+            let outflow = total_out
+                .checked_add(req.fee_zat)
+                .ok_or_else(|| anyhow!("total_out + fee overflow"))?;
+            if total_in > outflow {
+                return Err(anyhow!(
+                    "transparent change of {} zatoshis is required but the UFVK has no \
+                     transparent receiver to derive an internal change address from; \
+                     use a UFVK with a transparent component or send an exact-balance \
+                     amount (transparent inputs == outputs + fee)",
+                    total_in - outflow
+                ));
             }
-            derived
-        } else {
-            None
-        };
+        }
+        derived
+    } else {
+        None
+    };
+    let transparent_change_address = transparent_change.as_ref().map(|(addr, _, _)| *addr);
+    let transparent_change_pubkey = transparent_change.as_ref().map(|(_, pk, _)| *pk);
+    let transparent_change_address_index = transparent_change.as_ref().map(|(_, _, i)| *i);
 
     // ── 4. Anchor routing ─────────────────────────────────────────────────────
     let (anchor, spends) = if has_orchard_spends {
@@ -253,20 +278,71 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     };
 
     // ── 5. Decode transparent inputs ─────────────────────────────────────────
+    // For each input we verify that its (derivation_scope, address_index) really
+    // identifies the supplied pubkey under this UFVK, then record the path so the
+    // builder can stamp the input's `bip32_derivation` (the device's only source
+    // for the transparent signing path). The device signs with that path without
+    // re-checking it against the pubkey, so getting it wrong would yield an
+    // invalid signature — this up-front check turns that into a clear build error.
+    let account_pubkey = ufvk.transparent();
     let transparent_inputs: Vec<TransparentInput> = req
         .transparent_inputs
         .iter()
         .map(|dto| {
+            use zcash_transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
+
             let txid = hex_to_array::<32>(&dto.txid_hex, "txid")?;
             let pubkey = hex_to_array::<33>(&dto.pubkey_hex, "pubkey")?;
             let script_pubkey = hex::decode(&dto.script_pubkey_hex)
                 .map_err(|e| anyhow!("script_pubkey hex: {e}"))?;
+
+            let scope = match dto.derivation_scope {
+                0 => TransparentKeyScope::EXTERNAL,
+                1 => TransparentKeyScope::INTERNAL,
+                other => {
+                    return Err(anyhow!(
+                        "transparent input derivation_scope must be 0 (external) or 1 (internal), \
+                         got {other}"
+                    ))
+                }
+            };
+            let apk = account_pubkey.ok_or_else(|| {
+                anyhow!(
+                    "transparent inputs were supplied but the UFVK has no transparent component \
+                     to derive (and verify) their signing keys from"
+                )
+            })?;
+            let index = NonHardenedChildIndex::from_index(dto.address_index).ok_or_else(|| {
+                anyhow!(
+                    "transparent input address_index {} is not a valid non-hardened index",
+                    dto.address_index
+                )
+            })?;
+            let derived_pubkey = apk.derive_address_pubkey(scope, index).map_err(|e| {
+                anyhow!(
+                    "failed to derive transparent input pubkey at scope {} index {}: {e}",
+                    dto.derivation_scope,
+                    dto.address_index
+                )
+            })?;
+            if derived_pubkey.serialize() != pubkey {
+                return Err(anyhow!(
+                    "transparent input pubkey does not match the key derived from the UFVK at \
+                     scope {} index {}; the supplied (derivation_scope, address_index) does not \
+                     identify this UTXO's key",
+                    dto.derivation_scope,
+                    dto.address_index
+                ));
+            }
+
             Ok(TransparentInput {
                 txid,
                 vout: dto.vout,
                 script_pubkey,
                 value: dto.value_zat,
                 pubkey,
+                derivation_scope: dto.derivation_scope,
+                derivation_address_index: dto.address_index,
             })
         })
         .collect::<Result<_>>()?;
@@ -287,6 +363,8 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         ovk,
         change_address,
         transparent_change_address,
+        transparent_change_pubkey,
+        transparent_change_address_index,
         anchor,
         seed_fingerprint,
         account_index: req.account_index,
@@ -365,6 +443,8 @@ mod tests {
             script_pubkey_hex: "76a914".to_string() + &"11".repeat(20) + "88ac",
             value_zat: 100_000,
             pubkey_hex: "02".to_string() + &"01".repeat(32),
+            derivation_scope: 0,
+            address_index: 0,
         }
     }
 

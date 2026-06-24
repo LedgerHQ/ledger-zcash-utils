@@ -167,6 +167,20 @@ export interface TransparentInputJs {
   valueZat: string;
   /** 66-char hex (33 bytes) compressed secp256k1 pubkey controlling the UTXO. */
   pubkey: string;
+  /**
+   * BIP-44 chain (scope) the controlling key lives on: `0` = external,
+   * `1` = internal (change). With `addressIndex` this identifies the UTXO's
+   * signing key under the account. It is verified against the UFVK (the
+   * derived pubkey must equal `pubkey`) and stamped into the PCZT as the
+   * input's `bip32_derivation`, which the Ledger device uses as the signing
+   * path (the PCZT sign APDU carries no path).
+   */
+  derivationScope: number;
+  /**
+   * Non-hardened BIP-44 address index of the controlling key (see
+   * `derivationScope`).
+   */
+  addressIndex: number;
 }
 export interface BuildTransactionParams {
   grpcUrl: string;
