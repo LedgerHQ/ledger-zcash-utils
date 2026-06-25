@@ -182,9 +182,22 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         let derived = ufvk.transparent().and_then(|tpk| {
             use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
             let ivk = tpk.derive_internal_ivk().ok()?;
+            // `default_address()` returns the first non-hardened index whose key
+            // derivation succeeds, scanning up from 0. For secp256k1 this is
+            // index 0 except in a ~2^-128 derivation-failure case, in which case
+            // it transparently advances to the next valid index. Whatever index
+            // it lands on, the wallet (Ledger Live) must scan the internal chain
+            // (scope 1) from index 0 under the standard BIP-44 gap limit to
+            // rediscover and later spend this change — the index is exactly what
+            // `default_address()` picks, so a standard scan always finds it.
             let (addr, index) = ivk.default_address();
-            // The change output's bip32_derivation pubkey must be the exact pubkey
-            // backing `addr` so the device's re-derive-and-match check passes.
+            // Fund-safety invariant: `addr` and `pubkey` are derived along the
+            // *same* path `m/44'/coin'/account'/1/index` (addr from the internal
+            // ivk, pubkey from the account key at INTERNAL scope), so they can
+            // never diverge. The change output's bip32_derivation carries this
+            // pubkey; the device re-derives it from the path, hashes it, and
+            // matches it against the output script (which encodes `addr`) — that
+            // check only passes because both sides come from this one index.
             let pubkey = tpk
                 .derive_address_pubkey(TransparentKeyScope::INTERNAL, index)
                 .ok()?

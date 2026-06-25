@@ -311,8 +311,13 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
 
     let target = BlockHeight::from(target_height);
     if !network.is_nu_active(NetworkUpgrade::Nu5, target) {
+        // This builder always emits a v5 transaction (`BuildConfig::Standard`),
+        // and the v5 format is gated on NU5 regardless of which pools are used —
+        // so this also applies to transparent-only (Public→Public) transactions
+        // that contain no Orchard bundle.
         return Err(Error::Craft(format!(
-            "Orchard (NU5) is not active at target_height {target_height}"
+            "NU5 is not active at target_height {target_height}; this builder emits v5 \
+             transactions, which require NU5 (or a later upgrade) to be active"
         )));
     }
     if spends.is_empty() && transparent_inputs.is_empty() {
@@ -1223,8 +1228,9 @@ mod tests {
         };
         let err = build_transaction(inputs).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("Orchard (NU5) is not active")),
-            "got: {err}"
+            matches!(&err, Error::Craft(s)
+                if s.contains("NU5 is not active") && !s.contains("Orchard")),
+            "transparent-only NU5 error must not be attributed to Orchard, got: {err}"
         );
     }
 

@@ -283,6 +283,9 @@ pub struct TransparentInputJs {
     /// Output index within the origin transaction.
     pub vout: u32,
     /// Hex-encoded raw scriptPubKey bytes (no CompactSize length prefix).
+    /// Exposed to JS as `scriptPubKey` (canonical Bitcoin/Zcash casing) rather
+    /// than napi's default `scriptPubkey` camelCasing of the Rust field name.
+    #[napi(js_name = "scriptPubKey")]
     pub script_pubkey: String,
     /// UTXO value in zatoshis (decimal string to avoid f64 precision loss).
     pub value_zat: String,
