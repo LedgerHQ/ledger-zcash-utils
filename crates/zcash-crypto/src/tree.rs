@@ -201,7 +201,9 @@ fn decode_orchard_frontier(
 /// rather than assumed to start exactly on a shard boundary.
 pub fn frontier_leaf_count(bytes: &[u8]) -> Result<u64, Error> {
     let frontier = decode_orchard_frontier(bytes)?;
-    Ok(frontier.value().map_or(0, |nf| u64::from(nf.position()) + 1))
+    Ok(frontier
+        .value()
+        .map_or(0, |nf| u64::from(nf.position()) + 1))
 }
 
 #[cfg(test)]
@@ -638,7 +640,8 @@ mod tests {
         // Completed shard 0's summary root. With all-empty leaves it is the empty
         // root at the shard level. Supplying this in `cap_roots` while also
         // supplying shard 0's leaves exercises the summary/leaf overlap.
-        let shard0_root = MerkleHashOrchard::empty_root(Level::from(ORCHARD_SHARD_HEIGHT)).to_bytes();
+        let shard0_root =
+            MerkleHashOrchard::empty_root(Level::from(ORCHARD_SHARD_HEIGHT)).to_bytes();
 
         let inputs = WitnessInputs {
             cap_roots: vec![(0, shard0_root)],
@@ -665,7 +668,9 @@ mod tests {
         // Explicitly re-validate each witness against the anchor. `build_witnesses`
         // already enforces this internally, but the acceptance criterion calls for
         // an independent `MerklePath::root(cmx) == anchor` check per note.
-        let leaf_hash = MerkleHashOrchard::from_bytes(&leaf_val).into_option().unwrap();
+        let leaf_hash = MerkleHashOrchard::from_bytes(&leaf_val)
+            .into_option()
+            .unwrap();
         for path in &out.witnesses {
             assert_eq!(path.root(leaf_hash).to_bytes(), out.anchor);
         }
@@ -704,8 +709,14 @@ mod tests {
         let anchor = h32("a104cba07fd164a2f4432eac02ce9d4ea76749d63adc02050c7004ccb5c36014");
 
         let cap_roots = vec![
-            (0u32, h32("25934a8c8cde7b4ba7e51d78f2321c7e286d140811a192f692f29d3f0ecce510")),
-            (1u32, h32("a7d4af61ae5f9c5a63dd74d7bb541f42ca227c79c30ed360c569167f7dedfc1e")),
+            (
+                0u32,
+                h32("25934a8c8cde7b4ba7e51d78f2321c7e286d140811a192f692f29d3f0ecce510"),
+            ),
+            (
+                1u32,
+                h32("a7d4af61ae5f9c5a63dd74d7bb541f42ca227c79c30ed360c569167f7dedfc1e"),
+            ),
         ];
 
         let frontier_bytes = hex::decode(
@@ -815,7 +826,10 @@ mod tests {
             .unwrap()
             .root()
             .to_bytes();
-        assert_eq!(frontier_root, anchor, "canonical frontier root disagrees with assembled anchor");
+        assert_eq!(
+            frontier_root, anchor,
+            "canonical frontier root disagrees with assembled anchor"
+        );
 
         // 3. Exactly one witness, at the requested position.
         assert_eq!(out.witnesses.len(), 1);
@@ -827,7 +841,9 @@ mod tests {
         assert_eq!(got_path, expected_path, "authentication path mismatch");
 
         // 5. And the path re-roots to the anchor against the note cmx.
-        let leaf = MerkleHashOrchard::from_bytes(&note_cmx).into_option().unwrap();
+        let leaf = MerkleHashOrchard::from_bytes(&note_cmx)
+            .into_option()
+            .unwrap();
         assert_eq!(path.root(leaf).to_bytes(), anchor);
     }
 

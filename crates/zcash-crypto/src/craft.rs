@@ -420,9 +420,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     if change > 0 {
         if has_orchard {
             let change_addr = change_address.ok_or_else(|| {
-                Error::Craft(
-                    "change_address required for Orchard change but none supplied".into(),
-                )
+                Error::Craft("change_address required for Orchard change but none supplied".into())
             })?;
             let change_req = OutputRequest {
                 destination: Destination::Orchard(change_addr),
@@ -710,9 +708,7 @@ fn stamp_transparent_derivations(
                 address_index,
             )?;
             let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
-                .map_err(|e| {
-                    Error::Craft(format!("transparent change bip32 derivation: {e:?}"))
-                })?;
+                .map_err(|e| Error::Craft(format!("transparent change bip32 derivation: {e:?}")))?;
             Some((index, pubkey, derivation))
         }
         None => None,
@@ -1913,8 +1909,11 @@ mod tests {
                 // `bip32::ChildNumber::index()` strips the hardened bit, so compare
                 // de-hardened indices and hardened flags separately. Expected
                 // external signing path m/44'/133'/0'/0/3.
-                let in_indices: Vec<u32> =
-                    in_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let in_indices: Vec<u32> = in_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.index())
+                    .collect();
                 let in_hardened: Vec<bool> = in_deriv
                     .derivation_path()
                     .iter()
@@ -1938,8 +1937,11 @@ mod tests {
                     .get(&change_pubkey)
                     .expect("change output must carry a derivation keyed by the change pubkey");
                 // Expected internal change path m/44'/133'/0'/1/7.
-                let out_indices: Vec<u32> =
-                    out_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let out_indices: Vec<u32> = out_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.index())
+                    .collect();
                 let out_hardened: Vec<bool> = out_deriv
                     .derivation_path()
                     .iter()

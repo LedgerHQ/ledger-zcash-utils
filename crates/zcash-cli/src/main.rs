@@ -205,7 +205,9 @@ fn cmd_derive(args: DeriveArgs) {
         args.account,
         network,
         args.xpub_path.as_deref(),
-        DeriveOptions { include_sapling_in_ufvk: !args.no_sapling },
+        DeriveOptions {
+            include_sapling_in_ufvk: !args.no_sapling,
+        },
     ) {
         Ok(keys) => match args.format {
             Format::Human => {
@@ -281,25 +283,36 @@ fn parse_date_or_timestamp(input: &str) -> Result<u32, String> {
     // Try as YYYY-MM-DD → midnight UTC.
     let parts: Vec<&str> = input.split('-').collect();
     if parts.len() == 3 {
-        let year: i32 = parts[0].parse().map_err(|_| format!("invalid year: {}", parts[0]))?;
-        let month_num: u8 = parts[1].parse().map_err(|_| format!("invalid month: {}", parts[1]))?;
-        let day: u8 = parts[2].parse().map_err(|_| format!("invalid day: {}", parts[2]))?;
+        let year: i32 = parts[0]
+            .parse()
+            .map_err(|_| format!("invalid year: {}", parts[0]))?;
+        let month_num: u8 = parts[1]
+            .parse()
+            .map_err(|_| format!("invalid month: {}", parts[1]))?;
+        let day: u8 = parts[2]
+            .parse()
+            .map_err(|_| format!("invalid day: {}", parts[2]))?;
         let month = time::Month::try_from(month_num)
             .map_err(|_| format!("month out of range: {month_num}"))?;
         let date = time::Date::from_calendar_date(year, month, day)
             .map_err(|_| format!("invalid date: {input}"))?;
-        let ts = date.with_hms(0, 0, 0).unwrap().assume_utc().unix_timestamp();
+        let ts = date
+            .with_hms(0, 0, 0)
+            .unwrap()
+            .assume_utc()
+            .unix_timestamp();
         if ts >= 0 {
             return Ok(ts as u32);
         }
         return Err(format!("date '{input}' is before Unix epoch"));
     }
 
-    Err(format!("cannot parse '{input}' as YYYY-MM-DD or Unix timestamp"))
+    Err(format!(
+        "cannot parse '{input}' as YYYY-MM-DD or Unix timestamp"
+    ))
 }
 
 async fn cmd_sync(args: SyncArgs) {
-
     let network_str = match args.network {
         Network::Mainnet => "mainnet".to_string(),
         Network::Testnet => "testnet".to_string(),
@@ -324,7 +337,10 @@ async fn cmd_sync(args: SyncArgs) {
         Some(h) => h,
         None => {
             if args.verbose {
-                eprintln!("[sync] --end-height not set, querying chain tip from {}...", args.grpc_url);
+                eprintln!(
+                    "[sync] --end-height not set, querying chain tip from {}...",
+                    args.grpc_url
+                );
             }
             match zcash_sync::client::chain_tip(args.grpc_url.clone()).await {
                 Ok(h) => {
@@ -360,17 +376,31 @@ async fn cmd_sync(args: SyncArgs) {
     let w = 16; // label column width
     let sep = "─".repeat(72);
     eprintln!("{sep}");
-    eprintln!("{:<w$}{}", "Network",     network_str);
-    eprintln!("{:<w$}{}", "UFVK",        ufvk_prefix);
-    eprintln!("{:<w$}{}", "gRPC",        args.grpc_url);
-    eprintln!("{:<w$}{} → {}  ({} blocks)",
+    eprintln!("{:<w$}{}", "Network", network_str);
+    eprintln!("{:<w$}{}", "UFVK", ufvk_prefix);
+    eprintln!("{:<w$}{}", "gRPC", args.grpc_url);
+    eprintln!(
+        "{:<w$}{} → {}  ({} blocks)",
         "Block range",
-        fmt_num(start_height), fmt_num(end_height), fmt_num(total_blocks));
-    eprintln!("{:<w$}{} chunks × {} blocks",
-        "Chunks", fmt_num(n_chunks), fmt_num(chunk_size));
-    eprintln!("{:<w$}{}",
+        fmt_num(start_height),
+        fmt_num(end_height),
+        fmt_num(total_blocks)
+    );
+    eprintln!(
+        "{:<w$}{} chunks × {} blocks",
+        "Chunks",
+        fmt_num(n_chunks),
+        fmt_num(chunk_size)
+    );
+    eprintln!(
+        "{:<w$}{}",
         "Mode",
-        if args.orchard_only { "orchard-only (Sapling skipped)" } else { "full (Sapling + Orchard)" });
+        if args.orchard_only {
+            "orchard-only (Sapling skipped)"
+        } else {
+            "full (Sapling + Orchard)"
+        }
+    );
     eprintln!("{sep}");
     eprintln!();
 
@@ -392,16 +422,19 @@ async fn cmd_sync(args: SyncArgs) {
             )
             .unwrap()
             .progress_chars("█▉▊▋▌▍▎▏ ")
-            .with_key("per_sec", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                let bps = state.per_sec();
-                if bps >= 1_000_000.0 {
-                    write!(w, "{:.1}M bl/s", bps / 1_000_000.0).unwrap();
-                } else if bps >= 1_000.0 {
-                    write!(w, "{:.0}k bl/s", bps / 1_000.0).unwrap();
-                } else {
-                    write!(w, "{:.0} bl/s", bps).unwrap();
-                }
-            }),
+            .with_key(
+                "per_sec",
+                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                    let bps = state.per_sec();
+                    if bps >= 1_000_000.0 {
+                        write!(w, "{:.1}M bl/s", bps / 1_000_000.0).unwrap();
+                    } else if bps >= 1_000.0 {
+                        write!(w, "{:.0}k bl/s", bps / 1_000.0).unwrap();
+                    } else {
+                        write!(w, "{:.0} bl/s", bps).unwrap();
+                    }
+                },
+            ),
         );
         bar.enable_steady_tick(std::time::Duration::from_millis(100));
         Some(Arc::new(bar))
@@ -412,7 +445,9 @@ async fn cmd_sync(args: SyncArgs) {
     // Callback invoked per block by the sync engine — drives real-time progress.
     let on_block_done: Option<Arc<dyn Fn() + Send + Sync>> = pb.as_ref().map(|b| {
         let b = Arc::clone(b);
-        Arc::new(move || { b.inc(1); }) as Arc<dyn Fn() + Send + Sync>
+        Arc::new(move || {
+            b.inc(1);
+        }) as Arc<dyn Fn() + Send + Sync>
     });
 
     // Build the full list of chunks upfront so we can fan them out.
@@ -467,7 +502,9 @@ async fn cmd_sync(args: SyncArgs) {
         let chunk_result = match result {
             Ok(r) => r,
             Err(err) => {
-                if let Some(ref bar) = pb { bar.abandon(); }
+                if let Some(ref bar) = pb {
+                    bar.abandon();
+                }
                 eprintln!("Error on chunk {}..{}: {err}", s, e);
                 std::process::exit(1);
             }
@@ -476,14 +513,19 @@ async fn cmd_sync(args: SyncArgs) {
         if verbose {
             let blps = chunk_result.blocks_scanned as f64
                 / (chunk_result.elapsed_ms as f64 / 1000.0).max(0.001);
-            let tx_tag = if chunk_result.transactions.is_empty() { String::new() }
-                         else { format!("  *** {} tx found ***", chunk_result.transactions.len()) };
+            let tx_tag = if chunk_result.transactions.is_empty() {
+                String::new()
+            } else {
+                format!("  *** {} tx found ***", chunk_result.transactions.len())
+            };
             eprintln!(
                 "[sync] chunk {}/{} done: {} blocks in {}ms ({:.0} bl/s){}",
-                idx + 1, n_chunks,
+                idx + 1,
+                n_chunks,
                 chunk_result.blocks_scanned,
                 chunk_result.elapsed_ms,
-                blps, tx_tag,
+                blps,
+                tx_tag,
             );
             eprintln!(
                 "[sync]   trial_decrypt={}ms  get_transaction={}ms  full_decrypt={}ms",
@@ -529,158 +571,209 @@ async fn cmd_sync(args: SyncArgs) {
     };
 
     match args.format {
-            Format::Human => {
-                let sep  = "─".repeat(72);
-                let sep2 = "═".repeat(72);
+        Format::Human => {
+            let sep = "─".repeat(72);
+            let sep2 = "═".repeat(72);
 
-                // ── stats header ─────────────────────────────────────────────
-                let elapsed_str = if result.elapsed_ms >= 1_000 {
-                    format!("{:.1} s", result.elapsed_ms as f64 / 1_000.0)
-                } else {
-                    format!("{} ms", result.elapsed_ms)
-                };
-                let tx_count = result.transactions.len();
+            // ── stats header ─────────────────────────────────────────────
+            let elapsed_str = if result.elapsed_ms >= 1_000 {
+                format!("{:.1} s", result.elapsed_ms as f64 / 1_000.0)
+            } else {
+                format!("{} ms", result.elapsed_ms)
+            };
+            let tx_count = result.transactions.len();
 
-                println!("{sep2}");
-                println!("Scan results");
-                println!("{sep}");
-                println!("  Blocks scanned   {}", fmt_num(result.blocks_scanned));
-                println!("  Transactions     {tx_count}");
-                println!("  Elapsed          {elapsed_str}");
-                println!("{sep2}");
+            println!("{sep2}");
+            println!("Scan results");
+            println!("{sep}");
+            println!("  Blocks scanned   {}", fmt_num(result.blocks_scanned));
+            println!("  Transactions     {tx_count}");
+            println!("  Elapsed          {elapsed_str}");
+            println!("{sep2}");
 
-                if result.transactions.is_empty() {
-                    println!();
-                    println!("  No transactions found.");
-                    println!();
-                } else {
-                    // accumulate balance summary while printing
-                    let mut sapling_recv = 0u64;
-                    let mut sapling_sent = 0u64;
-                    let mut orchard_recv = 0u64;
-                    let mut orchard_sent = 0u64;
+            if result.transactions.is_empty() {
+                println!();
+                println!("  No transactions found.");
+                println!();
+            } else {
+                // accumulate balance summary while printing
+                let mut sapling_recv = 0u64;
+                let mut sapling_sent = 0u64;
+                let mut orchard_recv = 0u64;
+                let mut orchard_sent = 0u64;
 
-                    for (i, tx) in result.transactions.iter().enumerate() {
-                        let s_recv: u64 = tx.sapling_notes.iter()
-                            .filter(|n| n.transfer_type == "incoming").map(|n| n.amount).sum();
-                        let s_sent: u64 = tx.sapling_notes.iter()
-                            .filter(|n| n.transfer_type == "outgoing").map(|n| n.amount).sum();
-                        let o_recv: u64 = tx.orchard_notes.iter()
-                            .filter(|n| n.transfer_type == "incoming").map(|n| n.amount).sum();
-                        let o_sent: u64 = tx.orchard_notes.iter()
-                            .filter(|n| n.transfer_type == "outgoing").map(|n| n.amount).sum();
+                for (i, tx) in result.transactions.iter().enumerate() {
+                    let s_recv: u64 = tx
+                        .sapling_notes
+                        .iter()
+                        .filter(|n| n.transfer_type == "incoming")
+                        .map(|n| n.amount)
+                        .sum();
+                    let s_sent: u64 = tx
+                        .sapling_notes
+                        .iter()
+                        .filter(|n| n.transfer_type == "outgoing")
+                        .map(|n| n.amount)
+                        .sum();
+                    let o_recv: u64 = tx
+                        .orchard_notes
+                        .iter()
+                        .filter(|n| n.transfer_type == "incoming")
+                        .map(|n| n.amount)
+                        .sum();
+                    let o_sent: u64 = tx
+                        .orchard_notes
+                        .iter()
+                        .filter(|n| n.transfer_type == "outgoing")
+                        .map(|n| n.amount)
+                        .sum();
 
-                        sapling_recv += s_recv;
-                        sapling_sent += s_sent;
-                        orchard_recv += o_recv;
-                        orchard_sent += o_sent;
+                    sapling_recv += s_recv;
+                    sapling_sent += s_sent;
+                    orchard_recv += o_recv;
+                    orchard_sent += o_sent;
 
-                        let time = format_block_time(tx.block_time);
-                        let protocols = match (!tx.sapling_notes.is_empty(), !tx.orchard_notes.is_empty()) {
-                            (true,  true)  => "Sapling + Orchard",
-                            (true,  false) => "Sapling",
-                            (false, true)  => "Orchard",
+                    let time = format_block_time(tx.block_time);
+                    let protocols =
+                        match (!tx.sapling_notes.is_empty(), !tx.orchard_notes.is_empty()) {
+                            (true, true) => "Sapling + Orchard",
+                            (true, false) => "Sapling",
+                            (false, true) => "Orchard",
                             (false, false) => "—",
                         };
 
-                        println!();
-                        println!("  [{}/{}]  {}", i + 1, tx_count, tx.txid);
-                        println!("           Height     {}   {time}", fmt_num(tx.block_height));
-                        println!("           Protocols  {protocols}");
+                    println!();
+                    println!("  [{}/{}]  {}", i + 1, tx_count, tx.txid);
+                    println!(
+                        "           Height     {}   {time}",
+                        fmt_num(tx.block_height)
+                    );
+                    println!("           Protocols  {protocols}");
 
-                        if !tx.sapling_notes.is_empty() {
-                            println!("           ── Sapling ({} note{})",
-                                tx.sapling_notes.len(),
-                                if tx.sapling_notes.len() == 1 { "" } else { "s" });
-                            for n in &tx.sapling_notes {
-                                let memo = if n.memo.is_empty() { String::new() }
-                                           else { format!("  memo={:?}", n.memo) };
-                                println!("              [{:<8}]  {}{}",
-                                    n.transfer_type, fmt_zec(n.amount), memo);
-                            }
+                    if !tx.sapling_notes.is_empty() {
+                        println!(
+                            "           ── Sapling ({} note{})",
+                            tx.sapling_notes.len(),
+                            if tx.sapling_notes.len() == 1 { "" } else { "s" }
+                        );
+                        for n in &tx.sapling_notes {
+                            let memo = if n.memo.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  memo={:?}", n.memo)
+                            };
+                            println!(
+                                "              [{:<8}]  {}{}",
+                                n.transfer_type,
+                                fmt_zec(n.amount),
+                                memo
+                            );
                         }
-                        if !tx.orchard_notes.is_empty() {
-                            println!("           ── Orchard ({} note{})",
-                                tx.orchard_notes.len(),
-                                if tx.orchard_notes.len() == 1 { "" } else { "s" });
-                            for n in &tx.orchard_notes {
-                                let memo = if n.memo.is_empty() { String::new() }
-                                           else { format!("  memo={:?}", n.memo) };
-                                println!("              [{:<8}]  {}{}",
-                                    n.transfer_type, fmt_zec(n.amount), memo);
-                            }
+                    }
+                    if !tx.orchard_notes.is_empty() {
+                        println!(
+                            "           ── Orchard ({} note{})",
+                            tx.orchard_notes.len(),
+                            if tx.orchard_notes.len() == 1 { "" } else { "s" }
+                        );
+                        for n in &tx.orchard_notes {
+                            let memo = if n.memo.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  memo={:?}", n.memo)
+                            };
+                            println!(
+                                "              [{:<8}]  {}{}",
+                                n.transfer_type,
+                                fmt_zec(n.amount),
+                                memo
+                            );
                         }
-
-                        let tx_recv = s_recv + o_recv;
-                        let tx_sent = s_sent + o_sent;
-                        println!("           Fee        {}", fmt_zec(tx.fee_zatoshis as u64));
-                        println!("           Net        +{}  −{}", fmt_zec(tx_recv), fmt_zec(tx_sent));
                     }
 
-                    // ── balance summary ──────────────────────────────────────
-                    println!();
-                    println!("{sep2}");
-                    println!("Balance summary");
-                    println!("{sep}");
-
-                    let fmt_signed = |recv: u64, sent: u64| -> String {
-                        if recv >= sent {
-                            format!("+{}", fmt_zec(recv - sent))
-                        } else {
-                            format!("−{}", fmt_zec(sent - recv))
-                        }
-                    };
-
-                    println!("  Sapling   received {}   sent {}   net {}",
-                        fmt_zec(sapling_recv), fmt_zec(sapling_sent),
-                        fmt_signed(sapling_recv, sapling_sent));
-                    println!("  Orchard   received {}   sent {}   net {}",
-                        fmt_zec(orchard_recv), fmt_zec(orchard_sent),
-                        fmt_signed(orchard_recv, orchard_sent));
-                    println!("  {}", "─".repeat(68));
-                    let total_recv = sapling_recv + orchard_recv;
-                    let total_sent = sapling_sent + orchard_sent;
-                    println!("  Total net balance   {}", fmt_signed(total_recv, total_sent));
+                    let tx_recv = s_recv + o_recv;
+                    let tx_sent = s_sent + o_sent;
+                    println!("           Fee        {}", fmt_zec(tx.fee_zatoshis as u64));
+                    println!(
+                        "           Net        +{}  −{}",
+                        fmt_zec(tx_recv),
+                        fmt_zec(tx_sent)
+                    );
                 }
+
+                // ── balance summary ──────────────────────────────────────
+                println!();
                 println!("{sep2}");
-            }
-            Format::Json => {
-                let pool_notes = |notes: &[zcash_sync::sync::ShieldedNote]| {
-                    notes
-                        .iter()
-                        .map(|n| {
-                            serde_json::json!({
-                                "amount": n.amount,
-                                "transfer_type": n.transfer_type,
-                                "memo": n.memo,
-                                "nullifier": n.nullifier,
-                                "rho": n.rho,
-                                "rseed": n.rseed,
-                                "cmx": n.cmx,
-                                "position": n.position,
-                                "recipient": n.recipient,
-                                "is_spent": n.is_spent,
-                            })
-                        })
-                        .collect::<Vec<_>>()
+                println!("Balance summary");
+                println!("{sep}");
+
+                let fmt_signed = |recv: u64, sent: u64| -> String {
+                    if recv >= sent {
+                        format!("+{}", fmt_zec(recv - sent))
+                    } else {
+                        format!("−{}", fmt_zec(sent - recv))
+                    }
                 };
-                let json = serde_json::json!({
-                    "blocks_scanned": result.blocks_scanned,
-                    "elapsed_ms": result.elapsed_ms,
-                    "transactions": result.transactions.iter().map(|tx| {
-                        serde_json::json!({
-                            "txid": tx.txid,
-                            "block_height": tx.block_height,
-                            "block_hash": tx.block_hash,
-                            "block_time": tx.block_time,
-                            "fee_zatoshis": tx.fee_zatoshis,
-                            "sapling_notes": pool_notes(&tx.sapling_notes),
-                            "orchard_notes": pool_notes(&tx.orchard_notes),
-                        })
-                    }).collect::<Vec<_>>(),
-                });
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+
+                println!(
+                    "  Sapling   received {}   sent {}   net {}",
+                    fmt_zec(sapling_recv),
+                    fmt_zec(sapling_sent),
+                    fmt_signed(sapling_recv, sapling_sent)
+                );
+                println!(
+                    "  Orchard   received {}   sent {}   net {}",
+                    fmt_zec(orchard_recv),
+                    fmt_zec(orchard_sent),
+                    fmt_signed(orchard_recv, orchard_sent)
+                );
+                println!("  {}", "─".repeat(68));
+                let total_recv = sapling_recv + orchard_recv;
+                let total_sent = sapling_sent + orchard_sent;
+                println!(
+                    "  Total net balance   {}",
+                    fmt_signed(total_recv, total_sent)
+                );
             }
+            println!("{sep2}");
+        }
+        Format::Json => {
+            let pool_notes = |notes: &[zcash_sync::sync::ShieldedNote]| {
+                notes
+                    .iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "amount": n.amount,
+                            "transfer_type": n.transfer_type,
+                            "memo": n.memo,
+                            "nullifier": n.nullifier,
+                            "rho": n.rho,
+                            "rseed": n.rseed,
+                            "cmx": n.cmx,
+                            "position": n.position,
+                            "recipient": n.recipient,
+                            "is_spent": n.is_spent,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let json = serde_json::json!({
+                "blocks_scanned": result.blocks_scanned,
+                "elapsed_ms": result.elapsed_ms,
+                "transactions": result.transactions.iter().map(|tx| {
+                    serde_json::json!({
+                        "txid": tx.txid,
+                        "block_height": tx.block_height,
+                        "block_hash": tx.block_hash,
+                        "block_time": tx.block_time,
+                        "fee_zatoshis": tx.fee_zatoshis,
+                        "sapling_notes": pool_notes(&tx.sapling_notes),
+                        "orchard_notes": pool_notes(&tx.orchard_notes),
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
     }
 }
 
@@ -691,7 +784,9 @@ fn fmt_num(n: u32) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
         out.push(c);
     }
     out.chars().rev().collect()
@@ -700,7 +795,7 @@ fn fmt_num(n: u32) -> String {
 /// Format zatoshis as "1.23456789 ZEC".
 fn fmt_zec(zat: u64) -> String {
     let whole = zat / 100_000_000;
-    let frac  = zat % 100_000_000;
+    let frac = zat % 100_000_000;
     format!("{}.{:08} ZEC", whole, frac)
 }
 
@@ -723,10 +818,10 @@ fn format_block_time(ts: u32) -> String {
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp  = (5 * doy + 2) / 153;
-    let d   = doy - (153 * mp + 2) / 5 + 1;
-    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y   = if m <= 2 { y + 1 } else { y };
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
 
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
 }

@@ -7,21 +7,19 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
+use zcash_address::unified::{Encoding, Ufvk};
 use zcash_client_backend::proto::{
     compact_formats::{
         CompactBlock, CompactOrchardAction as ProtoOrchardAction,
         CompactSaplingOutput as ProtoSaplingOutput,
     },
-    service::{
-        compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, TxFilter,
-    },
+    service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, TxFilter},
 };
 use zcash_crypto::decrypt::{
     self, CompactOrchardAction, CompactSaplingOutput, CompactTransaction, PreparedIvks,
 };
 use zcash_crypto::network::parse_network;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_address::unified::{Encoding, Ufvk};
 use zcash_protocol::consensus::Network;
 
 use crate::client::{connect, UNARY_TIMEOUT};
@@ -258,7 +256,9 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
                 combined.trial_decrypt_ms += result.trial_decrypt_ms;
                 combined.get_transaction_ms += result.get_transaction_ms;
                 combined.full_decrypt_ms += result.full_decrypt_ms;
-                combined.spent_known_nullifiers.extend(result.spent_known_nullifiers);
+                combined
+                    .spent_known_nullifiers
+                    .extend(result.spent_known_nullifiers);
             }
             Err(ref err) if is_retryable_error(err) && attempts < max_retries => {
                 let block_count = e - s + 1;
@@ -312,8 +312,7 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let start = Instant::now();
 
     // 1. Resolve network and prepare IVKs + UFVK once (not per transaction).
-    let (network, ivks, ufvk) =
-        parse_sync_keys(params.network.as_deref(), &params.viewing_key)?;
+    let (network, ivks, ufvk) = parse_sync_keys(params.network.as_deref(), &params.viewing_key)?;
 
     // 2. Connect to lightwalletd / Zaino with TLS.
     let channel = connect(&params.grpc_url).await?;
@@ -321,8 +320,14 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 
     // 3. Stream compact blocks via GetBlockRange.
     let range = BlockRange {
-        start: Some(BlockId { height: params.start_height as u64, hash: vec![] }),
-        end: Some(BlockId { height: params.end_height as u64, hash: vec![] }),
+        start: Some(BlockId {
+            height: params.start_height as u64,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: params.end_height as u64,
+            hash: vec![],
+        }),
         pool_types: vec![],
     };
     let stream = client
@@ -400,26 +405,24 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = params
         .known_nullifiers
         .iter()
-        .filter_map(|h| {
-            match hex::decode(h) {
-                Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(arr) => Some(arr),
-                    Err(_) => {
-                        eprintln!(
-                            "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
-                            b.len(),
-                        );
-                        None
-                    }
-                },
-                Err(e) => {
+        .filter_map(|h| match hex::decode(h) {
+            Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
+                Ok(arr) => Some(arr),
+                Err(_) => {
                     eprintln!(
-                        "WARN: malformed known_nullifier hex {:?}: {}",
-                        &h[..h.len().min(16)],
-                        e,
+                        "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
+                        b.len(),
                     );
                     None
                 }
+            },
+            Err(e) => {
+                eprintln!(
+                    "WARN: malformed known_nullifier hex {:?}: {}",
+                    &h[..h.len().min(16)],
+                    e,
+                );
+                None
             }
         })
         .collect();
@@ -589,26 +592,24 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let known_nf_set: std::collections::HashSet<[u8; 32]> = params
         .known_nullifiers
         .iter()
-        .filter_map(|h| {
-            match hex::decode(h) {
-                Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
-                    Ok(arr) => Some(arr),
-                    Err(_) => {
-                        eprintln!(
-                            "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
-                            b.len(),
-                        );
-                        None
-                    }
-                },
-                Err(e) => {
+        .filter_map(|h| match hex::decode(h) {
+            Ok(b) => match <[u8; 32]>::try_from(b.as_slice()) {
+                Ok(arr) => Some(arr),
+                Err(_) => {
                     eprintln!(
-                        "WARN: malformed known_nullifier hex {:?}: {}",
-                        &h[..h.len().min(16)],
-                        e,
+                        "WARN: known_nullifier hex has wrong length ({} bytes), skipping",
+                        b.len(),
                     );
                     None
                 }
+            },
+            Err(e) => {
+                eprintln!(
+                    "WARN: malformed known_nullifier hex {:?}: {}",
+                    &h[..h.len().min(16)],
+                    e,
+                );
+                None
             }
         })
         .collect();
@@ -635,28 +636,24 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 /// Compute the Orchard commitment tree size before a block and the cumulative
 /// action offset for each transaction in the block. Used by both Phase 2 and
 /// Phase 4 to derive per-note positions.
-fn compute_block_position_ctx(result: &TrialResult) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
-    let total_actions_in_block: u32 = result
-        .tx_orchard_action_counts
-        .iter()
-        .map(|(_, c)| c)
-        .sum();
-    let tree_size_before_block: Option<u64> = result
-        .orchard_tree_size_after
-        .and_then(|sz| {
-            let sz = sz as u64;
-            let actions = total_actions_in_block as u64;
-            if sz < actions {
-                eprintln!(
-                    "WARN: orchard_tree_size_after ({}) < total actions in block ({}) at height {} \
+fn compute_block_position_ctx(
+    result: &TrialResult,
+) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
+    let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+    let tree_size_before_block: Option<u64> = result.orchard_tree_size_after.and_then(|sz| {
+        let sz = sz as u64;
+        let actions = total_actions_in_block as u64;
+        if sz < actions {
+            eprintln!(
+                "WARN: orchard_tree_size_after ({}) < total actions in block ({}) at height {} \
                      -- chain_metadata may be corrupt, skipping position tracking for this block",
-                    sz, actions, result.height,
-                );
-                None
-            } else {
-                Some(sz - actions)
-            }
-        });
+                sz, actions, result.height,
+            );
+            None
+        } else {
+            Some(sz - actions)
+        }
+    });
 
     let mut cumulative: u64 = 0;
     let mut tx_action_start_map: std::collections::HashMap<&str, u64> = Default::default();
@@ -715,8 +712,8 @@ fn parse_sync_keys(
 ) -> Result<(Network, Arc<PreparedIvks>, UnifiedFullViewingKey)> {
     let network = parse_network(network_str).map_err(|e| anyhow!("{}", e))?;
     let ivks = decrypt::prepare_ivks_arc(viewing_key).map_err(|e| anyhow!("{}", e))?;
-    let (_net, ufvk_str) = Ufvk::decode(viewing_key)
-        .map_err(|e| anyhow!("UFVK decode failed: {:?}", e))?;
+    let (_net, ufvk_str) =
+        Ufvk::decode(viewing_key).map_err(|e| anyhow!("UFVK decode failed: {:?}", e))?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk_str)
         .map_err(|e| anyhow!("UFVK parse failed: {:?}", e))?;
     Ok((network, ivks, ufvk))
@@ -891,7 +888,10 @@ async fn fetch_and_decrypt_tx(
 
     let t_rpc = Instant::now();
     let mut req = tonic::Request::new(TxFilter {
-        block: Some(BlockId { height: height as u64, hash: vec![] }),
+        block: Some(BlockId {
+            height: height as u64,
+            hash: vec![],
+        }),
         index: 0,
         hash: txid_bytes_le,
     });
@@ -953,7 +953,8 @@ async fn fetch_and_decrypt_tx(
             // position = tree_size_before_block + tx_action_start + action_index_within_tx
             // Returns None when chain_metadata was absent for this block.
             let position = tree_size_before_block.and_then(|tree_size| {
-                note.action_index.map(|idx| tree_size + tx_action_start + idx as u64)
+                note.action_index
+                    .map(|idx| tree_size + tx_action_start + idx as u64)
             });
 
             ShieldedNote {
@@ -1040,7 +1041,10 @@ mod tests {
     fn pipeline_depth_is_within_valid_range() {
         let depth = pipeline_depth();
         assert!(depth >= 2, "pipeline_depth must be at least 2, got {depth}");
-        assert!(depth <= 16, "pipeline_depth must be at most 16, got {depth}");
+        assert!(
+            depth <= 16,
+            "pipeline_depth must be at most 16, got {depth}"
+        );
     }
 
     // ── proto conversion helpers ──────────────────────────────────────────────
@@ -1126,13 +1130,11 @@ mod tests {
             matched_txids: vec![],
             tx_nullifiers: vec![],
             orchard_tree_size_after: Some(100),
-            tx_orchard_action_counts: vec![
-                ("txA".to_string(), 3),
-                ("txB".to_string(), 2),
-            ],
+            tx_orchard_action_counts: vec![("txA".to_string(), 3), ("txB".to_string(), 2)],
         };
 
-        let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+        let total_actions_in_block: u32 =
+            result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
         let tree_size_before_block: Option<u64> = result
             .orchard_tree_size_after
             .map(|sz| (sz as u64).saturating_sub(total_actions_in_block as u64));
@@ -1163,7 +1165,8 @@ mod tests {
             tx_orchard_action_counts: vec![("txA".to_string(), 3)],
         };
 
-        let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
+        let total_actions_in_block: u32 =
+            result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
         let tree_size_before_block: Option<u64> = result
             .orchard_tree_size_after
             .map(|sz| (sz as u64).saturating_sub(total_actions_in_block as u64));
@@ -1186,10 +1189,7 @@ mod tests {
             matched_txids: vec![],
             tx_nullifiers: vec![],
             orchard_tree_size_after: Some(6),
-            tx_orchard_action_counts: vec![
-                ("txA".to_string(), 3),
-                ("txB".to_string(), 3),
-            ],
+            tx_orchard_action_counts: vec![("txA".to_string(), 3), ("txB".to_string(), 3)],
         };
 
         let total_actions: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
@@ -1212,7 +1212,12 @@ mod tests {
         // txB actions: positions 3,4,5
         for idx in 0u64..3 {
             let pos = tree_size_before_block + map["txB"] + idx;
-            assert_eq!(pos, 3 + idx, "txB action {idx} should be at position {}", 3 + idx);
+            assert_eq!(
+                pos,
+                3 + idx,
+                "txB action {idx} should be at position {}",
+                3 + idx
+            );
         }
     }
 
@@ -1584,7 +1589,9 @@ mod tests {
         assert!(result.is_err(), "expected an error, got Ok");
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("gRPC connect failed") || msg.contains("timeout") || msg.contains("transport"),
+            msg.contains("gRPC connect failed")
+                || msg.contains("timeout")
+                || msg.contains("transport"),
             "unexpected error: {msg}"
         );
     }
@@ -1609,7 +1616,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(our_nullifiers.len(), 2, "only valid 32-byte hex should be parsed");
+        assert_eq!(
+            our_nullifiers.len(),
+            2,
+            "only valid 32-byte hex should be parsed"
+        );
         assert!(our_nullifiers.contains(&[0xAAu8; 32]));
         assert!(our_nullifiers.contains(&[0xBBu8; 32]));
     }
@@ -1623,7 +1634,11 @@ mod tests {
         ];
         let known_nf_set: std::collections::HashSet<[u8; 32]> = known_nullifiers
             .iter()
-            .filter_map(|h| hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()))
+            .filter_map(|h| {
+                hex::decode(h)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+            })
             .collect();
 
         // spent_nullifiers = all nullifiers that were both in our_nullifiers AND in block tx inputs

@@ -229,28 +229,48 @@ async fn tx3_has_one_internal_orchard_note() {
 #[ignore = "requires network access"]
 async fn range_scan_finds_all_three_known_txids() {
     // Scan the smallest range that contains all 3 known transactions.
-    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT))
+        .await
+        .unwrap();
 
-    let txids: Vec<&str> = result.transactions.iter().map(|tx| tx.txid.as_str()).collect();
+    let txids: Vec<&str> = result
+        .transactions
+        .iter()
+        .map(|tx| tx.txid.as_str())
+        .collect();
     for expected in [TX1_TXID, TX2_TXID, TX3_TXID] {
-        assert!(txids.contains(&expected), "missing txid {expected}\nfound: {txids:?}");
+        assert!(
+            txids.contains(&expected),
+            "missing txid {expected}\nfound: {txids:?}"
+        );
     }
 }
 
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn range_scan_results_are_in_chronological_order() {
-    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT)).await.unwrap();
-    let heights: Vec<u32> = result.transactions.iter().map(|tx| tx.block_height).collect();
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT))
+        .await
+        .unwrap();
+    let heights: Vec<u32> = result
+        .transactions
+        .iter()
+        .map(|tx| tx.block_height)
+        .collect();
     let mut sorted = heights.clone();
     sorted.sort_unstable();
-    assert_eq!(heights, sorted, "transactions must be returned in ascending block height order");
+    assert_eq!(
+        heights, sorted,
+        "transactions must be returned in ascending block height order"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn range_scan_blocks_scanned_count_matches_range_size() {
-    let result = run_sync(params_for_range(TX1_HEIGHT, TX1_HEIGHT + 9)).await.unwrap();
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX1_HEIGHT + 9))
+        .await
+        .unwrap();
     assert_eq!(result.blocks_scanned, 10);
 }
 
@@ -294,7 +314,9 @@ async fn orchard_only_finds_same_txids_as_full_mode() {
 async fn phase4_detects_spending_transactions() {
     // Scan the full range. TX2 and TX3 are change notes from spending txs —
     // those spending txs must be present in results.
-    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX3_HEIGHT))
+        .await
+        .unwrap();
 
     // At minimum we must find our 3 known transactions.
     assert!(
@@ -307,7 +329,11 @@ async fn phase4_detects_spending_transactions() {
     // must also be detected, even if they have no incoming/internal notes for us.
     // We verify this indirectly: if TX2 and TX3 are found, the spending txs
     // that created them as change were also processed (Phase 2 or Phase 4).
-    let txids: Vec<&str> = result.transactions.iter().map(|tx| tx.txid.as_str()).collect();
+    let txids: Vec<&str> = result
+        .transactions
+        .iter()
+        .map(|tx| tx.txid.as_str())
+        .collect();
     assert!(txids.contains(&TX2_TXID), "TX2 (change note) must be found");
     assert!(txids.contains(&TX3_TXID), "TX3 (change note) must be found");
 }
@@ -328,7 +354,9 @@ const TX_S1_HEIGHT: u32 = 954_650;
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs1_is_found_by_trial_decrypt() {
-    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT))
+        .await
+        .unwrap();
     assert!(
         result.transactions.iter().any(|tx| tx.txid == TX_S1_TXID),
         "TX_S1 not found — trial decrypt failed for Sapling incoming"
@@ -338,7 +366,9 @@ async fn txs1_is_found_by_trial_decrypt() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs1_fee_is_10000_zatoshis() {
-    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S1_TXID);
     assert_eq!(tx.fee_zatoshis, 10_000);
 }
@@ -346,7 +376,9 @@ async fn txs1_fee_is_10000_zatoshis() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs1_has_one_sapling_incoming_note() {
-    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S1_TXID);
     assert_eq!(tx.sapling_notes.len(), 1);
     assert!(tx.orchard_notes.is_empty());
@@ -357,7 +389,9 @@ async fn txs1_has_one_sapling_incoming_note() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs1_sapling_memo_decoded_correctly() {
-    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S1_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S1_TXID);
     assert_eq!(tx.sapling_notes[0].memo, "Thanks for using zfaucet!");
 }
@@ -373,7 +407,9 @@ const TX_S2_HEIGHT: u32 = 1_181_303;
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs2_fee_is_10000_zatoshis() {
-    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S2_TXID);
     assert_eq!(tx.fee_zatoshis, 10_000);
 }
@@ -381,7 +417,9 @@ async fn txs2_fee_is_10000_zatoshis() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs2_has_outgoing_and_incoming_sapling_notes() {
-    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S2_TXID);
     assert_eq!(tx.sapling_notes.len(), 2, "expected outgoing + incoming");
 }
@@ -389,7 +427,9 @@ async fn txs2_has_outgoing_and_incoming_sapling_notes() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs2_outgoing_note_amount_and_memo() {
-    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S2_TXID);
     let note = note_with_type(&tx.sapling_notes, "outgoing");
     assert_eq!(note.amount, 17_000);
@@ -399,7 +439,9 @@ async fn txs2_outgoing_note_amount_and_memo() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs2_incoming_note_amount() {
-    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S2_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S2_TXID);
     let note = note_with_type(&tx.sapling_notes, "incoming");
     assert_eq!(note.amount, 99_963_000);
@@ -418,7 +460,9 @@ const TX_S3_HEIGHT: u32 = 2_115_988;
 async fn txs3_fee_is_zero_shielding_transaction() {
     // fee_paid returns None for transparent inputs (prevout unavailable from compact blocks)
     // → we report 0. The actual fee for this shielding tx is genuinely 0, so the result is correct.
-    let result = run_sync(params_for_block_testnet(TX_S3_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S3_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S3_TXID);
     assert_eq!(tx.fee_zatoshis, 0);
 }
@@ -426,7 +470,9 @@ async fn txs3_fee_is_zero_shielding_transaction() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs3_has_sapling_internal_note_with_shielding_memo() {
-    let result = run_sync(params_for_block_testnet(TX_S3_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S3_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S3_TXID);
     let note = note_with_type(&tx.sapling_notes, "internal");
     assert_eq!(note.memo, "shielding:");
@@ -443,7 +489,9 @@ const TX_S4_HEIGHT: u32 = 2_618_505;
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs4_fee_is_10000_zatoshis() {
-    let result = run_sync(params_for_block_testnet(TX_S4_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S4_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S4_TXID);
     assert_eq!(tx.fee_zatoshis, 10_000);
 }
@@ -451,10 +499,15 @@ async fn txs4_fee_is_10000_zatoshis() {
 #[tokio::test]
 #[ignore = "requires network access"]
 async fn txs4_memo_with_trailing_newline_preserved() {
-    let result = run_sync(params_for_block_testnet(TX_S4_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_block_testnet(TX_S4_HEIGHT))
+        .await
+        .unwrap();
     let tx = find_tx(&result.transactions, TX_S4_TXID);
     assert_eq!(tx.sapling_notes[0].amount, 250);
-    assert_eq!(tx.sapling_notes[0].memo, "sending some money from an emulator\n");
+    assert_eq!(
+        tx.sapling_notes[0].memo,
+        "sending some money from an emulator\n"
+    );
 }
 
 // ── Testnet range scan ────────────────────────────────────────────────────────
@@ -463,10 +516,19 @@ async fn txs4_memo_with_trailing_newline_preserved() {
 #[ignore = "requires network access"]
 async fn testnet_range_scan_finds_sapling_txs_s1_and_s2() {
     // Quick range covering both early Sapling transactions.
-    let result = run_sync(params_for_range_testnet(TX_S1_HEIGHT, TX_S2_HEIGHT)).await.unwrap();
-    let txids: Vec<&str> = result.transactions.iter().map(|tx| tx.txid.as_str()).collect();
+    let result = run_sync(params_for_range_testnet(TX_S1_HEIGHT, TX_S2_HEIGHT))
+        .await
+        .unwrap();
+    let txids: Vec<&str> = result
+        .transactions
+        .iter()
+        .map(|tx| tx.txid.as_str())
+        .collect();
     for expected in [TX_S1_TXID, TX_S2_TXID] {
-        assert!(txids.contains(&expected), "missing {expected}\nfound: {txids:?}");
+        assert!(
+            txids.contains(&expected),
+            "missing {expected}\nfound: {txids:?}"
+        );
     }
 }
 
@@ -481,17 +543,39 @@ async fn full_scan_enriches_incoming_note_with_spending_fields() {
     let note = &tx1.orchard_notes[0];
 
     // Incoming note must have all spending fields populated
-    assert!(note.nullifier.is_some(), "incoming note must have nullifier");
+    assert!(
+        note.nullifier.is_some(),
+        "incoming note must have nullifier"
+    );
     assert!(note.rseed.is_some(), "incoming note must have rseed");
     assert!(note.cmx.is_some(), "incoming note must have cmx");
     assert!(note.position.is_some(), "incoming note must have position");
-    assert!(note.recipient.is_some(), "incoming note must have recipient");
+    assert!(
+        note.recipient.is_some(),
+        "incoming note must have recipient"
+    );
 
     // Field sizes: nullifier/rseed/cmx = 64 hex chars (32 bytes), recipient = 86 hex chars (43 bytes)
-    assert_eq!(note.nullifier.as_ref().unwrap().len(), 64, "nullifier must be 32 bytes hex");
-    assert_eq!(note.rseed.as_ref().unwrap().len(), 64, "rseed must be 32 bytes hex");
-    assert_eq!(note.cmx.as_ref().unwrap().len(), 64, "cmx must be 32 bytes hex");
-    assert_eq!(note.recipient.as_ref().unwrap().len(), 86, "recipient must be 43 bytes hex");
+    assert_eq!(
+        note.nullifier.as_ref().unwrap().len(),
+        64,
+        "nullifier must be 32 bytes hex"
+    );
+    assert_eq!(
+        note.rseed.as_ref().unwrap().len(),
+        64,
+        "rseed must be 32 bytes hex"
+    );
+    assert_eq!(
+        note.cmx.as_ref().unwrap().len(),
+        64,
+        "cmx must be 32 bytes hex"
+    );
+    assert_eq!(
+        note.recipient.as_ref().unwrap().len(),
+        86,
+        "recipient must be 43 bytes hex"
+    );
 }
 
 #[tokio::test]
@@ -500,11 +584,16 @@ async fn full_scan_marks_spent_note_when_spending_tx_is_in_range() {
     // TX1 (height 3,047,167) is an incoming note. TX2 (height 3,055,407) is a change
     // note from a tx that SPENDS TX1's note. Scanning the full range should detect
     // that TX1's note is spent.
-    let result = run_sync(params_for_range(TX1_HEIGHT, TX2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_range(TX1_HEIGHT, TX2_HEIGHT))
+        .await
+        .unwrap();
 
     let tx1 = find_tx(&result.transactions, TX1_TXID);
     let note = &tx1.orchard_notes[0];
-    assert!(note.is_spent, "TX1's note must be is_spent=true (spent by the tx creating TX2)");
+    assert!(
+        note.is_spent,
+        "TX1's note must be is_spent=true (spent by the tx creating TX2)"
+    );
 }
 
 #[tokio::test]
@@ -514,7 +603,10 @@ async fn single_block_scan_note_is_unspent_when_spending_tx_outside_range() {
     // so is_spent must be false (spending not visible in this range).
     let result = run_sync(params_for_block(TX1_HEIGHT)).await.unwrap();
     let tx1 = find_tx(&result.transactions, TX1_TXID);
-    assert!(!tx1.orchard_notes[0].is_spent, "TX1 unspent when scanned alone");
+    assert!(
+        !tx1.orchard_notes[0].is_spent,
+        "TX1 unspent when scanned alone"
+    );
 }
 
 // ── Incremental sync: known_nullifiers → spent_known_nullifiers ──────────────
@@ -552,7 +644,9 @@ async fn incremental_scan_returns_spent_known_nullifiers() {
 #[ignore = "requires network access"]
 async fn incremental_scan_with_empty_known_nullifiers_returns_empty_spent() {
     // Without known_nullifiers, spent_known_nullifiers must be empty.
-    let result = run_sync(params_for_range(TX1_HEIGHT + 1, TX2_HEIGHT)).await.unwrap();
+    let result = run_sync(params_for_range(TX1_HEIGHT + 1, TX2_HEIGHT))
+        .await
+        .unwrap();
     assert!(
         result.spent_known_nullifiers.is_empty(),
         "without known_nullifiers, spent_known_nullifiers must be empty"

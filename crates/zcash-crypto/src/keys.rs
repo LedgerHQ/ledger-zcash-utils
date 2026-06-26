@@ -241,7 +241,11 @@ mod tests {
             .as_ref()
             .expect("orchard keys should be present");
         // Sapling: fvk=128B, ivk=32B, ovk=32B
-        assert_eq!(sapling.fvk.len(), 256, "sapling fvk should be 128 bytes hex");
+        assert_eq!(
+            sapling.fvk.len(),
+            256,
+            "sapling fvk should be 128 bytes hex"
+        );
         assert_eq!(sapling.ivk.len(), 64, "sapling ivk should be 32 bytes hex");
         assert_eq!(sapling.ovk.len(), 64, "sapling ovk should be 32 bytes hex");
         // Orchard: fvk=96B, ivk=64B, ovk=32B
@@ -339,15 +343,22 @@ mod tests {
         let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
         let items = ufvk.items();
 
-        assert!(items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
-            "UFVK must contain Orchard even when Sapling is excluded");
-        assert!(!items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
-            "UFVK must NOT contain Sapling when include_sapling_in_ufvk = false");
+        assert!(
+            items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
+            "UFVK must contain Orchard even when Sapling is excluded"
+        );
+        assert!(
+            !items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
+            "UFVK must NOT contain Sapling when include_sapling_in_ufvk = false"
+        );
 
         // P2PKH is only present when the transparent-inputs feature is enabled.
         let has_p2pkh = items.iter().any(|item| matches!(item, Fvk::P2pkh(_)));
-        assert_eq!(has_p2pkh, cfg!(feature = "transparent-inputs"),
-            "P2PKH presence must match the transparent-inputs feature flag");
+        assert_eq!(
+            has_p2pkh,
+            cfg!(feature = "transparent-inputs"),
+            "P2PKH presence must match the transparent-inputs feature flag"
+        );
 
         assert!(
             keys.sapling.is_some(),

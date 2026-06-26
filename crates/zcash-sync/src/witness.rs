@@ -548,9 +548,10 @@ mod tests {
             drop(l);
             a
         };
-        let err = fetch_orchard_anchor(&format!("https://127.0.0.1:{}", addr.port()), Some(1), None)
-            .await
-            .unwrap_err();
+        let err =
+            fetch_orchard_anchor(&format!("https://127.0.0.1:{}", addr.port()), Some(1), None)
+                .await
+                .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "unexpected error: {err}"

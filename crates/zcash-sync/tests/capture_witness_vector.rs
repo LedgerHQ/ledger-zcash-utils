@@ -31,11 +31,21 @@ async fn collect_cmxs(
     end: u64,
 ) -> Vec<[u8; 32]> {
     let range = BlockRange {
-        start: Some(BlockId { height: start, hash: vec![] }),
-        end: Some(BlockId { height: end, hash: vec![] }),
+        start: Some(BlockId {
+            height: start,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: end,
+            hash: vec![],
+        }),
         pool_types: vec![],
     };
-    let mut stream = c.get_block_range(range).await.expect("block range").into_inner();
+    let mut stream = c
+        .get_block_range(range)
+        .await
+        .expect("block range")
+        .into_inner();
     let mut out = Vec::new();
     while let Some(block) = stream.message().await.expect("stream") {
         for tx in &block.vtx {
@@ -86,7 +96,11 @@ async fn emit() {
         hash: vec![],
     });
     req.set_timeout(UNARY_TIMEOUT);
-    let ts = c.get_tree_state(req).await.expect("tree state").into_inner();
+    let ts = c
+        .get_tree_state(req)
+        .await
+        .expect("tree state")
+        .into_inner();
     let frontier_bytes = hex::decode(&ts.orchard_tree).expect("hex");
 
     // Total leaves at the anchor = frontier position + 1. The shard boundary can
@@ -102,12 +116,17 @@ async fn emit() {
         u64::from(f.value().expect("non-empty frontier").position()) + 1
     };
     let shard_leaf_count = (total_leaves - base) as usize;
-    eprintln!("total_leaves={total_leaves}, frontier-shard leaf count={shard_leaf_count} (base {base})");
+    eprintln!(
+        "total_leaves={total_leaves}, frontier-shard leaf count={shard_leaf_count} (base {base})"
+    );
 
     // Collect cmxs from the boundary block (inclusive) through the anchor, then
     // keep only the trailing `shard_leaf_count` — those are shard `frontier_shard_index`.
     let all = collect_cmxs(&mut c, last_completing, u64::from(anchor_height)).await;
-    assert!(all.len() >= shard_leaf_count, "fetched fewer cmxs than expected");
+    assert!(
+        all.len() >= shard_leaf_count,
+        "fetched fewer cmxs than expected"
+    );
     let cmxs: Vec<[u8; 32]> = all[all.len() - shard_leaf_count..].to_vec();
 
     // Witness the first leaf of the frontier shard.

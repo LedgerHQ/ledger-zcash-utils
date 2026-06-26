@@ -6,8 +6,7 @@ use rayon::prelude::*;
 use orchard::{
     keys::{PreparedIncomingViewingKey as PreparedOrchardIvk, Scope},
     note::{
-        ExtractedNoteCommitment as OrchardExtractedNoteCommitment,
-        Nullifier as OrchardNullifier,
+        ExtractedNoteCommitment as OrchardExtractedNoteCommitment, Nullifier as OrchardNullifier,
     },
     note_encryption::{CompactAction, OrchardDomain},
 };
@@ -182,7 +181,10 @@ fn zip212_enforcement(network: &Network, height: u32) -> Zip212Enforcement {
 /// Decode a [`MemoBytes`] to a UTF-8 string, stripping trailing null bytes.
 pub(crate) fn decode_memo(memo: MemoBytes) -> String {
     let memo_bytes = memo.into_bytes();
-    let memo_len = memo_bytes.iter().position(|&b| b == 0).unwrap_or(memo_bytes.len());
+    let memo_len = memo_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(memo_bytes.len());
     if memo_len == 0 {
         return String::new();
     }
@@ -220,8 +222,14 @@ pub fn prepare_ivks(viewing_key: &str) -> Result<PreparedIvks, Error> {
 
     let sapling = if let Some(dfvk) = ufvk.sapling() {
         vec![
-            (PreparedSaplingIvk::new(&dfvk.to_ivk(zip32::Scope::External)), "incoming"),
-            (PreparedSaplingIvk::new(&dfvk.to_ivk(zip32::Scope::Internal)), "internal"),
+            (
+                PreparedSaplingIvk::new(&dfvk.to_ivk(zip32::Scope::External)),
+                "incoming",
+            ),
+            (
+                PreparedSaplingIvk::new(&dfvk.to_ivk(zip32::Scope::Internal)),
+                "internal",
+            ),
         ]
     } else {
         vec![]
@@ -229,8 +237,14 @@ pub fn prepare_ivks(viewing_key: &str) -> Result<PreparedIvks, Error> {
 
     let orchard = if let Some(fvk) = ufvk.orchard() {
         vec![
-            (PreparedOrchardIvk::new(&fvk.to_ivk(Scope::External)), "incoming"),
-            (PreparedOrchardIvk::new(&fvk.to_ivk(Scope::Internal)), "internal"),
+            (
+                PreparedOrchardIvk::new(&fvk.to_ivk(Scope::External)),
+                "incoming",
+            ),
+            (
+                PreparedOrchardIvk::new(&fvk.to_ivk(Scope::Internal)),
+                "internal",
+            ),
         ]
     } else {
         vec![]
@@ -273,7 +287,9 @@ pub fn trial_decrypt_block(
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
             tx.sapling_outputs.iter().filter_map(move |o| {
-                parse_compact_sapling_output(o).ok().map(|parsed| (tx_idx, parsed))
+                parse_compact_sapling_output(o)
+                    .ok()
+                    .map(|parsed| (tx_idx, parsed))
             })
         })
         .collect();
@@ -293,7 +309,9 @@ pub fn trial_decrypt_block(
         .enumerate()
         .flat_map(|(tx_idx, tx)| {
             tx.orchard_actions.iter().filter_map(move |a| {
-                parse_compact_orchard_action(a).ok().map(|action| (tx_idx, action))
+                parse_compact_orchard_action(a)
+                    .ok()
+                    .map(|action| (tx_idx, action))
             })
         })
         .collect();
@@ -380,8 +398,8 @@ pub fn full_decrypt_tx_with_ufvk(
 
     let branch_id = BranchId::for_height(&network, BlockHeight::from(height));
 
-    let tx_bytes = hex::decode(tx_hex)
-        .map_err(|e| Error::Decrypt(format!("hex decode failed: {:?}", e)))?;
+    let tx_bytes =
+        hex::decode(tx_hex).map_err(|e| Error::Decrypt(format!("hex decode failed: {:?}", e)))?;
     let mut cursor = Cursor::new(tx_bytes);
     let tx = ZcashTransaction::read(&mut cursor, branch_id)
         .map_err(|e| Error::Decrypt(format!("TX parse failed: {:?}", e)))?;
@@ -450,7 +468,13 @@ pub fn full_decrypt_tx_with_ufvk(
                 // Cast to u32 is safe: action counts per transaction are always < 2^32.
                 let idx: u32 = f.index() as u32;
 
-                (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(recipient_bytes), Some(idx))
+                (
+                    Some(rho_bytes),
+                    Some(rseed_bytes),
+                    Some(cmx_bytes),
+                    Some(recipient_bytes),
+                    Some(idx),
+                )
             };
 
             DecryptedOutput {
@@ -479,7 +503,11 @@ pub fn full_decrypt_tx_with_ufvk(
         .map(|z| z.into_u64() as i64)
         .unwrap_or(0);
 
-    Ok(DecryptedTx { sapling_outputs, orchard_outputs, fee_zatoshis })
+    Ok(DecryptedTx {
+        sapling_outputs,
+        orchard_outputs,
+        fee_zatoshis,
+    })
 }
 
 /// Full decryption of a raw transaction hex using the UFVK.
@@ -513,26 +541,18 @@ pub fn full_decrypt_tx(
 pub(crate) fn parse_compact_sapling_output(
     output: &CompactSaplingOutput,
 ) -> Result<CompactOutputDescription, Error> {
-    let cmu_bytes: [u8; 32] = output
-        .cmu
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Decrypt(format!("cmu must be 32 bytes, got {}", output.cmu.len())))?;
-    let epk_bytes: [u8; 32] = output
-        .ephemeral_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            Error::Decrypt(format!(
-                "ephemeral_key must be 32 bytes, got {}",
-                output.ephemeral_key.len()
-            ))
+    let cmu_bytes: [u8; 32] =
+        output.cmu.as_slice().try_into().map_err(|_| {
+            Error::Decrypt(format!("cmu must be 32 bytes, got {}", output.cmu.len()))
         })?;
-    let ct_bytes: [u8; COMPACT_NOTE_SIZE] = output
-        .ciphertext
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
+    let epk_bytes: [u8; 32] = output.ephemeral_key.as_slice().try_into().map_err(|_| {
+        Error::Decrypt(format!(
+            "ephemeral_key must be 32 bytes, got {}",
+            output.ephemeral_key.len()
+        ))
+    })?;
+    let ct_bytes: [u8; COMPACT_NOTE_SIZE] =
+        output.ciphertext.as_slice().try_into().map_err(|_| {
             Error::Decrypt(format!(
                 "ciphertext must be {} bytes, got {}",
                 COMPACT_NOTE_SIZE,
@@ -540,11 +560,10 @@ pub(crate) fn parse_compact_sapling_output(
             ))
         })?;
 
-    let cmu =
-        Option::<SaplingExtractedNoteCommitment>::from(SaplingExtractedNoteCommitment::from_bytes(
-            &cmu_bytes,
-        ))
-        .ok_or_else(|| Error::Decrypt("invalid cmu field element".into()))?;
+    let cmu = Option::<SaplingExtractedNoteCommitment>::from(
+        SaplingExtractedNoteCommitment::from_bytes(&cmu_bytes),
+    )
+    .ok_or_else(|| Error::Decrypt("invalid cmu field element".into()))?;
 
     Ok(CompactOutputDescription {
         cmu,
@@ -559,26 +578,18 @@ pub(crate) fn parse_compact_sapling_output(
 pub(crate) fn parse_compact_orchard_action(
     action: &CompactOrchardAction,
 ) -> Result<CompactAction, Error> {
-    let cmx_bytes: [u8; 32] = action
-        .cmx
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Decrypt(format!("cmx must be 32 bytes, got {}", action.cmx.len())))?;
-    let ek_bytes: [u8; 32] = action
-        .ephemeral_key
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
-            Error::Decrypt(format!(
-                "ephemeral_key must be 32 bytes, got {}",
-                action.ephemeral_key.len()
-            ))
+    let cmx_bytes: [u8; 32] =
+        action.cmx.as_slice().try_into().map_err(|_| {
+            Error::Decrypt(format!("cmx must be 32 bytes, got {}", action.cmx.len()))
         })?;
-    let ct_bytes: [u8; COMPACT_NOTE_SIZE] = action
-        .ciphertext
-        .as_slice()
-        .try_into()
-        .map_err(|_| {
+    let ek_bytes: [u8; 32] = action.ephemeral_key.as_slice().try_into().map_err(|_| {
+        Error::Decrypt(format!(
+            "ephemeral_key must be 32 bytes, got {}",
+            action.ephemeral_key.len()
+        ))
+    })?;
+    let ct_bytes: [u8; COMPACT_NOTE_SIZE] =
+        action.ciphertext.as_slice().try_into().map_err(|_| {
             Error::Decrypt(format!(
                 "ciphertext must be {} bytes, got {}",
                 COMPACT_NOTE_SIZE,
@@ -689,7 +700,10 @@ mod tests {
             orchard_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
-        assert!(result.is_empty(), "invalid output should be skipped, not panic");
+        assert!(
+            result.is_empty(),
+            "invalid output should be skipped, not panic"
+        );
     }
 
     #[test]
@@ -875,40 +889,70 @@ mod tests {
 
     #[test]
     fn test_zip212_mainnet_below_heartwood() {
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_799), Zip212Enforcement::Off);
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 0), Zip212Enforcement::Off);
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 903_799),
+            Zip212Enforcement::Off
+        );
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 0),
+            Zip212Enforcement::Off
+        );
     }
 
     #[test]
     fn test_zip212_mainnet_at_heartwood_is_grace_period() {
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800), Zip212Enforcement::GracePeriod);
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 903_800),
+            Zip212Enforcement::GracePeriod
+        );
     }
 
     #[test]
     fn test_zip212_mainnet_within_grace_period() {
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_801), Zip212Enforcement::GracePeriod);
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800 + 32_255), Zip212Enforcement::GracePeriod);
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 903_801),
+            Zip212Enforcement::GracePeriod
+        );
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 903_800 + 32_255),
+            Zip212Enforcement::GracePeriod
+        );
     }
 
     #[test]
     fn test_zip212_mainnet_after_grace_period() {
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 903_800 + 32_256), Zip212Enforcement::On);
-        assert_eq!(zip212_enforcement(&Network::MainNetwork, 2_000_000), Zip212Enforcement::On);
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 903_800 + 32_256),
+            Zip212Enforcement::On
+        );
+        assert_eq!(
+            zip212_enforcement(&Network::MainNetwork, 2_000_000),
+            Zip212Enforcement::On
+        );
     }
 
     #[test]
     fn test_zip212_testnet_below_heartwood() {
-        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_499), Zip212Enforcement::Off);
+        assert_eq!(
+            zip212_enforcement(&Network::TestNetwork, 1_028_499),
+            Zip212Enforcement::Off
+        );
     }
 
     #[test]
     fn test_zip212_testnet_at_heartwood_is_grace_period() {
-        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_500), Zip212Enforcement::GracePeriod);
+        assert_eq!(
+            zip212_enforcement(&Network::TestNetwork, 1_028_500),
+            Zip212Enforcement::GracePeriod
+        );
     }
 
     #[test]
     fn test_zip212_testnet_after_grace_period() {
-        assert_eq!(zip212_enforcement(&Network::TestNetwork, 1_028_500 + 32_256), Zip212Enforcement::On);
+        assert_eq!(
+            zip212_enforcement(&Network::TestNetwork, 1_028_500 + 32_256),
+            Zip212Enforcement::On
+        );
     }
 
     // ── parse_compact_orchard_action — nf fallback ────────────────────────────
@@ -1008,7 +1052,10 @@ mod tests {
         // All returned txids must be from the input set
         let input_set: std::collections::HashSet<_> = txids.iter().copied().collect();
         for txid in &result {
-            assert!(input_set.contains(txid.as_str()), "unexpected txid in result: {txid}");
+            assert!(
+                input_set.contains(txid.as_str()),
+                "unexpected txid in result: {txid}"
+            );
         }
     }
 
@@ -1033,8 +1080,14 @@ mod tests {
         assert_eq!(output.transfer_type, "outgoing");
         assert!(output.rseed.is_none(), "outgoing: rseed must be None");
         assert!(output.cmx.is_none(), "outgoing: cmx must be None");
-        assert!(output.recipient.is_none(), "outgoing: recipient must be None");
-        assert!(output.action_index.is_none(), "outgoing: action_index must be None");
+        assert!(
+            output.recipient.is_none(),
+            "outgoing: recipient must be None"
+        );
+        assert!(
+            output.action_index.is_none(),
+            "outgoing: action_index must be None"
+        );
     }
 
     /// Sapling outputs are always constructed with all spending fields set to
@@ -1057,8 +1110,14 @@ mod tests {
         };
         assert!(output.rseed.is_none(), "Sapling: rseed must be None");
         assert!(output.cmx.is_none(), "Sapling: cmx must be None");
-        assert!(output.recipient.is_none(), "Sapling: recipient must be None");
-        assert!(output.action_index.is_none(), "Sapling: action_index must be None");
+        assert!(
+            output.recipient.is_none(),
+            "Sapling: recipient must be None"
+        );
+        assert!(
+            output.action_index.is_none(),
+            "Sapling: action_index must be None"
+        );
     }
 
     /// Verify that incoming/internal `DecryptedOutput` values can carry spending
@@ -1149,8 +1208,8 @@ mod tests {
 
     #[test]
     fn test_full_decrypt_tx_invalid_hex() {
-        let err = full_decrypt_tx("not_hex!!", ALICE_UFVK, 1_900_000, Network::TestNetwork)
-            .unwrap_err();
+        let err =
+            full_decrypt_tx("not_hex!!", ALICE_UFVK, 1_900_000, Network::TestNetwork).unwrap_err();
         assert!(matches!(err, Error::Decrypt(_)));
         assert!(err.to_string().contains("hex decode failed"));
     }

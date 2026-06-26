@@ -25,12 +25,18 @@ mod tests {
 
     #[test]
     fn test_parse_network_mainnet() {
-        assert_eq!(parse_network(Some("mainnet")).unwrap(), Network::MainNetwork);
+        assert_eq!(
+            parse_network(Some("mainnet")).unwrap(),
+            Network::MainNetwork
+        );
     }
 
     #[test]
     fn test_parse_network_testnet() {
-        assert_eq!(parse_network(Some("testnet")).unwrap(), Network::TestNetwork);
+        assert_eq!(
+            parse_network(Some("testnet")).unwrap(),
+            Network::TestNetwork
+        );
     }
 
     #[test]

@@ -91,7 +91,10 @@ fn note_with_type<'a>(outputs: &'a [DecryptedOutput], transfer_type: &str) -> &'
 #[test]
 fn tx1_fee_is_10000_zatoshis() {
     let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
-    assert_eq!(tx.fee_zatoshis, 10_000, "expected fee 10000 zat (0.0001 ZEC)");
+    assert_eq!(
+        tx.fee_zatoshis, 10_000,
+        "expected fee 10000 zat (0.0001 ZEC)"
+    );
 }
 
 #[test]
@@ -154,8 +157,14 @@ fn tx1_incoming_note_has_cmx() {
 fn tx1_incoming_note_has_recipient() {
     let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
     let note = &tx.orchard_outputs[0];
-    let recipient = note.recipient.expect("incoming Orchard note must have recipient");
-    assert_eq!(recipient.len(), 43, "recipient must be 43 bytes (11-byte diversifier + 32-byte pk_d)");
+    let recipient = note
+        .recipient
+        .expect("incoming Orchard note must have recipient");
+    assert_eq!(
+        recipient.len(),
+        43,
+        "recipient must be 43 bytes (11-byte diversifier + 32-byte pk_d)"
+    );
 }
 
 #[test]
@@ -163,7 +172,10 @@ fn tx1_incoming_note_has_action_index() {
     let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
     let note = &tx.orchard_outputs[0];
     // action_index is the 0-based position of this note within the Orchard bundle.
-    assert!(note.action_index.is_some(), "incoming Orchard note must have action_index");
+    assert!(
+        note.action_index.is_some(),
+        "incoming Orchard note must have action_index"
+    );
 }
 
 #[test]
@@ -173,8 +185,14 @@ fn tx1_spending_fields_are_deterministic() {
     let b = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
     assert_eq!(a.orchard_outputs[0].rseed, b.orchard_outputs[0].rseed);
     assert_eq!(a.orchard_outputs[0].cmx, b.orchard_outputs[0].cmx);
-    assert_eq!(a.orchard_outputs[0].recipient, b.orchard_outputs[0].recipient);
-    assert_eq!(a.orchard_outputs[0].action_index, b.orchard_outputs[0].action_index);
+    assert_eq!(
+        a.orchard_outputs[0].recipient,
+        b.orchard_outputs[0].recipient
+    );
+    assert_eq!(
+        a.orchard_outputs[0].action_index,
+        b.orchard_outputs[0].action_index
+    );
 }
 
 // ── TX2: internal (change) note ───────────────────────────────────────────────
@@ -182,7 +200,10 @@ fn tx1_spending_fields_are_deterministic() {
 #[test]
 fn tx2_fee_is_15000_zatoshis() {
     let tx = decrypt_mainnet(TX2_HEX, TX2_HEIGHT);
-    assert_eq!(tx.fee_zatoshis, 15_000, "expected fee 15000 zat (0.00015 ZEC)");
+    assert_eq!(
+        tx.fee_zatoshis, 15_000,
+        "expected fee 15000 zat (0.00015 ZEC)"
+    );
 }
 
 #[test]
@@ -219,8 +240,14 @@ fn tx2_internal_note_has_all_spending_fields() {
     assert_eq!(note.transfer_type, "internal");
     assert!(note.rseed.is_some(), "internal note must have rseed");
     assert!(note.cmx.is_some(), "internal note must have cmx");
-    assert!(note.recipient.is_some(), "internal note must have recipient");
-    assert!(note.action_index.is_some(), "internal note must have action_index");
+    assert!(
+        note.recipient.is_some(),
+        "internal note must have recipient"
+    );
+    assert!(
+        note.action_index.is_some(),
+        "internal note must have action_index"
+    );
 }
 
 // ── TX3: internal (change) note, smaller amount ───────────────────────────────
@@ -260,9 +287,17 @@ fn tx3_orchard_note_has_no_memo() {
 
 #[test]
 fn all_fees_are_positive() {
-    for (hex, height) in [(TX1_HEX, TX1_HEIGHT), (TX2_HEX, TX2_HEIGHT), (TX3_HEX, TX3_HEIGHT)] {
+    for (hex, height) in [
+        (TX1_HEX, TX1_HEIGHT),
+        (TX2_HEX, TX2_HEIGHT),
+        (TX3_HEX, TX3_HEIGHT),
+    ] {
         let tx = decrypt_mainnet(hex, height);
-        assert!(tx.fee_zatoshis > 0, "fee must be positive, got {}", tx.fee_zatoshis);
+        assert!(
+            tx.fee_zatoshis > 0,
+            "fee must be positive, got {}",
+            tx.fee_zatoshis
+        );
     }
 }
 
@@ -270,7 +305,11 @@ fn all_fees_are_positive() {
 fn no_tx_has_sapling_outputs() {
     // This wallet is Orchard-only; none of these transactions should yield
     // Sapling outputs for our key.
-    for (hex, height) in [(TX1_HEX, TX1_HEIGHT), (TX2_HEX, TX2_HEIGHT), (TX3_HEX, TX3_HEIGHT)] {
+    for (hex, height) in [
+        (TX1_HEX, TX1_HEIGHT),
+        (TX2_HEX, TX2_HEIGHT),
+        (TX3_HEX, TX3_HEIGHT),
+    ] {
         let tx = decrypt_mainnet(hex, height);
         assert!(
             tx.sapling_outputs.is_empty(),
@@ -290,7 +329,10 @@ fn wrong_ufvk_yields_empty_outputs_but_no_error() {
     );
     // May fail on UFVK decode (network mismatch), or succeed with empty outputs.
     if let Ok(tx) = result {
-        assert!(tx.orchard_outputs.is_empty(), "wrong-network UFVK must not decrypt our notes");
+        assert!(
+            tx.orchard_outputs.is_empty(),
+            "wrong-network UFVK must not decrypt our notes"
+        );
     }
 }
 
@@ -302,18 +344,36 @@ fn txs1_sapling_note_has_no_spending_fields() {
     let note = &tx.sapling_outputs[0];
     assert!(note.rseed.is_none(), "Sapling note must not have rseed");
     assert!(note.cmx.is_none(), "Sapling note must not have cmx");
-    assert!(note.recipient.is_none(), "Sapling note must not have recipient");
-    assert!(note.action_index.is_none(), "Sapling note must not have action_index");
+    assert!(
+        note.recipient.is_none(),
+        "Sapling note must not have recipient"
+    );
+    assert!(
+        note.action_index.is_none(),
+        "Sapling note must not have action_index"
+    );
 }
 
 #[test]
 fn txs2_outgoing_sapling_note_has_no_spending_fields() {
     let tx = decrypt_testnet(TX_S2_HEX, TX_S2_HEIGHT);
     let note = note_with_type(&tx.sapling_outputs, "outgoing");
-    assert!(note.rseed.is_none(), "outgoing Sapling note must not have rseed");
-    assert!(note.cmx.is_none(), "outgoing Sapling note must not have cmx");
-    assert!(note.recipient.is_none(), "outgoing Sapling note must not have recipient");
-    assert!(note.action_index.is_none(), "outgoing Sapling note must not have action_index");
+    assert!(
+        note.rseed.is_none(),
+        "outgoing Sapling note must not have rseed"
+    );
+    assert!(
+        note.cmx.is_none(),
+        "outgoing Sapling note must not have cmx"
+    );
+    assert!(
+        note.recipient.is_none(),
+        "outgoing Sapling note must not have recipient"
+    );
+    assert!(
+        note.action_index.is_none(),
+        "outgoing Sapling note must not have action_index"
+    );
 }
 
 // ── Testnet Sapling: TX_S1 — pure incoming ───────────────────────────────────
@@ -356,7 +416,11 @@ fn txs2_fee_is_10000_zatoshis() {
 #[test]
 fn txs2_has_two_sapling_notes() {
     let tx = decrypt_testnet(TX_S2_HEX, TX_S2_HEIGHT);
-    assert_eq!(tx.sapling_outputs.len(), 2, "expected outgoing + incoming notes");
+    assert_eq!(
+        tx.sapling_outputs.len(),
+        2,
+        "expected outgoing + incoming notes"
+    );
 }
 
 #[test]
@@ -423,5 +487,8 @@ fn txs4_memo_with_trailing_newline_decoded_correctly() {
     // The memo "sending some money from an emulator\n" ends with 0x0A (LF).
     // decode_memo stops at the first 0x00 null byte, so the newline is preserved.
     let tx = decrypt_testnet(TX_S4_HEX, TX_S4_HEIGHT);
-    assert_eq!(tx.sapling_outputs[0].memo, "sending some money from an emulator\n");
+    assert_eq!(
+        tx.sapling_outputs[0].memo,
+        "sending some money from an emulator\n"
+    );
 }

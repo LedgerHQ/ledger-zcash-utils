@@ -58,7 +58,10 @@ shardtree             = "0.6"
 # Partially Created Zcash Transaction format (wire format + role helpers).
 # Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
 # (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
-pczt = { version = "0.7", default-features = false, features = ["std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover"] }
+pczt = { version = "0.7", default-features = false, features = [
+    "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
+    "signer", "tx-extractor", "spend-finalizer",
+] }
 
 # RNG plumbing for build_for_pczt(rng, &fee) and the PCZT Prover.
 rand      = "0.8"
