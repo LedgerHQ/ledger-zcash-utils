@@ -91,3 +91,19 @@ cannot sign, so a CLI invocation would only yield an unsignable artifact.
 Its per-spend inputs (`rho`/`rseed`/`cmx`/`position`/`nullifier`) and per-UTXO
 pubkeys are produced by a prior `sync` run, not hand-entered. The builder is
 therefore reachable only through `zcash-ffi-node`, its sole consumer.
+
+**Exception: transaction finalization (`finalize`, `finalize_transaction`).**
+Finalization is device-coupled for the same reason as `craft`: it consumes the
+device-produced Orchard `spendAuthSig`s and transparent input signatures, which
+only exist after the PCZT has been APDU-streamed to and signed by the Ledger
+device. A CLI invocation has no source for those signatures, so it could not
+produce a finalized transaction. Reachable only through `zcash-ffi-node`.
+
+**Exception: broadcast (`broadcast_transaction`).**
+Broadcast is a thin gRPC pass-through (`SendTransaction`) over an
+already-finalized, hex-encoded transaction. It is not device-coupled, so a
+standalone `broadcast` CLI subcommand *could* be useful for manual end-to-end
+testing against a testnet endpoint. It is deliberately deferred for now (no
+funded testnet account is available to exercise it end-to-end); when that
+prerequisite lands, a `broadcast` subcommand is the intended follow-up. Until
+then it is reachable only through `zcash-ffi-node`.

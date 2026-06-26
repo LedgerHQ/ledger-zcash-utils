@@ -3,8 +3,10 @@ use std::time::Duration;
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
-    GetSubtreeRootsArg, ShieldedProtocol, SubtreeRoot, TreeState,
+    GetSubtreeRootsArg, RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState,
 };
+use zcash_primitives::transaction::{Transaction, TxVersion};
+use zcash_protocol::consensus::BranchId;
 
 /// Timeout for establishing the TCP+TLS connection.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -230,6 +232,92 @@ pub(crate) async fn get_tree_state_at(
         .map_err(|e| anyhow!("GetTreeState({}) failed: {}", height, e))
 }
 
+/// Broadcast a serialized transaction via the `SendTransaction` gRPC method.
+///
+/// Returns the txid (hex) on success (`error_code == 0`). On a non-zero
+/// `error_code`, returns an error carrying the server's `error_message`.
+///
+/// The txid is recomputed from the V5 transaction bytes (which embed the
+/// consensus branch ID in the stream, making the branch-id argument to
+/// `Transaction::read` advisory for V5).
+///
+/// # Errors
+///
+/// Returns an error if the connection fails, the RPC is rejected, or the
+/// endpoint reports a non-zero error code.
+pub async fn broadcast_transaction(grpc_url: String, tx_bytes: Vec<u8>) -> Result<String> {
+    let channel = connect(&grpc_url).await?;
+    let mut client = CompactTxStreamerClient::new(channel);
+
+    let mut req = tonic::Request::new(RawTransaction {
+        data: tx_bytes.clone(),
+        height: 0,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+    let resp = client
+        .send_transaction(req)
+        .await
+        .map_err(|e| anyhow!("SendTransaction failed: {}", e))?
+        .into_inner();
+
+    // Pure mapping, unit-testable without a gRPC server (see tests below).
+    interpret_send_response(resp)?;
+
+    // Recompute the txid from the V5 bytes. For V5 transactions `Transaction::read`
+    // derives the txid from the stream (the branch id argument is ignored for V5).
+    let txid = txid_from_v5_bytes(&tx_bytes)?;
+    Ok(txid)
+}
+
+/// Map a `SendResponse` to success/failure. `error_code == 0` ⇒ accepted;
+/// any non-zero code surfaces the server's `error_message`. Split out as a
+/// pure function so the rejection path is unit-testable without a gRPC server.
+fn interpret_send_response(resp: SendResponse) -> Result<()> {
+    if resp.error_code != 0 {
+        return Err(anyhow!(
+            "SendTransaction rejected (code {}): {}",
+            resp.error_code,
+            resp.error_message
+        ));
+    }
+    Ok(())
+}
+
+/// Compute the txid from a serialized V5 transaction, in big-endian (display)
+/// hex order.
+///
+/// Rejects non-V5 bytes with a descriptive error before calling
+/// `Transaction::read`, so callers cannot accidentally compute a txid from a
+/// legacy transaction whose wire format differs from ZIP-225.
+///
+/// For V5 transactions the consensus branch ID is embedded in the stream, so
+/// the `BranchId` argument to `Transaction::read` is not used. We pass
+/// `BranchId::Nu6` as a safe placeholder.
+///
+/// Byte order: `Transaction::txid()` returns internal little-endian bytes; this
+/// function reverses them to big-endian *display* order so the result matches
+/// `ShieldedTransaction.txid` from the sync path (see `sync.rs`) and the txid
+/// Ledger Live records as the operation hash. Keeping the two paths consistent
+/// is required so a freshly-broadcast transaction reconciles with the same
+/// transaction once it is discovered by sync.
+fn txid_from_v5_bytes(tx_bytes: &[u8]) -> Result<String> {
+    // Peek at the version header without consuming from the slice that
+    // `Transaction::read` will use — use a separate cursor for the check.
+    let version = TxVersion::read(std::io::Cursor::new(tx_bytes))
+        .map_err(|e| anyhow!("txid_from_v5_bytes: version parse failed: {}", e))?;
+    if !matches!(version, TxVersion::V5) {
+        return Err(anyhow!(
+            "txid_from_v5_bytes: expected V5 transaction, got {:?}",
+            version
+        ));
+    }
+    let tx = Transaction::read(tx_bytes, BranchId::Nu6)
+        .map_err(|e| anyhow!("txid_from_v5_bytes: Transaction::read failed: {}", e))?;
+    let mut txid_bytes: [u8; 32] = *tx.txid().as_ref();
+    txid_bytes.reverse(); // internal little-endian -> big-endian display order
+    Ok(hex::encode(txid_bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +412,123 @@ mod tests {
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ── broadcast_transaction — error paths ──────────────────────────────────
+
+    #[tokio::test]
+    async fn broadcast_transaction_fails_on_malformed_url() {
+        let err = broadcast_transaction("invalid gRPC URL".to_string(), vec![0u8; 4])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid gRPC URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_fails_fast_on_refused_port() {
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let err = broadcast_transaction(format!("https://127.0.0.1:{}", addr.port()), vec![0u8; 4])
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ── interpret_send_response — pure mapping tests ──────────────────────────
+
+    #[test]
+    fn interpret_send_response_ok_for_error_code_zero() {
+        let resp = SendResponse {
+            error_code: 0,
+            error_message: String::new(),
+        };
+        assert!(
+            interpret_send_response(resp).is_ok(),
+            "error_code == 0 must return Ok"
+        );
+    }
+
+    #[test]
+    fn interpret_send_response_err_for_nonzero_error_code() {
+        let resp = SendResponse {
+            error_code: 1,
+            error_message: "fee too low".to_string(),
+        };
+        let err = interpret_send_response(resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("code 1"),
+            "error must contain 'code 1', got: {msg}"
+        );
+        assert!(
+            msg.contains("fee too low"),
+            "error must contain the error_message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpret_send_response_err_nonzero_preserves_message() {
+        let resp = SendResponse {
+            error_code: 42,
+            error_message: "double spend detected".to_string(),
+        };
+        let err = interpret_send_response(resp).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("42"), "error must contain error_code");
+        assert!(
+            msg.contains("double spend detected"),
+            "error must contain error_message"
+        );
+    }
+
+    // ── txid_from_v5_bytes — direct tests ────────────────────────────────────
+    //
+    // Known vectors reused from `zcash-crypto/tests/fixtures` (same workspace).
+    // The expected txids are the big-endian *display* form documented in
+    // `zcash-crypto/tests/known_vectors.rs`.
+
+    /// A real V5 transaction (header `05000080`).
+    const TX_V5_HEX: &str =
+        include_str!("../../zcash-crypto/tests/fixtures/tx_0b5baa0c_h3055417.hex");
+    /// Its canonical (big-endian, display) txid.
+    const TX_V5_TXID_DISPLAY: &str =
+        "0b5baa0c01ea74f93effe5cc0566eaf086bf67329ff2923bc07a5d0e8859a65e";
+    /// A real V4 transaction (header `04000080`) — used to exercise the V5 guard.
+    const TX_V4_HEX: &str =
+        include_str!("../../zcash-crypto/tests/fixtures/tx_c534920d_h954650_testnet.hex");
+
+    #[test]
+    fn txid_from_v5_bytes_computes_canonical_txid() {
+        let bytes = hex::decode(TX_V5_HEX.trim()).expect("fixture must be valid hex");
+        let got = txid_from_v5_bytes(&bytes).expect("V5 txid computation must succeed");
+        assert_eq!(got.len(), 64, "txid hex must be 64 chars");
+        // `txid_from_v5_bytes` returns big-endian display order, matching the
+        // sync path (`ShieldedTransaction.txid`) and the LL operation hash.
+        assert_eq!(
+            got, TX_V5_TXID_DISPLAY,
+            "txid must match the documented big-endian display txid"
+        );
+    }
+
+    #[test]
+    fn txid_from_v5_bytes_rejects_non_v5() {
+        let bytes = hex::decode(TX_V4_HEX.trim()).expect("fixture must be valid hex");
+        let err = txid_from_v5_bytes(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected V5 transaction"),
+            "non-V5 input must be rejected by the version guard, got: {msg}"
         );
     }
 
