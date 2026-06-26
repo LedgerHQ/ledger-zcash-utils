@@ -9,6 +9,11 @@
 //! Pipeline:
 //!   1. `Pczt::parse(bytes)`.
 //!   2. Identify the unsigned Orchard action indices (real spends).
+//!   2b. If there are transparent inputs, stamp each input's `hash160_preimage`
+//!      with its controlling pubkey (taken from the `bip32_derivation` the craft
+//!      step recorded). `append_transparent_signature` and `SpendFinalizer` need
+//!      that pubkey to verify the device signature and rebuild the `script_sig`;
+//!      the builder leaves the map empty and the device never supplies it.
 //!   3. `Signer::new(pczt)`; for each unsigned action i, in order, apply the
 //!      i-th device `spendAuthSig` via `apply_orchard_signature(i, sig)`
 //!      (verifies against the action's `rk`, fails closed on a bad signature).
@@ -23,7 +28,10 @@ use std::sync::OnceLock;
 
 use orchard::{circuit::VerifyingKey, primitives::redpallas};
 use pczt::{
-    roles::{signer::Signer, spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor},
+    roles::{
+        signer::Signer, spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor,
+        updater::Updater,
+    },
     Pczt,
 };
 
@@ -100,6 +108,16 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
         )));
     }
 
+    // 2b. Stamp each transparent input's `hash160_preimage` with its controlling
+    //     pubkey so the host can verify the device signature and rebuild the
+    //     `script_sig` in steps 4 + 6. Gated on `n_transparent > 0` so pure-Orchard
+    //     PCZTs (which have no transparent bundle) skip the transparent Updater.
+    let pczt = if n_transparent > 0 {
+        stamp_transparent_hash160_preimages(pczt)?
+    } else {
+        pczt
+    };
+
     // 3. Inject Orchard spend-auth signatures.
     //    `apply_orchard_signature` verifies each sig against the action's `rk`
     //    (orchard-0.14.0/src/pczt/signer.rs:43-54) and rejects invalid ones, so
@@ -157,6 +175,51 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     let txid: [u8; 32] = *tx.txid().as_ref();
 
     Ok(FinalizeOutput { tx_bytes, txid })
+}
+
+/// Stamp the `hash160_preimages` map of every transparent input with its
+/// controlling pubkey.
+///
+/// For a P2PKH input the `script_pubkey` only commits to `HASH160(pubkey)`, not
+/// the pubkey itself. To inject the device's signature
+/// (`Signer::append_transparent_signature`) the host must recover that pubkey so
+/// it can (1) verify the ECDSA signature against it and (2) have
+/// `SpendFinalizer::finalize_spends` assemble the `<sig> <pubkey>` `script_sig`.
+/// The transparent input PCZT field that carries it (`hash160_preimages`) is left
+/// empty by `Builder::build_for_pczt`, and the Ledger device never returns it, so
+/// finalize populates it here from the pubkey the craft step recorded as the key
+/// of each input's `bip32_derivation` (the device signing-path metadata, which is
+/// always present — the device parser rejects a transparent input without it).
+///
+/// This is pure signer metadata: like `bip32_derivation`, it does not affect the
+/// txid or the sighash, so adding it to the already-proven PCZT is sound. Stamping
+/// every candidate pubkey is safe because `set_hash160_preimage` keys each entry
+/// by `HASH160(pubkey)`, so the lookup in `append_signature` resolves to the entry
+/// whose hash matches the input's `script_pubkey`.
+fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
+    Updater::new(pczt)
+        .update_transparent_with(|mut updater| {
+            // Collect each input's candidate pubkeys (its `bip32_derivation` keys)
+            // before mutating, to avoid overlapping immutable/mutable borrows of
+            // the bundle.
+            let input_pubkeys: Vec<Vec<[u8; 33]>> = updater
+                .bundle()
+                .inputs()
+                .iter()
+                .map(|input| input.bip32_derivation().keys().copied().collect())
+                .collect();
+            for (index, pubkeys) in input_pubkeys.into_iter().enumerate() {
+                updater.update_input_with(index, |mut input| {
+                    for pubkey in pubkeys {
+                        input.set_hash160_preimage(pubkey.to_vec());
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Finalize(format!("PCZT Updater (transparent hash160 preimage): {e:?}")))
+        .map(Updater::finish)
 }
 
 /// Parse a Ledger-produced transparent ECDSA signature into a libsecp256k1
@@ -220,6 +283,7 @@ mod tests {
     use super::*;
     use crate::craft::{
         build_transaction, BuildInputs, Destination, OrchardSpendInput, OutputRequest,
+        TransparentInput,
     };
     use incrementalmerkletree::{Marking, Retention};
     use orchard::{
@@ -366,6 +430,134 @@ mod tests {
             .collect()
     }
 
+    /// Standard 25-byte P2PKH `scriptPubKey` paying to `hash`:
+    /// `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG`.
+    fn make_p2pkh_script(hash: [u8; 20]) -> Vec<u8> {
+        let mut s = Vec::with_capacity(25);
+        s.push(0x76); // OP_DUP
+        s.push(0xa9); // OP_HASH160
+        s.push(0x14); // push 20 bytes
+        s.extend_from_slice(&hash);
+        s.push(0x88); // OP_EQUALVERIFY
+        s.push(0xac); // OP_CHECKSIG
+        s
+    }
+
+    /// HASH160 (RIPEMD160 ∘ SHA256) of a compressed pubkey — the value a standard
+    /// P2PKH `scriptPubKey` commits to.
+    fn pubkey_hash160(pubkey: &[u8; 33]) -> [u8; 20] {
+        use bitcoin::hashes::{hash160, Hash};
+        hash160::Hash::hash(pubkey).to_byte_array()
+    }
+
+    /// Build a proven mixed PCZT (one real Orchard spend + one transparent P2PKH
+    /// input → one Orchard output, with Orchard change), returning the PCZT bytes
+    /// and the secp256k1 secret key controlling the transparent input.
+    ///
+    /// Layout (so `finalize_transaction` exercises every mixed-path role):
+    ///   - 1 real Orchard spend (value 20_000) → device `spendAuthSig` required.
+    ///   - 1 transparent P2PKH input (value 15_000) → device DER signature required.
+    ///   - 1 Orchard recipient output (value 10_000).
+    ///   - Orchard change (10_000) is added automatically by the builder.
+    /// ZIP-317: orchard_actions = max(2, max(1 spend, 2 outputs)) = 2,
+    /// transparent_actions = max(1 in, 0 out) = 1 → fee = 5_000 × 3 = 15_000.
+    fn build_mixed_pczt() -> (Vec<u8>, secp256k1::SecretKey) {
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let change = fvk.address_at(0u32, Scope::Internal);
+
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let spend_value: u64 = 20_000;
+        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
+            .into_option()
+            .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (anchor, path) = synthetic_anchor_and_path(leaf);
+        let ovk = Some(fvk.to_ovk(Scope::External));
+
+        // Transparent input controlled by a known key so the test can sign it.
+        let secp = Secp256k1::new();
+        let t_sk = SecretKey::from_slice(&[0x07u8; 32]).unwrap();
+        let t_pubkey = PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let transparent_value: u64 = 15_000;
+
+        let fee = 15_000u64;
+        let out_value = 10_000u64;
+
+        let inputs = BuildInputs {
+            network: zcash_protocol::consensus::Network::MainNetwork,
+            target_height: nu5_height(),
+            orchard_fvk: Some(fvk.clone()),
+            ovk,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![OrchardSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: spend_value,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path: path,
+            }],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: t_pubkey,
+                txid: [0x09u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script(pubkey_hash160(&t_pubkey)),
+                value: transparent_value,
+                derivation_scope: 0,
+                derivation_address_index: 0,
+            }],
+            outputs: vec![OutputRequest {
+                destination: Destination::Orchard(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let pczt_bytes = build_transaction(inputs)
+            .expect("build_mixed_pczt: build must succeed")
+            .pczt_bytes;
+        (pczt_bytes, t_sk)
+    }
+
+    /// Produce the DER signature a Ledger device would return for transparent
+    /// input `index`: compute the input's sighash via the PCZT `Signer`, sign it
+    /// with `sk`, then apply the two device-specific quirks `parse_transparent_der`
+    /// is responsible for undoing (y-parity bit OR-ed into the DER header, trailing
+    /// `SIGHASH_ALL` byte). This exercises the real signature wire format end-to-end.
+    fn device_transparent_der_signature(
+        pczt_bytes: &[u8],
+        index: usize,
+        sk: &secp256k1::SecretKey,
+    ) -> Vec<u8> {
+        use secp256k1::{Message, Secp256k1};
+
+        let pczt = Pczt::parse(pczt_bytes).expect("device_transparent_der_signature: parse");
+        let signer =
+            PcztSigner::new(pczt).expect("device_transparent_der_signature: Signer::new");
+        let sighash = signer
+            .transparent_sighash(index)
+            .expect("device_transparent_der_signature: transparent_sighash");
+
+        let secp = Secp256k1::new();
+        let sig = secp.sign_ecdsa(&Message::from_digest(sighash), sk);
+        let mut der = sig.serialize_der().to_vec();
+        der[0] = 0x31; // Ledger y-parity header bit (0x30 → 0x31)
+        der.push(0x01); // trailing SIGHASH_ALL byte
+        der
+    }
+
     // ── test 1: pure-Orchard finalize ─────────────────────────────────────────
 
     /// Build → device-sign → finalize yields well-formed tx_bytes and a 32-byte
@@ -401,10 +593,62 @@ mod tests {
         );
     }
 
-    // test 2 (mixed transparent+Orchard, full finalize) is deferred to the
-    // DEV-03 integration tests (needs a funded transparent UTXO). The covered
-    // portion — transparent-signature DER parsing — is in the dedicated group
-    // near the end of this module.
+    // ── test 2: mixed transparent + Orchard finalize ──────────────────────────
+
+    /// Full mixed-path finalize: build a PCZT with one real Orchard spend and one
+    /// transparent P2PKH input, inject the device Orchard `spendAuthSig` and the
+    /// device transparent DER signature, and run the complete finalize pipeline
+    /// (preimage stamping → Signer → `SpendFinalizer` → `TransactionExtractor`).
+    /// The result must be a well-formed V5 transaction that round-trips through
+    /// `Transaction::read`, carries both bundles, and has a non-empty `script_sig`
+    /// on its transparent input.
+    #[test]
+    fn mixed_transparent_and_orchard_finalize_produces_valid_v5_tx() {
+        let (pczt_bytes, t_sk) = build_mixed_pczt();
+        let ask = make_ask();
+        let orchard_signatures = sign_unsigned_actions(&pczt_bytes, &ask);
+        assert_eq!(
+            orchard_signatures.len(),
+            1,
+            "the mixed PCZT must have exactly one real (device-signed) Orchard spend"
+        );
+        let transparent_sig = device_transparent_der_signature(&pczt_bytes, 0, &t_sk);
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures,
+            transparent_signatures: vec![transparent_sig],
+        })
+        .expect("mixed finalize must succeed");
+
+        assert!(!out.tx_bytes.is_empty(), "tx_bytes must be non-empty");
+        assert_eq!(out.txid.len(), 32, "txid must be 32 bytes");
+
+        // Round-trip and inspect: both pools present, transparent input signed.
+        let tx = Transaction::read(&out.tx_bytes[..], BranchId::Nu6)
+            .expect("Transaction::read must succeed on mixed V5 tx bytes");
+        assert_eq!(
+            *tx.txid().as_ref(),
+            out.txid,
+            "txid from read must match finalize output"
+        );
+
+        let transparent = tx
+            .transparent_bundle()
+            .expect("mixed tx must carry a transparent bundle");
+        assert_eq!(transparent.vin.len(), 1, "exactly one transparent input");
+        // A finalized P2PKH `script_sig` (`<sig> <pubkey>`) is ~107 bytes; an empty
+        // script serializes to a single CompactSize `0x00` byte. `> 1` therefore
+        // confirms the SpendFinalizer assembled a real `script_sig`.
+        assert!(
+            transparent.vin[0].script_sig().serialized_size() > 1,
+            "transparent input must have a finalized (non-empty) script_sig"
+        );
+        assert!(
+            tx.orchard_bundle().is_some(),
+            "mixed tx must carry an Orchard bundle"
+        );
+    }
 
     // ── test 3: valid/invalid Orchard signature ────────────────────────────────
 
@@ -653,15 +897,14 @@ mod tests {
         );
     }
 
-    // ── transparent-signature DER parsing (mixed-path finalize → DEV-03) ──────
+    // ── transparent-signature DER parsing (unit-level) ───────────────────────
     //
-    // This is the covered portion of the "mixed transparent+Orchard" criterion.
-    // A fully realistic mixed PCZT requires a funded transparent UTXO and a
-    // real secp256k1 private key to produce a valid `script_sig`; that full
-    // finalize path (SpendFinalizer + transparent bundle extraction) is covered
-    // by the DEV-03 integration tests once a funded testnet account is available
-    // (MISSING item flagged in the plan). Here we confirm the helper integrates:
-    // `parse_transparent_der` normalizes a synthetic valid DER signature.
+    // The full mixed transparent+Orchard finalize path (SpendFinalizer +
+    // transparent bundle extraction) is now covered end-to-end by
+    // `mixed_transparent_and_orchard_finalize_produces_valid_v5_tx` above. This
+    // remaining case is a focused unit check that `parse_transparent_der`
+    // normalizes a synthetic device-shaped DER signature (header bit + trailing
+    // sighash byte) back to a canonical signature.
     #[test]
     fn transparent_der_parse_integrates_with_finalize_path() {
         use secp256k1::{Message, Secp256k1, SecretKey};
