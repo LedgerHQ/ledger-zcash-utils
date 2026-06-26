@@ -249,8 +249,13 @@ pub async fn broadcast_transaction(grpc_url: String, tx_bytes: Vec<u8>) -> Resul
     let channel = connect(&grpc_url).await?;
     let mut client = CompactTxStreamerClient::new(channel);
 
+    // Recompute the txid from the V5 bytes before moving them into the request.
+    // For V5 transactions `Transaction::read` derives the txid from the stream
+    // (the branch id argument is ignored for V5).
+    let txid = txid_from_v5_bytes(&tx_bytes)?;
+
     let mut req = tonic::Request::new(RawTransaction {
-        data: tx_bytes.clone(),
+        data: tx_bytes,
         height: 0,
     });
     req.set_timeout(UNARY_TIMEOUT);
@@ -263,9 +268,6 @@ pub async fn broadcast_transaction(grpc_url: String, tx_bytes: Vec<u8>) -> Resul
     // Pure mapping, unit-testable without a gRPC server (see tests below).
     interpret_send_response(resp)?;
 
-    // Recompute the txid from the V5 bytes. For V5 transactions `Transaction::read`
-    // derives the txid from the stream (the branch id argument is ignored for V5).
-    let txid = txid_from_v5_bytes(&tx_bytes)?;
     Ok(txid)
 }
 
@@ -443,6 +445,122 @@ mod tests {
             err.to_string().contains("gRPC connect failed"),
             "unexpected error: {err}"
         );
+    }
+
+    // ── broadcast_transaction — happy path (end-to-end, mock gRPC server) ─────
+    //
+    // `zcash_client_backend` only generates the CompactTxStreamer *client*, so
+    // there is no server trait to implement. We hand-roll the smallest possible
+    // gRPC server: a `tower` service that routes the single `SendTransaction`
+    // path to a `UnaryService` returning a configured `SendResponse`, served over
+    // plaintext h2 (matching the `http://` branch of `connect`). This exercises
+    // the full success path: connect → SendTransaction → error_code == 0 →
+    // recompute txid from the V5 bytes, which the error-path and pure-mapping
+    // tests never cover.
+
+    /// Minimal `CompactTxStreamer` mock that answers `SendTransaction` with a
+    /// fixed `SendResponse` and rejects every other method as unimplemented.
+    #[derive(Clone)]
+    struct MockStreamer {
+        response: SendResponse,
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for MockStreamer {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(
+            &mut self,
+            req: tonic::codegen::http::Request<tonic::body::Body>,
+        ) -> Self::Future {
+            let response = self.response.clone();
+            Box::pin(async move {
+                match req.uri().path() {
+                    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction" => {
+                        struct SendTxSvc(SendResponse);
+                        impl tonic::server::UnaryService<RawTransaction> for SendTxSvc {
+                            type Response = SendResponse;
+                            type Future = std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = Result<
+                                                tonic::Response<SendResponse>,
+                                                tonic::Status,
+                                            >,
+                                        > + Send,
+                                >,
+                            >;
+                            fn call(
+                                &mut self,
+                                _request: tonic::Request<RawTransaction>,
+                            ) -> Self::Future {
+                                let resp = self.0.clone();
+                                Box::pin(async move { Ok(tonic::Response::new(resp)) })
+                            }
+                        }
+
+                        // ProstCodec<Encode, Decode>: we encode SendResponse and
+                        // decode the inbound RawTransaction.
+                        let codec =
+                            tonic_prost::ProstCodec::<SendResponse, RawTransaction>::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(SendTxSvc(response), req).await)
+                    }
+                    _ => Ok(tonic::codegen::http::Response::new(
+                        tonic::body::Body::default(),
+                    )),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_returns_txid_on_accept() {
+        let tx_bytes = hex::decode(TX_V5_HEX.trim()).expect("fixture must be valid hex");
+
+        // Bind first so the OS backlog queues the client's connection even before
+        // the server's accept loop starts — no startup sleep needed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .serve_with_incoming(
+                    MockStreamer {
+                        response: SendResponse {
+                            error_code: 0,
+                            error_message: String::new(),
+                        },
+                    },
+                    incoming,
+                )
+                .await
+        });
+
+        let url = format!("http://127.0.0.1:{port}");
+        let txid = broadcast_transaction(url, tx_bytes)
+            .await
+            .expect("error_code == 0 must yield a txid");
+
+        // The returned txid must be the canonical big-endian display txid of the
+        // V5 bytes we broadcast, identical to what the sync path / LL records.
+        assert_eq!(
+            txid, TX_V5_TXID_DISPLAY,
+            "happy path must recompute the canonical txid from the V5 bytes"
+        );
+
+        server.abort();
     }
 
     // ── interpret_send_response — pure mapping tests ──────────────────────────

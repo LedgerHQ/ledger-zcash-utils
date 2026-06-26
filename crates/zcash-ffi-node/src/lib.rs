@@ -516,7 +516,14 @@ pub async fn finalize_transaction(
         })
     })
     .await
-    .map_err(|e| napi::Error::from_reason(format!("spawn_blocking panicked: {e}")))?
+    .map_err(|e| {
+        let kind = if e.is_cancelled() {
+            "was cancelled"
+        } else {
+            "panicked"
+        };
+        napi::Error::from_reason(format!("finalization task {kind}: {e}"))
+    })?
     .map_err(|e| napi::Error::from_reason(e.to_string()))?;
 
     // `result.txid` is internal little-endian; surface it in big-endian display

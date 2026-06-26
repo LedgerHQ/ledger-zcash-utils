@@ -188,8 +188,18 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
 /// The transparent input PCZT field that carries it (`hash160_preimages`) is left
 /// empty by `Builder::build_for_pczt`, and the Ledger device never returns it, so
 /// finalize populates it here from the pubkey the craft step recorded as the key
-/// of each input's `bip32_derivation` (the device signing-path metadata, which is
-/// always present — the device parser rejects a transparent input without it).
+/// of each input's `bip32_derivation` (the device signing-path metadata).
+///
+/// # Precondition
+///
+/// Every transparent input must carry at least one `bip32_derivation` entry. The
+/// device parser is expected to reject a transparent input without one, but that
+/// is a property of the firmware, not something the PCZT type system enforces: an
+/// input with an empty `bip32_derivation` map would silently stamp no preimage
+/// here, and the failure would only surface much later — and far less clearly — as
+/// a missing-preimage error inside `SpendFinalizer::finalize_spends`. We therefore
+/// fail closed up front with an explicit [`Error::Finalize`] naming the offending
+/// input rather than letting a confusing downstream error escape.
 ///
 /// This is pure signer metadata: like `bip32_derivation`, it does not affect the
 /// txid or the sighash, so adding it to the already-proven PCZT is sound. Stamping
@@ -197,7 +207,12 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
 /// by `HASH160(pubkey)`, so the lookup in `append_signature` resolves to the entry
 /// whose hash matches the input's `script_pubkey`.
 fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
-    Updater::new(pczt)
+    // The `update_transparent_with` closure can only surface `UpdaterError`, which
+    // has no variant for our domain-specific precondition. Capture any violation in
+    // an outer slot and convert it to `Error::Finalize` once the borrow ends.
+    let mut precondition_error: Option<Error> = None;
+
+    let updated = Updater::new(pczt)
         .update_transparent_with(|mut updater| {
             // Collect each input's candidate pubkeys (its `bip32_derivation` keys)
             // before mutating, to avoid overlapping immutable/mutable borrows of
@@ -208,6 +223,18 @@ fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
                 .iter()
                 .map(|input| input.bip32_derivation().keys().copied().collect())
                 .collect();
+
+            // Precondition: an input without any `bip32_derivation` entry would be
+            // stamped with no preimage, yielding a confusing downstream
+            // `SpendFinalizer` error. Fail closed here with a clear message instead.
+            if let Some(index) = input_pubkeys.iter().position(Vec::is_empty) {
+                precondition_error = Some(Error::Finalize(format!(
+                    "transparent input {index} has no bip32_derivation; cannot stamp \
+                     hash160 preimage (the controlling pubkey is unknown)"
+                )));
+                return Ok(());
+            }
+
             for (index, pubkeys) in input_pubkeys.into_iter().enumerate() {
                 updater.update_input_with(index, |mut input| {
                     for pubkey in pubkeys {
@@ -218,22 +245,37 @@ fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
             }
             Ok(())
         })
-        .map_err(|e| Error::Finalize(format!("PCZT Updater (transparent hash160 preimage): {e:?}")))
-        .map(Updater::finish)
+        .map_err(|e| {
+            Error::Finalize(format!("PCZT Updater (transparent hash160 preimage): {e:?}"))
+        })?;
+
+    if let Some(err) = precondition_error {
+        return Err(err);
+    }
+
+    Ok(updated.finish())
 }
 
 /// Parse a Ledger-produced transparent ECDSA signature into a libsecp256k1
 /// `Signature`.
 ///
-/// The device produces this signature through the PCZT signing flow
-/// (`INS_PCZT_SIGN_TRANSPARENT`, 0x55): `handler_pczt_sign_transparent`
-/// (`app-zcash:src/handlers/pczt.rs:202-283`) reads the signing path from the
-/// input's PCZT `bip32_derivation` and emits the signature via the shared
-/// `append_signature` helper (`app-zcash:src/handlers/sign_tx.rs:371-398`).
-/// That helper emits a variable-length DER (ASN.1) ECDSA signature with the
-/// y-parity bit OR-ed into the sequence header byte (`sig[0] |= 0x01`), followed
-/// by a 1-byte `sighash_type`. Two Ledger-specific normalizations are therefore
-/// applied before calling `from_der`:
+/// The device emits this signature from the dedicated PCZT transparent-signing
+/// handler `handler_pczt_sign_transparent`
+/// (`app-zcash:src/handlers/pczt.rs:202`, verified against app-zcash v3.6.0 on
+/// `develop` — the PCZT-enabled build this middleware targets). That handler
+/// delegates to `append_signature` (`sign_tx.rs:371-399`) with
+/// `deterministic_sign = true`, which signs the signature digest with the Ledger
+/// SDK secp256k1 ECDSA (`p.deterministic_sign`, returning a DER/ASN.1-encoded
+/// signature), then applies two device-specific quirks before returning the
+/// APDU payload:
+///
+///   - it ORs the y-parity bit into the DER sequence header byte when the `y`
+///     coordinate is odd (`if info != 0 { sig[0] |= 0x01; }`, sign_tx.rs:390-392), and
+///   - it appends a trailing 1-byte `sighash_type` (`comm.append(&[sighash_type])`,
+///     sign_tx.rs:397).
+///
+/// Two Ledger-specific normalizations are therefore applied before calling
+/// `from_der`:
 ///
 /// 1. **DER header-bit normalization** (`0x31 → 0x30`): reset the y-parity bit
 ///    the device ORs into the DER sequence header byte, restoring the canonical
@@ -245,6 +287,39 @@ fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
 ///    length with the ASN.1 total length (header byte + 1 length byte + content
 ///    length): if the buffer is exactly 1 byte longer than the DER-declared
 ///    total length, strip the trailing byte.
+///
+/// # KNOWN RISK / TODO: firmware-source-verified, device-bytes-unverified
+///
+/// Both normalizations match the `app-zcash` firmware *source* for the PCZT
+/// transparent path (verified against app-zcash v3.6.0 on `develop`:
+/// `handler_pczt_sign_transparent`, pczt.rs:202 → `append_signature`,
+/// sign_tx.rs:371-399):
+///
+/// - The `0x31 → 0x30` header-bit reset matches `if info != 0 { sig[0] |= 0x01; }`
+///   (sign_tx.rs:390-392): the device only sets the bit when the `y` coordinate is
+///   odd, so an even-`y` signature arrives canonical (`0x30`) and this branch is a
+///   harmless no-op.
+/// - The trailing-byte strip matches `comm.append(&[sighash_type])` (sign_tx.rs:397):
+///   exactly one `sighash_type` byte is appended after the DER signature.
+///
+/// One residual gap remains, so this is *not* fully validated: the shape has not
+/// been confirmed against bytes a *physical device* actually returns. The
+/// mixed-path test (`mixed_transparent_and_orchard_finalize_produces_valid_v5_tx`)
+/// drives the pipeline with a *canonical* signature, so it exercises assembly but
+/// makes no claim about the device wire shape. The `parse_transparent_der_*` unit
+/// tests check these normalizations against the documented firmware *source*, but
+/// only `golden_device_transparent_signature_validates_end_to_end` (scaffolded and
+/// `#[ignore]`d until device bytes are captured) validates them against real
+/// firmware output.
+///
+/// TODO(transparent): capture a real Ledger transparent signature over a PCZT
+/// input to validate this path end-to-end against firmware rather than against
+/// itself. The fixture test `golden_device_transparent_signature_validates_end_to_end`
+/// (with its `golden_fixture` populate-point and capture procedure) is scaffolded
+/// and `#[ignore]`d, waiting on those bytes. The normalizations fail closed
+/// (`from_der` rejects a malformed buffer), so a wrong assumption surfaces as
+/// `Error::Finalize` rather than a silently invalid transaction — but it has not
+/// been exercised against a device.
 fn parse_transparent_der(bytes: &[u8]) -> Result<secp256k1::ecdsa::Signature, Error> {
     if bytes.len() < 2 {
         return Err(Error::Finalize(format!(
@@ -257,7 +332,12 @@ fn parse_transparent_der(bytes: &[u8]) -> Result<secp256k1::ecdsa::Signature, Er
     let mut buf = bytes.to_vec();
 
     // Normalization 1: reset the Ledger y-parity header bit.
-    // DER SEQUENCE tag is 0x30; the device ORs in 0x01, yielding 0x31.
+    // DER SEQUENCE tag is 0x30; the device ORs in 0x01 (only for odd y), yielding 0x31.
+    //
+    // Matches app-zcash firmware source (`if info != 0 { sig[0] |= 0x01; }`,
+    // sign_tx.rs:390-392, v3.6.0 `develop`), but not yet validated against bytes
+    // from a physical device. See the function doc's "KNOWN RISK / TODO" section.
+    // Fails closed (a wrong assumption makes `from_der` below reject the buffer).
     if buf[0] == 0x31 {
         buf[0] = 0x30;
     }
@@ -266,7 +346,19 @@ fn parse_transparent_der(bytes: &[u8]) -> Result<secp256k1::ecdsa::Signature, Er
     // ASN.1 total wire length = 1 (tag) + 1 (length byte) + content_length.
     // If the buffer is exactly 1 byte longer than that, the extra byte is the
     // sighash type appended by the device.
-    if buf.len() >= 2 {
+    //
+    // This parses only the *short-form* DER length (single length byte, high bit
+    // clear, value 0..=127). The device produces the signature via the Ledger SDK
+    // secp256k1 ECDSA (`p.deterministic_sign`, app-zcash sign_tx.rs:382-387,
+    // v3.6.0 `develop`, DER/ASN.1 output), whose buffer is bounded at 72 bytes
+    // (`0x30` tag + len byte + at most 70 bytes of content: two 33-byte INTEGERs).
+    // The DER content length is therefore always <= 70 < 128, so the length is
+    // always short-form and `buf[1]` is the content length directly.
+    // We still guard the high bit explicitly rather than rely on that bound
+    // implicitly: if a long-form length byte (>= 0x80) ever shows up we skip the
+    // strip and let `from_der` below reject/parse the buffer as-is (fail closed,
+    // never silently truncate using a misread length).
+    if buf.len() >= 2 && buf[1] < 0x80 {
         let content_len = buf[1] as usize;
         let declared_total = 2 + content_len; // tag + length-byte + content
         if buf.len() == declared_total + 1 {
@@ -342,7 +434,7 @@ mod tests {
 
     /// Build a proven PCZT (pure Orchard) with a single real spend.
     ///
-    /// Returns (pczt_bytes, spend_value, fee) so callers can derive the
+    /// Returns the canonical PCZT bytes so callers can derive the
     /// device signature for the real spend.
     fn build_orchard_pczt() -> Vec<u8> {
         let fvk = make_fvk();
@@ -531,31 +623,36 @@ mod tests {
         (pczt_bytes, t_sk)
     }
 
-    /// Produce the DER signature a Ledger device would return for transparent
-    /// input `index`: compute the input's sighash via the PCZT `Signer`, sign it
-    /// with `sk`, then apply the two device-specific quirks `parse_transparent_der`
-    /// is responsible for undoing (y-parity bit OR-ed into the DER header, trailing
-    /// `SIGHASH_ALL` byte). This exercises the real signature wire format end-to-end.
-    fn device_transparent_der_signature(
+    /// Produce a **canonical** DER signature over transparent input `index`'s
+    /// sighash: compute the sighash via the PCZT `Signer`, sign it with `sk`, and
+    /// return the standard libsecp256k1 DER encoding (`0x30` SEQUENCE header, no
+    /// trailing sighash-type byte).
+    ///
+    /// Deliberately does NOT reproduce the Ledger wire quirks (the `0x31` y-parity
+    /// header bit and the trailing `SIGHASH_ALL` byte). Fabricating exactly the
+    /// shape `parse_transparent_der` strips would make the mixed test a closed loop
+    /// that stays green even if real firmware emits a different shape — the very
+    /// over-confidence this avoids. The quirk normalization is exercised in
+    /// isolation by the `parse_transparent_der_*` unit tests, and validated against
+    /// real device bytes by `golden_device_transparent_signature_validates_end_to_end`.
+    /// This helper's sole job is to feed the finalize pipeline a valid signature.
+    fn valid_transparent_der_signature(
         pczt_bytes: &[u8],
         index: usize,
         sk: &secp256k1::SecretKey,
     ) -> Vec<u8> {
         use secp256k1::{Message, Secp256k1};
 
-        let pczt = Pczt::parse(pczt_bytes).expect("device_transparent_der_signature: parse");
+        let pczt = Pczt::parse(pczt_bytes).expect("valid_transparent_der_signature: parse");
         let signer =
-            PcztSigner::new(pczt).expect("device_transparent_der_signature: Signer::new");
+            PcztSigner::new(pczt).expect("valid_transparent_der_signature: Signer::new");
         let sighash = signer
             .transparent_sighash(index)
-            .expect("device_transparent_der_signature: transparent_sighash");
+            .expect("valid_transparent_der_signature: transparent_sighash");
 
         let secp = Secp256k1::new();
         let sig = secp.sign_ecdsa(&Message::from_digest(sighash), sk);
-        let mut der = sig.serialize_der().to_vec();
-        der[0] = 0x31; // Ledger y-parity header bit (0x30 → 0x31)
-        der.push(0x01); // trailing SIGHASH_ALL byte
-        der
+        sig.serialize_der().to_vec()
     }
 
     // ── test 1: pure-Orchard finalize ─────────────────────────────────────────
@@ -602,6 +699,15 @@ mod tests {
     /// The result must be a well-formed V5 transaction that round-trips through
     /// `Transaction::read`, carries both bundles, and has a non-empty `script_sig`
     /// on its transparent input.
+    ///
+    /// SCOPE: this test validates the finalize *pipeline* — transparent signature
+    /// injection → `SpendFinalizer` → `TransactionExtractor`, ending in a V5 tx
+    /// that round-trips and carries both bundles with a populated `script_sig`. It
+    /// is driven by a *canonical* signature from `valid_transparent_der_signature`
+    /// and therefore makes no claim about the Ledger DER wire shape: that
+    /// assumption is checked against firmware *source* by the `parse_transparent_der_*`
+    /// unit tests and against real *device bytes* by
+    /// `golden_device_transparent_signature_validates_end_to_end`.
     #[test]
     fn mixed_transparent_and_orchard_finalize_produces_valid_v5_tx() {
         let (pczt_bytes, t_sk) = build_mixed_pczt();
@@ -612,7 +718,7 @@ mod tests {
             1,
             "the mixed PCZT must have exactly one real (device-signed) Orchard spend"
         );
-        let transparent_sig = device_transparent_der_signature(&pczt_bytes, 0, &t_sk);
+        let transparent_sig = valid_transparent_der_signature(&pczt_bytes, 0, &t_sk);
 
         let out = finalize_transaction(FinalizeInputs {
             pczt_bytes,
@@ -918,5 +1024,137 @@ mod tests {
                         // Both normalizations must produce the original signature.
         let parsed = parse_transparent_der(&der).unwrap();
         assert_eq!(parsed, sig);
+    }
+
+    // ── golden device-bytes fixture (open loop) ───────────────────────────────
+    //
+    // Closes the gap documented in `parse_transparent_der`'s "KNOWN RISK / TODO":
+    // no other test validates the Ledger DER wire shape against real firmware. The
+    // mixed test drives the pipeline with a canonical signature, and the
+    // `parse_transparent_der_*` unit tests only check the normalizations against the
+    // documented firmware *source*. This test instead feeds in **bytes a physical
+    // Ledger actually returned** for a transparent PCZT input and proves, end-to-end,
+    // that after normalization they are a valid ECDSA signature over the sighash
+    // this crate computes — validating the DER-shape assumption against firmware
+    // rather than against ourselves.
+    //
+    // ── How to capture the fixture ────────────────────────────────────────────
+    //
+    // On a host with a physical Ledger running the PCZT-enabled app-zcash build:
+    //
+    //   1. Build a transaction that has at least one transparent (P2PKH) input,
+    //      e.g. via the `buildTransaction` NAPI export. Record the returned
+    //      `pczt_hex` verbatim → `GOLDEN_PCZT_HEX`. (The sighash depends on the
+    //      whole tx, so the PCZT here MUST be the exact one streamed to the
+    //      device.)
+    //   2. Stream that PCZT to the device and have it sign each transparent
+    //      input. Capture the raw bytes the device returns for each input,
+    //      exactly as they arrive in the APDU payload — i.e. *with* the Ledger
+    //      quirks still applied (y-parity bit OR-ed into the DER header byte and
+    //      the trailing 1-byte `sighash_type`; see `handler_pczt_sign_transparent`
+    //      → `append_signature`, app-zcash pczt.rs:202 / sign_tx.rs:371-399,
+    //      v3.6.0 `develop`). Do NOT pre-normalize them. Hex-encode →
+    //      first element of each `GOLDEN_TRANSPARENT_INPUTS` tuple.
+    //   3. Record the 33-byte compressed controlling pubkey for each input (the
+    //      same value passed as `TransparentInputJs.pubkey` when building) →
+    //      second element of each tuple. Inputs must be listed in PCZT input
+    //      order.
+    //
+    // Then drop the captured bytes into `golden_fixture` below (return `Some(..)`)
+    // and the assertions validate the path against real firmware output. A
+    // `from_der` rejection means the PCZT firmware emits a different DER shape than
+    // the documented assumption; a verification failure means the device signed a
+    // different sighash (or the normalization corrupted the signature). Either way
+    // the path fails closed.
+    //
+    // ── Blocking dependency (why this stays open) ─────────────────────────────
+    //
+    // This fixture cannot be captured today for a *structural* reason, not just
+    // the funded-testnet prerequisite: there is no host-side path that streams a
+    // PCZT to the device and returns the raw transparent DER signature. As of
+    // device-sdk-ts `signer-zcash` v0.3.0, only the legacy transparent flow exists
+    // (`SignTransactionTask`, "Zcash transparent signing only"); there is no PCZT
+    // sign device-action, and `finalizeTransaction` has no consumer wired in
+    // `coin-bitcoin/.../chain-adapters/zcash/`. Step 2 above ("stream that PCZT to
+    // the device and capture the raw bytes") is therefore not yet implementable.
+    //
+    // DEPENDENCY: this test unblocks only once the DMK PCZT signing device-action
+    // lands in device-sdk-ts `signer-zcash` (APDU-stream a PCZT, return the raw
+    // transparent DER signature) and a consumer is wired into the coin-bitcoin
+    // Zcash chain-adapter. Track that work as an explicit prerequisite for this
+    // golden fixture.
+
+    /// The captured golden fixture, or `None` until one exists.
+    ///
+    /// To enable the end-to-end test, return
+    /// `Some((pczt_hex, &[(device_signature_hex, controlling_pubkey_hex), ..]))`
+    /// where the inner tuples are in PCZT input order and `device_signature_hex`
+    /// is the raw APDU payload (Ledger header bit + trailing sighash byte intact).
+    /// See the capture procedure documented above this function.
+    fn golden_fixture() -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
+        None
+    }
+
+    #[test]
+    #[ignore = "requires golden bytes captured from a physical Ledger; see the doc comment for the capture procedure"]
+    fn golden_device_transparent_signature_validates_end_to_end() {
+        let Some((pczt_hex, transparent_inputs)) = golden_fixture() else {
+            eprintln!(
+                "SKIP golden_device_transparent_signature_validates_end_to_end: no fixture \
+                 captured yet. Populate `golden_fixture` — see the doc comment above this test \
+                 for the capture procedure."
+            );
+            return;
+        };
+
+        use secp256k1::{Message, PublicKey, Secp256k1};
+
+        let pczt_bytes = hex::decode(pczt_hex).expect("golden pczt_hex must be valid hex");
+        let pczt = Pczt::parse(&pczt_bytes).expect("golden pczt_hex must parse as a PCZT");
+
+        assert_eq!(
+            pczt.transparent().inputs().len(),
+            transparent_inputs.len(),
+            "fixture transparent-input count must match the golden PCZT"
+        );
+
+        let signer = PcztSigner::new(pczt).expect("Signer::new on golden PCZT");
+        let secp = Secp256k1::new();
+
+        for (index, (sig_hex, pubkey_hex)) in transparent_inputs.iter().enumerate() {
+            let raw = hex::decode(sig_hex)
+                .unwrap_or_else(|e| panic!("transparent input {index} signature hex: {e}"));
+
+            // (1) The device's raw bytes must satisfy parse_transparent_der's
+            //     normalization assumptions. This is the exact fail-closed branch
+            //     (`from_der` rejection) the closed-loop test cannot reach.
+            let parsed = parse_transparent_der(&raw).unwrap_or_else(|e| {
+                panic!(
+                    "transparent input {index}: parse_transparent_der rejected the device bytes \
+                     ({e}). The PCZT firmware DER shape does not match the documented \
+                     (app-zcash v3.6.0 `develop`) assumption — update parse_transparent_der."
+                )
+            });
+
+            // (2) End-to-end fidelity: the normalized signature must verify against
+            //     the controlling pubkey over the sighash THIS crate computes.
+            let sighash = signer
+                .transparent_sighash(index)
+                .unwrap_or_else(|e| panic!("transparent_sighash({index}): {e:?}"));
+            let pubkey_bytes = hex::decode(pubkey_hex)
+                .unwrap_or_else(|e| panic!("transparent input {index} pubkey hex: {e}"));
+            let pubkey = PublicKey::from_slice(&pubkey_bytes)
+                .unwrap_or_else(|e| panic!("transparent input {index} pubkey: {e}"));
+
+            secp.verify_ecdsa(&Message::from_digest(sighash), &parsed, &pubkey)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "transparent input {index}: the normalized device signature does NOT \
+                         verify against the controlling pubkey over the computed sighash ({e}). \
+                         The device signed a different sighash, or normalization corrupted the \
+                         signature."
+                    )
+                });
+        }
     }
 }
