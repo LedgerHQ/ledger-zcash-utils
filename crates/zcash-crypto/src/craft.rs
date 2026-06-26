@@ -1,27 +1,27 @@
-//! Build, prove, and serialize a PCZT for the Orchard send flows.
+//! Build, prove, and serialize a PCZT for Orchard and transparent send flows.
 //!
-//! Covers the two flows where the source is Orchard:
-//!   - Private → Private (Orchard spends + Orchard outputs)
-//!   - Private → Public  (Orchard spends + at least one transparent output)
-//!
-//! Transparent *inputs* are out of scope (deferred to `zcash_sync::craft`).
+//! Covers all four send flows:
+//!   - Private → Private  (Orchard spends + Orchard outputs)
+//!   - Private → Public   (Orchard spends + at least one transparent output)
+//!   - Public  → Private  (transparent inputs + Orchard output; anchor-only)
+//!   - Public  → Public   (transparent inputs + transparent outputs; no Orchard bundle)
 //!
 //! Lifecycle (host side):
 //!   1. Construct `zcash_primitives::transaction::builder::Builder` with the
 //!      anchor from `zcash_sync::witness::WitnessOutput`.
-//!   2. For each spend: reconstruct the Orchard `Note` via `Note::from_parts`
+//!   2. For each Orchard spend: reconstruct the `Note` via `Note::from_parts`
 //!      and call `add_orchard_spend(fvk, note, merkle_path)`.
-//!   3. For each output: dispatch on the destination address type and call
+//!   3. For each transparent input: validate the pubkey + OutPoint + TxOut,
+//!      then call `add_transparent_p2pkh_input(pubkey, outpoint, coin)`.
+//!   4. For each output: dispatch on the destination address type and call
 //!      `add_orchard_output` or `add_transparent_output`. An automatic change
 //!      output is added when value balance is positive.
-//!   4. `Builder::build_for_pczt(OsRng, &FeeRule::standard())` → `PcztParts`.
-//!   5. `pczt::roles::creator::Creator::build_from_parts` wraps it into a
+//!   5. `Builder::build_for_pczt(OsRng, &FeeRule::standard())` → `PcztParts`.
+//!   6. `pczt::roles::creator::Creator::build_from_parts` wraps it into a
 //!      wire-format `Pczt`.
-//!   6. `pczt::roles::io_finalizer::IoFinalizer::finalize_io()` computes the
-//!      Orchard binding signing key (bsk) and signs dummy spends.
-//!   7. `pczt::roles::prover::Prover::create_orchard_proof(&pk)` generates the
-//!      Halo 2 proof. The `ProvingKey` is cached process-globally via
-//!      `OnceLock` (first build ~2-5 s, subsequent reuse ~hundreds of ms).
+//!   7. When an Orchard bundle is present: stamp ZIP-32 derivation paths, run
+//!      `IoFinalizer::finalize_io()`, `Prover::create_orchard_proof(&pk)`.
+//!      For transparent-only: skip stamp + prover, only run `IoFinalizer`.
 //!   8. `Pczt::serialize()` emits the canonical wire format
 //!      (`PCZT` magic + u32 version + postcard payload).
 //!
@@ -50,6 +50,42 @@
 //! never asks the device to sign those action indices. The path shape matches
 //! exactly what the device validates and re-derives from
 //! (`app-rust-zcash` `check_bip44_compliance` / `derive_orchard_fvk`).
+//!
+//! ## Transparent BIP-44 `bip32_derivation`
+//!
+//! The transparent pool needs the analogous metadata, stamped onto the PCZT's
+//! transparent bundle by [`stamp_transparent_derivations`]:
+//!
+//!   - **Every transparent input** is stamped with its compressed pubkey and the
+//!     BIP-44 path `m/44'/coin_type'/account'/scope/address_index`. In the Ledger
+//!     PCZT signing flow this path *is* the signing-key locator — the sign APDU
+//!     (`handler_pczt_sign_transparent`) carries no path, and the device parser
+//!     rejects any transparent input whose `bip32_derivation` is missing or not
+//!     exactly one entry. The device signs with this path without re-checking it
+//!     against the pubkey, so the caller must guarantee it derives to the pubkey
+//!     (the sync layer verifies this against the UFVK before building).
+//!   - **The transparent change output** is stamped with the change pubkey and
+//!     the internal path `m/44'/coin_type'/account'/1/address_index`. Without it
+//!     the device classifies the wallet's own change as a third-party recipient
+//!     and shows it to the user; with it the device re-derives the pubkey from
+//!     the path, matches its hash against the output script, and hides it as
+//!     change. Regular (non-change) transparent recipient outputs are left
+//!     un-stamped so the device displays them as external payments.
+//!
+//! Transparent stamping runs after the IO Finalizer and Prover because
+//! `bip32_derivation` is signer metadata that does not affect the txid or
+//! sighash, and the transparent Updater role has no `tx_modifiable` gate.
+//!
+//! ## Transparent inputs — encoding conventions
+//!
+//! `txid`: The 32-byte txid is supplied in **internal (little-endian) byte
+//! order**, matching what `OutPoint::new([u8;32], u32)` expects and what the
+//! Bitcoin/Zcash wire encoding stores. Ledger Live sources txids in display
+//! (big-endian) order; callers must reverse before passing here.
+//!
+//! `script_pubkey`: Supplied as **raw script bytes** (no CompactSize length
+//! prefix). `Script::read` expects a CompactSize-prefixed encoding, so we
+//! construct `Script(script::Code(bytes))` directly from the raw slice.
 
 use std::sync::OnceLock;
 
@@ -75,7 +111,9 @@ use zcash_protocol::{
     memo::MemoBytes,
     value::Zatoshis,
 };
-use zcash_transparent::address::TransparentAddress;
+use zcash_transparent::{
+    address::TransparentAddress, pczt::Bip32Derivation as TransparentBip32Derivation,
+};
 use zip32::ChildIndex;
 
 use crate::error::Error;
@@ -97,6 +135,42 @@ pub struct OrchardSpendInput {
     pub rseed: [u8; 32],
     /// Merkle witness for this note (from `zcash_crypto::tree::WitnessOutput`).
     pub merkle_path: incrementalmerkletree::MerklePath<orchard::tree::MerkleHashOrchard, 32>,
+}
+
+/// One transparent (P2PKH) UTXO to spend.
+#[derive(Clone, Debug)]
+pub struct TransparentInput {
+    /// 33-byte compressed secp256k1 public key controlling the UTXO. The device
+    /// holds the matching private key; this builder produces an unsigned input.
+    pub pubkey: [u8; 33],
+    /// 32-byte prevout txid in **internal (little-endian) byte order**.
+    /// Zcash/Bitcoin display txids in reversed (big-endian) order; callers must
+    /// reverse before passing.
+    pub txid: [u8; 32],
+    /// Output index within the origin transaction (prevout vout).
+    pub vout: u32,
+    /// The UTXO's `scriptPubKey` as **raw script bytes** (no CompactSize prefix).
+    /// For a standard P2PKH output this is the 25-byte
+    /// `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG` script.
+    pub script_pubkey: Vec<u8>,
+    /// UTXO value in zatoshis.
+    pub value: u64,
+    /// BIP-44 chain (scope) the controlling key was derived at: `0` = external,
+    /// `1` = internal (change). Combined with the shared `account_index` and the
+    /// network coin type into the input's signing path
+    /// `m/44'/coin_type'/account'/scope/address_index`, which is stamped into the
+    /// PCZT as this input's `bip32_derivation`.
+    ///
+    /// The Ledger device reads the signing path exclusively from this field in
+    /// the PCZT flow (`handler_pczt_sign_transparent` carries no path APDU); a
+    /// transparent input without a `bip32_derivation` is rejected by the device
+    /// parser. The path is not re-checked against `pubkey` on-device, so callers
+    /// must ensure it derives to `pubkey` (the sync layer verifies this against
+    /// the UFVK before building).
+    pub derivation_scope: u32,
+    /// Non-hardened BIP-44 address index of the controlling key (see
+    /// [`Self::derivation_scope`]).
+    pub derivation_address_index: u32,
 }
 
 /// A destination for one output.
@@ -124,18 +198,43 @@ pub struct BuildInputs {
     /// Target block height. Builder uses `target + DEFAULT_TX_EXPIRY_DELTA` for
     /// the expiry. Branch ID is derived from this height.
     pub target_height: u32,
-    /// Orchard full viewing key (extracted from the UFVK).
-    pub orchard_fvk: OrchardFvk,
+    /// Orchard full viewing key (extracted from the UFVK). Required (`Some`)
+    /// only when an Orchard bundle will be present (Orchard spends or Orchard
+    /// outputs). `None` is valid for the transparent-only Public→Public flow,
+    /// where no Orchard key material is read.
+    pub orchard_fvk: Option<OrchardFvk>,
     /// Optional Outgoing Viewing Key for output recipients. Pass `Some(external_ovk)`
     /// if the wallet should be able to later decrypt its own outgoing notes.
     pub ovk: Option<OutgoingViewingKey>,
-    /// Internal-scope Orchard change address.
-    pub change_address: OrchardAddress,
+    /// Internal-scope Orchard change address. Required (`Some`) only when an
+    /// Orchard bundle is present and `change > 0`; `None` is valid for the
+    /// transparent-only Public→Public flow.
+    pub change_address: Option<OrchardAddress>,
+    /// Internal-scope transparent change address. Required when `has_orchard ==
+    /// false` and `change > 0` (Public→Public flow). `None` is valid when no
+    /// change is expected, or when change is taken in Orchard.
+    pub transparent_change_address: Option<TransparentAddress>,
+    /// Compressed secp256k1 pubkey (33 bytes) of `transparent_change_address`.
+    /// Required (`Some`) whenever a transparent change output is produced. It is
+    /// stamped into the change output's `bip32_derivation` so the Ledger device
+    /// recognizes the output as change (and hides it) instead of displaying it as
+    /// a third-party recipient. The device re-derives this pubkey from the change
+    /// path and aborts if it does not match, so it must be the exact pubkey of
+    /// `transparent_change_address`.
+    pub transparent_change_pubkey: Option<[u8; 33]>,
+    /// Non-hardened BIP-44 address index of `transparent_change_address`.
+    /// Combined with the shared `account_index`, the internal scope (`1`), and
+    /// the network coin type into the change path
+    /// `m/44'/coin_type'/account'/1/address_index`. Required (`Some`) whenever a
+    /// transparent change output is produced.
+    pub transparent_change_address_index: Option<u32>,
     /// Anchor root (32-byte little-endian Pallas encoding) from `zcash_sync::witness::WitnessOutput`.
+    /// Used only when an Orchard bundle is present; pass `[0u8; 32]` for
+    /// Public→Public (no Orchard bundle).
     pub anchor: [u8; 32],
     /// ZIP-32 seed fingerprint of the wallet seed (see ZIP-32 §"Seed
-    /// fingerprints"). Stamped onto every real spend so the device can confirm
-    /// the PCZT belongs to its seed before producing a spend-auth signature.
+    /// fingerprints"). Stamped onto every real Orchard spend so the device can
+    /// confirm the PCZT belongs to its seed before producing a spend-auth signature.
     pub seed_fingerprint: [u8; 32],
     /// ZIP-32 account index the `orchard_fvk` was derived at. Combined with the
     /// network coin type into the per-spend path `m/32'/coin_type'/account'`.
@@ -146,7 +245,10 @@ pub struct BuildInputs {
     /// is validated against ZIP-317 for the final action layout — our ZIP-317
     /// implementation is validation-only.
     pub fee: u64,
+    /// Orchard notes to spend. Empty for Public→* flows.
     pub spends: Vec<OrchardSpendInput>,
+    /// Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows.
+    pub transparent_inputs: Vec<TransparentInput>,
     pub outputs: Vec<OutputRequest>,
 }
 
@@ -162,6 +264,10 @@ pub struct BuildOutput {
     pub anchor_height: u32,
     /// Orchard action count after dummy padding.
     pub n_actions_orchard: u32,
+    /// Transparent input count.
+    pub n_transparent_inputs: u32,
+    /// Transparent output count (including change).
+    pub n_transparent_outputs: u32,
 }
 
 /// Process-global Halo 2 proving key. First initialization is ~2–5 s;
@@ -171,15 +277,17 @@ pub(crate) fn proving_key() -> &'static ProvingKey {
     PROVING_KEY.get_or_init(ProvingKey::build)
 }
 
-/// Build, prove, and serialize a PCZT for an Orchard-source send.
+/// Build, prove, and serialize a PCZT for an Orchard or transparent send.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Craft`] for:
+/// - both orchard spends and transparent inputs are empty;
 /// - invalid spend components (recipient bytes, rho, rseed → `Note::from_parts` fails);
-/// - invalid anchor encoding;
+/// - invalid transparent input (pubkey bytes, OutPoint, TxOut construction);
+/// - invalid anchor encoding (when an Orchard bundle is present);
 /// - unsupported network state (NU5 not active at `target_height`);
-/// - builder errors (insufficient funds, add_orchard_* failures);
+/// - builder errors (insufficient funds, add_orchard_* / add_transparent_* failures);
 /// - PCZT IO finalizer or prover errors;
 /// - value-out-of-range conversion errors (zatoshis cap = 2^63 - 1).
 pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
@@ -189,47 +297,84 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         orchard_fvk,
         ovk,
         change_address,
+        transparent_change_address,
+        transparent_change_pubkey,
+        transparent_change_address_index,
         anchor,
         seed_fingerprint,
         account_index,
         fee,
         spends,
+        transparent_inputs,
         outputs,
     } = inputs;
 
     let target = BlockHeight::from(target_height);
     if !network.is_nu_active(NetworkUpgrade::Nu5, target) {
+        // This builder always emits a v5 transaction (`BuildConfig::Standard`),
+        // and the v5 format is gated on NU5 regardless of which pools are used —
+        // so this also applies to transparent-only (Public→Public) transactions
+        // that contain no Orchard bundle.
         return Err(Error::Craft(format!(
-            "Orchard (NU5) is not active at target_height {target_height}"
+            "NU5 is not active at target_height {target_height}; this builder emits v5 \
+             transactions, which require NU5 (or a later upgrade) to be active"
         )));
     }
-    if spends.is_empty() {
-        return Err(Error::Craft("spends list is empty".into()));
+    if spends.is_empty() && transparent_inputs.is_empty() {
+        return Err(Error::Craft(
+            "no inputs: both orchard spends and transparent inputs are empty".into(),
+        ));
     }
     if outputs.is_empty() {
         return Err(Error::Craft("outputs list is empty".into()));
     }
 
-    let orchard_anchor = orchard::Anchor::from_bytes(anchor)
-        .into_option()
-        .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?;
+    // Determine whether an Orchard bundle will be present. An Orchard bundle
+    // is created when there are Orchard spends OR any Orchard output.
+    let has_orchard = !spends.is_empty()
+        || outputs
+            .iter()
+            .any(|o| matches!(o.destination, Destination::Orchard(_)));
+
+    // Conditionally build the Orchard anchor only when needed.
+    let orchard_anchor = if has_orchard {
+        Some(
+            orchard::Anchor::from_bytes(anchor)
+                .into_option()
+                .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?,
+        )
+    } else {
+        None
+    };
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
-        orchard_anchor: Some(orchard_anchor),
+        orchard_anchor,
     };
 
-    // ── 1. Builder + spends + non-change outputs ─────────────────────────────
+    // ── 1. Builder + Orchard spends + transparent inputs + non-change outputs ──
     let mut builder = Builder::new(network, target, build_config);
 
     let mut total_in: u64 = 0;
-    let mut n_spends: u32 = 0;
-    for spend in &spends {
-        add_spend(&mut builder, &orchard_fvk, spend)?;
-        total_in = total_in
-            .checked_add(spend.value)
-            .ok_or_else(|| Error::Craft("spend value overflow".into()))?;
-        n_spends += 1;
+    if !spends.is_empty() {
+        let fvk = orchard_fvk.as_ref().ok_or_else(|| {
+            Error::Craft("orchard_fvk is required when Orchard spends are present".into())
+        })?;
+        for spend in &spends {
+            add_spend(&mut builder, fvk, spend)?;
+            total_in = total_in
+                .checked_add(spend.value)
+                .ok_or_else(|| Error::Craft("spend value overflow".into()))?;
+        }
     }
+    let n_spends = spends.len() as u32;
+
+    for tin in &transparent_inputs {
+        add_transparent_input(&mut builder, tin)?;
+        total_in = total_in
+            .checked_add(tin.value)
+            .ok_or_else(|| Error::Craft("transparent input value overflow".into()))?;
+    }
+    let n_transparent_inputs = transparent_inputs.len() as u32;
 
     let mut total_out: u64 = 0;
     let mut n_orchard_outputs: u32 = 0;
@@ -251,8 +396,6 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // and use ZIP-317 only to *validate* that fee against the final layout.
     let fee_rule = FeeRule::standard();
 
-    // change = total_in − total_out − fee. Must be ≥ 0; a negative result means
-    // the inputs cannot cover the requested outputs plus the supplied fee.
     let outflow = total_out
         .checked_add(fee)
         .ok_or_else(|| Error::Craft("total_out + fee overflow".into()))?;
@@ -263,27 +406,72 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     }
     let change = total_in - outflow;
 
-    // Any positive surplus becomes a single Orchard change output. Note that a
-    // surplus can never be "absorbed into the fee": `build_for_pczt` enforces
-    // `value_balance == ZIP-317 fee` exactly (it returns `ChangeRequired` for
-    // any leftover), so the only valid placements for surplus value are a
-    // change output (when it can fund the extra action) or nothing (exact
-    // fee). A surplus too small to fund the change output's extra action is
-    // therefore unrepresentable and is rejected by the validation below with a
-    // precise message rather than a cryptic builder error.
+    // Route surplus change to the appropriate pool:
+    // - Orchard bundle present → Orchard change output (existing behaviour).
+    // - Transparent-only (Public→Public) → transparent change output.
+    //
+    // When a transparent change output is added we record its index in the
+    // transparent bundle plus the metadata needed to stamp its `bip32_derivation`
+    // (so the device can recognize it as change). The transparent builder appends
+    // outputs in insertion order without shuffling, so the change output — added
+    // here, after all caller-supplied outputs — is the last transparent output;
+    // its index equals the number of transparent outputs added before it.
+    let mut transparent_change_stamp: Option<(usize, [u8; 33], u32)> = None;
     if change > 0 {
-        let change_req = OutputRequest {
-            destination: Destination::Orchard(change_address),
-            value: change,
-            memo: None,
-        };
-        add_output(&mut builder, ovk.as_ref(), &change_req)?;
-        n_orchard_outputs += 1;
+        if has_orchard {
+            let change_addr = change_address.ok_or_else(|| {
+                Error::Craft(
+                    "change_address required for Orchard change but none supplied".into(),
+                )
+            })?;
+            let change_req = OutputRequest {
+                destination: Destination::Orchard(change_addr),
+                value: change,
+                memo: None,
+            };
+            add_output(&mut builder, ovk.as_ref(), &change_req)?;
+            n_orchard_outputs += 1;
+        } else {
+            let addr = transparent_change_address.ok_or_else(|| {
+                Error::Craft(
+                    "transparent change required but no transparent_change_address supplied".into(),
+                )
+            })?;
+            let change_pubkey = transparent_change_pubkey.ok_or_else(|| {
+                Error::Craft(
+                    "transparent change required but no transparent_change_pubkey supplied — \
+                     the device needs the change output's bip32_derivation to recognize it as \
+                     change rather than a third-party recipient"
+                        .into(),
+                )
+            })?;
+            let change_address_index = transparent_change_address_index.ok_or_else(|| {
+                Error::Craft(
+                    "transparent change required but no transparent_change_address_index supplied"
+                        .into(),
+                )
+            })?;
+            let change_req = OutputRequest {
+                destination: Destination::Transparent(addr),
+                value: change,
+                memo: None,
+            };
+            let change_output_index = n_transparent_outputs as usize;
+            add_output(&mut builder, None, &change_req)?;
+            n_transparent_outputs += 1;
+            transparent_change_stamp =
+                Some((change_output_index, change_pubkey, change_address_index));
+        }
     }
 
     // ZIP-317 validation (validation-only). The supplied fee must equal the
     // ZIP-317 fee for the *final* action layout (after any change output).
-    let required_fee = zip317_fee(n_spends, n_orchard_outputs, n_transparent_outputs);
+    let required_fee = zip317_fee(
+        n_spends,
+        n_orchard_outputs,
+        n_transparent_inputs,
+        n_transparent_outputs,
+    );
     if fee != required_fee {
         return Err(Error::Craft(format!(
             "fee {fee} does not satisfy ZIP-317 for this transaction (requires {required_fee}); \
@@ -295,12 +483,11 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // Defense-in-depth: cross-check against the builder's own fee rule. With the
     // validation above this should never fire; it guards against our ZIP-317
     // model drifting from the library's `FeeRule::standard()`.
-    let builder_fee = builder
-        .get_fee(&fee_rule)
-        .map(u64::from)
-        .map_err(|e: zcash_primitives::transaction::builder::FeeError<Zip317FeeError>| {
+    let builder_fee = builder.get_fee(&fee_rule).map(u64::from).map_err(
+        |e: zcash_primitives::transaction::builder::FeeError<Zip317FeeError>| {
             Error::Craft(format!("get_fee: {e:?}"))
-        })?;
+        },
+    )?;
     if builder_fee != fee {
         return Err(Error::Craft(format!(
             "fee mismatch — caller-supplied {fee}, builder {builder_fee}"
@@ -321,18 +508,49 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         Error::Craft("PCZT Creator rejected the PcztParts (unsupported tx version)".into())
     })?;
 
-    // Stamp every action's spend with its ZIP-32 derivation path so the device
-    // can locate the signing key (the device requires a path on every action).
-    let pczt = stamp_spend_derivations(pczt, &network, seed_fingerprint, account_index)?;
+    // Stamp ZIP-32 derivation paths only when an Orchard bundle is present.
+    // For Public→Public there is no Orchard bundle; `update_orchard_with` errors
+    // on an absent/empty bundle, so we gate it behind `has_orchard`.
+    let pczt = if has_orchard {
+        stamp_spend_derivations(pczt, &network, seed_fingerprint, account_index)?
+    } else {
+        pczt
+    };
 
     let pczt = IoFinalizer::new(pczt)
         .finalize_io()
         .map_err(|e| Error::Craft(format!("PCZT IoFinalizer: {e:?}")))?;
 
-    let pczt = Prover::new(pczt)
-        .create_orchard_proof(proving_key())
-        .map_err(|e| Error::Craft(format!("PCZT Prover (orchard): {e:?}")))?
-        .finish();
+    // Generate the Orchard proof only when the bundle exists.
+    let prover = Prover::new(pczt);
+    let pczt = if prover.requires_orchard_proof() {
+        prover
+            .create_orchard_proof(proving_key())
+            .map_err(|e| Error::Craft(format!("PCZT Prover (orchard): {e:?}")))?
+            .finish()
+    } else {
+        prover.finish()
+    };
+
+    // Stamp transparent `bip32_derivation`s. Done after IoFinalizer/Prover because
+    // these are signer metadata that do not affect the txid or sighash, and the
+    // transparent Updater role has no `tx_modifiable` gate. The device requires a
+    // `bip32_derivation` on every transparent input (it is the signing path in the
+    // PCZT flow) and on the transparent change output (so it is recognized as
+    // change). Skipped entirely for flows with no transparent inputs and no
+    // transparent change.
+    let pczt = if !transparent_inputs.is_empty() || transparent_change_stamp.is_some() {
+        stamp_transparent_derivations(
+            pczt,
+            &network,
+            seed_fingerprint,
+            account_index,
+            &transparent_inputs,
+            transparent_change_stamp,
+        )?
+    } else {
+        pczt
+    };
 
     let pczt_bytes = pczt.serialize();
 
@@ -341,20 +559,23 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         fee,
         anchor_height: target_height.saturating_sub(DEFAULT_TX_EXPIRY_DELTA),
         n_actions_orchard,
+        n_transparent_inputs,
+        n_transparent_outputs,
     })
 }
 
 /// Stamps **every** Orchard action's spend in the PCZT with the ZIP-32
 /// derivation path `m/32'/coin_type'/account'` and the wallet seed fingerprint.
 ///
-/// The Ledger device's PCZT parser requires a derivation path on every action
-/// (it builds one signing record per action and aborts with `BadState` if the
-/// path is missing — see `app-rust-zcash` `src/parser/pczt/orchard.rs`), so
-/// dummy-spend actions that the builder injects for change must be stamped too.
-/// This is safe: dummy spends are already signed host-side by the IO Finalizer
-/// (via `dummy_sk`), so the host never requests a device signature for those
-/// action indices, and the device only ever signs the indices it is asked to.
-/// All spends in a single-account transaction share the same path.
+/// Only called when an Orchard bundle is present. The Ledger device's PCZT
+/// parser requires a derivation path on every action (it builds one signing
+/// record per action and aborts with `BadState` if the path is missing — see
+/// `app-rust-zcash` `src/parser/pczt/orchard.rs`), so dummy-spend actions that
+/// the builder injects for change must be stamped too. This is safe: dummy
+/// spends are already signed host-side by the IO Finalizer (via `dummy_sk`),
+/// so the host never requests a device signature for those action indices, and
+/// the device only ever signs the indices it is asked to. All spends in a
+/// single-account transaction share the same path.
 fn stamp_spend_derivations(
     pczt: Pczt,
     network: &Network,
@@ -393,6 +614,130 @@ fn stamp_spend_derivations(
         .map(Updater::finish)
 }
 
+/// BIP-44 internal (change) scope. Transparent change addresses live on the
+/// internal chain; the Ledger device only accepts a change output whose
+/// `bip32_derivation` path has scope `1` (`check_bip44_compliance` with
+/// `is_change_path: true`).
+const TRANSPARENT_INTERNAL_SCOPE: u32 = 1;
+
+/// Builds the transparent BIP-44 derivation path
+/// `m/44'/coin_type'/account'/scope/address_index` as raw ZIP-32 child indices
+/// (the first three hardened, the last two non-hardened).
+///
+/// This matches what the Ledger device validates via `check_bip44_compliance`
+/// (purpose `44`, the network coin type) and — for change outputs — re-derives
+/// the pubkey from.
+fn bip44_transparent_path(
+    coin_type: u32,
+    account_index: u32,
+    scope: u32,
+    address_index: u32,
+) -> Result<Vec<u32>, Error> {
+    const HARDENED_OFFSET: u32 = 1 << 31;
+    if account_index >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "account_index {account_index} exceeds the ZIP-32 hardened range"
+        )));
+    }
+    if scope >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "transparent derivation scope {scope} must be non-hardened"
+        )));
+    }
+    if address_index >= HARDENED_OFFSET {
+        return Err(Error::Craft(format!(
+            "transparent address index {address_index} must be non-hardened"
+        )));
+    }
+    Ok(vec![
+        ChildIndex::hardened(44).index(),
+        ChildIndex::hardened(coin_type).index(),
+        ChildIndex::hardened(account_index).index(),
+        scope,
+        address_index,
+    ])
+}
+
+/// Stamps the transparent bundle's `bip32_derivation`s:
+///
+/// - **Every transparent input** gets a derivation keyed by its compressed
+///   pubkey at path `m/44'/coin_type'/account'/scope/address_index`. In the
+///   Ledger PCZT signing flow this path *is* the signing key locator — the
+///   device reads it from the PCZT (the sign APDU carries no path) and rejects
+///   inputs whose `bip32_derivation` is absent or not exactly one entry.
+/// - **The transparent change output** (when present) gets a derivation keyed by
+///   the change pubkey at path `m/44'/coin_type'/account'/1/address_index`, so
+///   the device classifies it as change (re-deriving the pubkey from the path
+///   and matching its hash against the output script) instead of showing it as a
+///   third-party recipient.
+///
+/// Regular (non-change) transparent recipient outputs are intentionally left
+/// without a derivation so the device displays them as external payments.
+///
+/// Derivations are pre-computed before entering the updater closure so path and
+/// parse errors surface as [`Error::Craft`]; the closure itself can only yield
+/// the transparent `UpdaterError` (invalid index).
+fn stamp_transparent_derivations(
+    pczt: Pczt,
+    network: &Network,
+    seed_fingerprint: [u8; 32],
+    account_index: u32,
+    transparent_inputs: &[TransparentInput],
+    change: Option<(usize, [u8; 33], u32)>,
+) -> Result<Pczt, Error> {
+    let coin_type = network.coin_type();
+
+    let mut input_derivations: Vec<([u8; 33], TransparentBip32Derivation)> =
+        Vec::with_capacity(transparent_inputs.len());
+    for tin in transparent_inputs {
+        let path = bip44_transparent_path(
+            coin_type,
+            account_index,
+            tin.derivation_scope,
+            tin.derivation_address_index,
+        )?;
+        let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
+            .map_err(|e| Error::Craft(format!("transparent input bip32 derivation: {e:?}")))?;
+        input_derivations.push((tin.pubkey, derivation));
+    }
+
+    let change_derivation = match change {
+        Some((index, pubkey, address_index)) => {
+            let path = bip44_transparent_path(
+                coin_type,
+                account_index,
+                TRANSPARENT_INTERNAL_SCOPE,
+                address_index,
+            )?;
+            let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
+                .map_err(|e| {
+                    Error::Craft(format!("transparent change bip32 derivation: {e:?}"))
+                })?;
+            Some((index, pubkey, derivation))
+        }
+        None => None,
+    };
+
+    Updater::new(pczt)
+        .update_transparent_with(|mut updater| {
+            for (i, (pubkey, derivation)) in input_derivations.into_iter().enumerate() {
+                updater.update_input_with(i, |mut input| {
+                    input.set_bip32_derivation(pubkey, derivation);
+                    Ok(())
+                })?;
+            }
+            if let Some((index, pubkey, derivation)) = change_derivation {
+                updater.update_output_with(index, |mut output| {
+                    output.set_bip32_derivation(pubkey, derivation);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Craft(format!("PCZT Updater (transparent bip32): {e:?}")))
+        .map(Updater::finish)
+}
+
 fn add_spend(
     builder: &mut Builder<'_, Network, ()>,
     fvk: &OrchardFvk,
@@ -414,6 +759,61 @@ fn add_spend(
     builder
         .add_orchard_spend::<Zip317FeeError>(fvk.clone(), note, merkle_path)
         .map_err(|e| Error::Craft(format!("add_orchard_spend: {e:?}")))?;
+    Ok(())
+}
+
+/// Add one transparent P2PKH UTXO to the builder.
+///
+/// `txid` must be in **internal (little-endian) byte order** — this is the
+/// byte order `OutPoint::new([u8;32], u32)` stores internally and what the
+/// sighash computation uses. Zcash/Bitcoin display txids in big-endian (reversed)
+/// order; callers sourcing txids from ledger-live's display representation must
+/// reverse the 32-byte array before passing.
+///
+/// `script_pubkey` must be **raw script bytes** with no length prefix. A standard
+/// P2PKH scriptPubKey is 25 bytes: `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG`.
+/// `Script::read` expects a CompactSize-prefixed encoding; we prepend the
+/// CompactSize varint before calling it (the inner `script::Code` type is private
+/// in `zcash_transparent` and cannot be named from outside the crate).
+fn add_transparent_input(
+    builder: &mut Builder<'_, Network, ()>,
+    tin: &TransparentInput,
+) -> Result<(), Error> {
+    use zcash_transparent::{address::Script, bundle::TxOut};
+
+    let pubkey = secp256k1::PublicKey::from_slice(&tin.pubkey)
+        .map_err(|e| Error::Craft(format!("invalid transparent pubkey: {e}")))?;
+
+    // OutPoint::new takes [u8;32] in internal byte order (verified: bundle.rs:168).
+    let outpoint = zcash_transparent::bundle::OutPoint::new(tin.txid, tin.vout);
+
+    let value = Zatoshis::from_u64(tin.value)
+        .map_err(|e| Error::Craft(format!("transparent input value out of range: {e}")))?;
+
+    // Script::read expects a CompactSize-prefixed encoding (address.rs:63-68).
+    // We prepend the length as a single byte, which is only valid while the length
+    // fits a one-byte CompactSize: values 0–252 (0xFC) encode as one byte, while
+    // 253+ require a multi-byte varint (0xFD + u16, etc.). 252 is therefore the
+    // CompactSize single-byte boundary, not an arbitrary policy cap. All standard
+    // scripts fit comfortably (P2PKH = 25 bytes, P2SH = 23 bytes).
+    let script_len = tin.script_pubkey.len();
+    if script_len > 252 {
+        return Err(Error::Craft(format!(
+            "scriptPubKey length ({script_len} bytes) exceeds the single-byte CompactSize limit (252 bytes); larger scripts would need a multi-byte length prefix"
+        )));
+    }
+    let mut prefixed = Vec::with_capacity(1 + script_len);
+    prefixed.push(script_len as u8);
+    prefixed.extend_from_slice(&tin.script_pubkey);
+
+    let script_pubkey = Script::read(prefixed.as_slice())
+        .map_err(|e| Error::Craft(format!("invalid scriptPubKey: {e}")))?;
+
+    let coin = TxOut::new(value, script_pubkey);
+
+    builder
+        .add_transparent_p2pkh_input(pubkey, outpoint, coin)
+        .map_err(|e| Error::Craft(format!("add_transparent_p2pkh_input: {e:?}")))?;
     Ok(())
 }
 
@@ -462,19 +862,26 @@ const ORCHARD_MIN_ACTIONS: u64 = 2;
 /// `fee = MARGINAL_FEE × max(GRACE_ACTIONS, transparent_actions + sapling_actions + orchard_actions)`
 ///
 /// where:
-///   - `transparent_actions = max(t_in_size / STD_IN, t_out_size / STD_OUT)`
-///     (we have no transparent inputs in this task; each standard output counts as 1)
-///   - `sapling_actions = max(n_sapling_in, n_sapling_out)` (0 here)
+///   - `transparent_actions = max(t_in, t_out)` (standard P2PKH sizing: each
+///     input/output counts as one standard unit)
+///   - `sapling_actions = 0` (Sapling not in scope)
 ///   - `orchard_actions` is computed by `BundleType::DEFAULT::num_actions`
-///     which pads to a minimum of `MIN_ACTIONS = 2`.
-fn zip317_fee(n_spends: u32, n_orchard_outputs: u32, n_transparent_outputs: u32) -> u64 {
+///     which pads to a minimum of `MIN_ACTIONS = 2` when any Orchard items present.
+fn zip317_fee(
+    n_spends: u32,
+    n_orchard_outputs: u32,
+    n_transparent_inputs: u32,
+    n_transparent_outputs: u32,
+) -> u64 {
     let requested = u64::from(std::cmp::max(n_spends, n_orchard_outputs));
     let orchard_actions = if n_spends == 0 && n_orchard_outputs == 0 {
         0
     } else {
         std::cmp::max(ORCHARD_MIN_ACTIONS, requested)
     };
-    let transparent_actions = u64::from(n_transparent_outputs);
+    // ZIP-317 transparent logical actions = max(t_in, t_out).
+    // For standard P2PKH each input/output is one standard-sized unit.
+    let transparent_actions = u64::from(std::cmp::max(n_transparent_inputs, n_transparent_outputs));
     let sapling_actions = 0u64;
     let logical = transparent_actions + sapling_actions + orchard_actions;
     MARGINAL_FEE * std::cmp::max(GRACE_ACTIONS, logical)
@@ -499,11 +906,12 @@ mod tests {
     }
 
     /// Build a one-leaf ShardTree containing `cmx`, returning `(anchor, path)`.
-    /// Mirrors the orchard 0.14 PCZT test pattern in
-    /// `~/.cargo/registry/src/.../orchard-0.14.0/src/pczt.rs::tests::shielded_bundle`.
     fn synthetic_anchor_and_path(
         leaf: MerkleHashOrchard,
-    ) -> ([u8; 32], incrementalmerkletree::MerklePath<MerkleHashOrchard, 32>) {
+    ) -> (
+        [u8; 32],
+        incrementalmerkletree::MerklePath<MerkleHashOrchard, 32>,
+    ) {
         let mut tree: ShardTree<MemoryShardStore<MerkleHashOrchard, u32>, 32, 16> =
             ShardTree::new(MemoryShardStore::empty(), 100);
         tree.append(
@@ -516,14 +924,15 @@ mod tests {
         .unwrap();
         let root = tree.root_at_checkpoint_id(&0).unwrap().unwrap();
         let position = tree.max_leaf_position(None).unwrap().unwrap();
-        let mp = tree.witness_at_checkpoint_id(position, &0).unwrap().unwrap();
+        let mp = tree
+            .witness_at_checkpoint_id(position, &0)
+            .unwrap()
+            .unwrap();
         (root.to_bytes(), mp)
     }
 
     /// Build a multi-leaf ShardTree containing `leaves` in order, returning the
-    /// shared anchor and one Merkle path per leaf. All leaves are marked so a
-    /// witness can be produced for each; a single checkpoint is taken after the
-    /// last append so every path shares the same anchor.
+    /// shared anchor and one Merkle path per leaf.
     fn synthetic_anchor_and_paths(
         leaves: &[MerkleHashOrchard],
     ) -> (
@@ -555,8 +964,7 @@ mod tests {
         (root.to_bytes(), paths)
     }
 
-    /// NU5 (Orchard) activation heights — hardcoded since `Network` does not
-    /// expose them via `Parameters` in 0.9.
+    /// NU5 (Orchard) activation heights.
     fn nu5_activation_height(network: Network) -> u32 {
         match network {
             Network::MainNetwork => 1_687_104,
@@ -564,10 +972,7 @@ mod tests {
         }
     }
 
-    /// Make a single-spend BuildInputs that balances exactly (no change). The
-    /// spend value is set to `out_value + fee` so `total_in == total_out + fee`
-    /// and no change output is produced. The leaf's commitment is computed from
-    /// the actual spend value so the builder's anchor-mismatch check passes.
+    /// Make a single-spend BuildInputs that balances exactly (no change).
     fn make_single_spend_inputs(
         network: Network,
         out_destination: Destination,
@@ -579,19 +984,14 @@ mod tests {
         let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
             .into_option()
             .unwrap();
-        // Exact ZIP-317 fee for the no-change layout (caller-owned per FR-4):
-        //   - Private→Private: 1 spend + 1 orchard output → orchard=2 → 10_000.
-        //   - Private→Public:  1 spend + 1 transparent output → orchard=2, t=1
-        //     → 15_000.
         let fee = match &out_destination {
-            Destination::Orchard(_) => zip317_fee(1, 1, 0),
-            Destination::Transparent(_) => zip317_fee(1, 0, 1),
+            Destination::Orchard(_) => zip317_fee(1, 1, 0, 0),
+            Destination::Transparent(_) => zip317_fee(1, 0, 0, 1),
         };
         let spend_value = out_value + fee;
-        let note =
-            Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
-                .into_option()
-                .unwrap();
+        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
+            .into_option()
+            .unwrap();
         let cmx = ExtractedNoteCommitment::from(note.commitment());
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         let (anchor, path) = synthetic_anchor_and_path(leaf);
@@ -601,9 +1001,12 @@ mod tests {
         BuildInputs {
             network,
             target_height: nu5_activation_height(network) + 1,
-            orchard_fvk: fvk,
+            orchard_fvk: Some(fvk),
             ovk,
-            change_address: change,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -615,11 +1018,57 @@ mod tests {
                 rseed: *rseed.as_bytes(),
                 merkle_path: path,
             }],
+            transparent_inputs: vec![],
             outputs: vec![OutputRequest {
                 destination: out_destination,
                 value: out_value,
                 memo: None,
             }],
+        }
+    }
+
+    /// Standard P2PKH scriptPubKey (25 bytes) for a 20-byte hash.
+    fn make_p2pkh_script(hash: [u8; 20]) -> Vec<u8> {
+        let mut s = Vec::with_capacity(25);
+        s.push(0x76); // OP_DUP
+        s.push(0xa9); // OP_HASH160
+        s.push(0x14); // push 20 bytes
+        s.extend_from_slice(&hash);
+        s.push(0x88); // OP_EQUALVERIFY
+        s.push(0xac); // OP_CHECKSIG
+        s
+    }
+
+    /// A deterministic compressed secp256k1 pubkey (33 bytes) for testing.
+    fn make_test_pubkey() -> [u8; 33] {
+        use secp256k1::{Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[0x01u8; 32]).unwrap();
+        secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+    }
+
+    /// HASH160 (RIPEMD160 ∘ SHA256) of a compressed pubkey — the value that a
+    /// standard P2PKH scriptPubKey commits to. `add_transparent_p2pkh_input`
+    /// rejects an input whose scriptPubKey hash does not equal this.
+    fn pubkey_hash160(pubkey: &[u8; 33]) -> [u8; 20] {
+        use bitcoin::hashes::{hash160, Hash};
+        hash160::Hash::hash(pubkey).to_byte_array()
+    }
+
+    /// Make a minimal TransparentInput for unit tests. The scriptPubKey is the
+    /// real P2PKH script paying to `hash160(pubkey)`, so the builder's
+    /// pubkey↔script consistency check passes.
+    fn make_transparent_input(value: u64) -> TransparentInput {
+        let pubkey = make_test_pubkey();
+        TransparentInput {
+            pubkey,
+            // txid in internal (little-endian) byte order.
+            txid: [0x01u8; 32],
+            vout: 0,
+            script_pubkey: make_p2pkh_script(pubkey_hash160(&pubkey)),
+            value,
+            derivation_scope: 0,
+            derivation_address_index: 0,
         }
     }
 
@@ -643,9 +1092,12 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork,
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: change,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0xff; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -657,6 +1109,7 @@ mod tests {
                 rseed: *rseed.as_bytes(),
                 merkle_path: path,
             }],
+            transparent_inputs: vec![],
             outputs: vec![OutputRequest {
                 destination: Destination::Orchard(dummy_recipient),
                 value: 50,
@@ -671,20 +1124,24 @@ mod tests {
     }
 
     #[test]
-    fn empty_spends_returns_craft_error() {
+    fn empty_spends_and_transparent_inputs_returns_craft_error() {
         let fvk = make_fvk();
         let change = fvk.address_at(0u32, Scope::Internal);
         let inputs = BuildInputs {
             network: Network::MainNetwork,
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: change,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
             fee: 10_000,
             spends: vec![],
+            transparent_inputs: vec![],
             outputs: vec![OutputRequest {
                 destination: Destination::Orchard(fvk.address_at(0u32, Scope::External)),
                 value: 1,
@@ -693,7 +1150,7 @@ mod tests {
         };
         let err = build_transaction(inputs).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("spends list is empty")),
+            matches!(&err, Error::Craft(s) if s.contains("no inputs")),
             "got: {err}"
         );
     }
@@ -715,9 +1172,12 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork,
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: change,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -729,6 +1189,7 @@ mod tests {
                 rseed: *rseed.as_bytes(),
                 merkle_path: path,
             }],
+            transparent_inputs: vec![],
             outputs: vec![],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -744,21 +1205,32 @@ mod tests {
         let change = fvk.address_at(0u32, Scope::Internal);
         let inputs = BuildInputs {
             network: Network::MainNetwork,
-            target_height: 100, // far before NU5 activation
-            orchard_fvk: fvk.clone(),
+            target_height: 100,
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: change,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor: [0u8; 32],
             seed_fingerprint: [0x42; 32],
             account_index: 0,
             fee: 10_000,
             spends: vec![],
-            outputs: vec![],
+            transparent_inputs: vec![make_transparent_input(20_000)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(TransparentAddress::PublicKeyHash(
+                    [0x11u8; 20],
+                )),
+                value: 1,
+                memo: None,
+            }],
         };
         let err = build_transaction(inputs).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("Orchard (NU5) is not active")),
-            "got: {err}"
+            matches!(&err, Error::Craft(s)
+                if s.contains("NU5 is not active") && !s.contains("Orchard")),
+            "transparent-only NU5 error must not be attributed to Orchard, got: {err}"
         );
     }
 
@@ -785,52 +1257,191 @@ mod tests {
 
     #[test]
     fn zip317_fee_one_spend_one_orchard_output_is_10000() {
-        // orchard padded to MIN_ACTIONS=2, transparent=0 → logical=2 → 10000.
-        assert_eq!(zip317_fee(1, 1, 0), 10_000);
+        assert_eq!(zip317_fee(1, 1, 0, 0), 10_000);
     }
 
     #[test]
-    fn zip317_fee_one_spend_one_orchard_one_transparent_is_15000() {
-        // orchard=2 (padded), transparent=1 → logical=3 → 15_000.
-        assert_eq!(zip317_fee(1, 1, 1), 15_000);
+    fn zip317_fee_one_spend_one_orchard_one_transparent_out_is_15000() {
+        // orchard=2 (padded), transparent=max(0,1)=1 → logical=3 → 15_000.
+        assert_eq!(zip317_fee(1, 1, 0, 1), 15_000);
     }
 
     #[test]
     fn zip317_fee_two_spends_three_outputs_is_15000() {
-        // orchard = max(2 padded, max(2,3)) = 3 → logical=3 → 15_000.
-        assert_eq!(zip317_fee(2, 3, 0), 15_000);
+        assert_eq!(zip317_fee(2, 3, 0, 0), 15_000);
     }
 
     #[test]
     fn zip317_change_output_does_not_bump_fee_when_grace_bound() {
-        // 1 spend + 1 orchard recipient output. Adding the change output makes
-        // it 2 orchard outputs, but orchard actions are already padded to
-        // MIN_ACTIONS=2, so the fee stays at the grace-bound 10_000 either way.
-        assert_eq!(zip317_fee(1, 1, 0), 10_000); // no change
-        assert_eq!(zip317_fee(1, 2, 0), 10_000); // with change, still 10_000
+        assert_eq!(zip317_fee(1, 1, 0, 0), 10_000);
+        assert_eq!(zip317_fee(1, 2, 0, 0), 10_000);
     }
 
     #[test]
     fn zip317_change_output_bumps_fee_past_grace_bound() {
-        // 1 spend + 2 orchard recipient outputs. Without change orchard=2 →
-        // 10_000; the change output makes 3 orchard outputs → orchard=3 →
-        // 15_000. This is the band where a sub-change-output surplus is
-        // unrepresentable (see surplus-band validation test).
-        assert_eq!(zip317_fee(1, 2, 0), 10_000); // no change
-        assert_eq!(zip317_fee(1, 3, 0), 15_000); // with change
+        assert_eq!(zip317_fee(1, 2, 0, 0), 10_000);
+        assert_eq!(zip317_fee(1, 3, 0, 0), 15_000);
     }
 
     #[test]
     fn zip317_no_spends_no_outputs_is_grace_bound() {
-        // No actions at all → orchard_actions=0, logical=0 → max(grace=2, 0)=2 → 10_000.
-        assert_eq!(zip317_fee(0, 0, 0), 10_000);
+        assert_eq!(zip317_fee(0, 0, 0, 0), 10_000);
+    }
+
+    // ── ZIP-317 with transparent inputs (new) ─────────────────────────────────
+
+    #[test]
+    fn zip317_one_transparent_in_one_transparent_out_is_10000() {
+        // transparent_actions = max(1,1) = 1; orchard = 0; logical = 1 → grace → 10_000.
+        assert_eq!(zip317_fee(0, 0, 1, 1), 10_000);
+    }
+
+    #[test]
+    fn zip317_two_transparent_in_one_transparent_out_is_10000() {
+        // transparent_actions = max(2,1) = 2; orchard = 0; logical = 2 → grace → 10_000.
+        assert_eq!(zip317_fee(0, 0, 2, 1), 10_000);
+    }
+
+    #[test]
+    fn zip317_one_orchard_spend_one_orchard_out_one_transparent_in() {
+        // orchard = max(2, max(1,1)) = 2; transparent = max(1,0) = 1; logical = 3 → 15_000.
+        assert_eq!(zip317_fee(1, 1, 1, 0), 15_000);
+    }
+
+    // ── scriptPubKey encoding and txid endianness pinning ─────────────────────
+
+    /// Verify that a standard 25-byte P2PKH scriptPubKey round-trips through the
+    /// exact encoding the production `add_transparent_input` helper uses: a raw
+    /// script with a prepended CompactSize length prefix, parsed by
+    /// `Script::read`. This pins the convention (raw scriptPubKey bytes from the
+    /// host, CompactSize-prefixed before `Script::read`).
+    #[test]
+    fn p2pkh_script_pubkey_compactsize_roundtrip() {
+        use zcash_transparent::address::Script;
+        let hash = [0xabu8; 20];
+        let raw = make_p2pkh_script(hash);
+        assert_eq!(raw.len(), 25, "standard P2PKH script is exactly 25 bytes");
+
+        // Mirror production: prepend the 1-byte CompactSize varint before Script::read.
+        let mut prefixed = Vec::with_capacity(1 + raw.len());
+        prefixed.push(raw.len() as u8);
+        prefixed.extend_from_slice(&raw);
+
+        let script = Script::read(prefixed.as_slice())
+            .expect("Script::read must accept a CompactSize-prefixed P2PKH script");
+
+        // Writing it back reproduces the CompactSize-prefixed encoding exactly.
+        let mut written = Vec::new();
+        script.write(&mut written).unwrap();
+        assert_eq!(
+            written, prefixed,
+            "Script must round-trip to its prefixed form"
+        );
+        assert_eq!(script.serialized_size(), prefixed.len());
+
+        let value = Zatoshis::from_u64(10_000).unwrap();
+        let txout = zcash_transparent::bundle::TxOut::new(value, script);
+        assert_eq!(u64::from(txout.value()), 10_000);
+    }
+
+    /// Verify txid byte order: OutPoint::new takes internal (little-endian)
+    /// byte order and returns the same bytes via txid().as_ref().
+    #[test]
+    fn txid_internal_byte_order_roundtrip() {
+        let txid_le: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
+        let outpoint = zcash_transparent::bundle::OutPoint::new(txid_le, 3);
+        let retrieved: &[u8; 32] = outpoint.txid().as_ref();
+        assert_eq!(
+            *retrieved, txid_le,
+            "OutPoint stores txid in the byte order supplied to ::new (internal/LE)"
+        );
+        assert_eq!(outpoint.n(), 3);
+    }
+
+    /// Verify that an invalid 33-byte pubkey (all 0xff) is rejected.
+    #[test]
+    fn invalid_transparent_pubkey_returns_craft_error() {
+        let fvk = make_fvk();
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let t_dest = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 1);
+        let out_value = 10_000u64;
+        let inputs = BuildInputs {
+            network: Network::MainNetwork,
+            target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: [0xffu8; 33], // invalid
+                txid: [0x01u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script([0x11u8; 20]),
+                value: out_value + fee,
+                derivation_scope: 0,
+                derivation_address_index: 0,
+            }],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_dest),
+                value: out_value,
+                memo: None,
+            }],
+        };
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("invalid transparent pubkey")),
+            "got: {err}"
+        );
+    }
+
+    /// Verify that a missing transparent_change_address when surplus exists and
+    /// no Orchard bundle is present returns the expected error.
+    #[test]
+    fn missing_transparent_change_address_returns_craft_error() {
+        let fvk = make_fvk();
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let t_dest = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 1); // 10_000
+        let inputs = BuildInputs {
+            network: Network::MainNetwork,
+            target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(change),
+            transparent_change_address: None, // intentionally missing
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(30_000)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_dest),
+                value: 10_000,
+                memo: None,
+            }],
+        };
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("transparent change required")),
+            "got: {err}"
+        );
     }
 
     // ── Happy-path tests (proof generation; slow on first run) ────────────────
     //
-    // These tests exercise the full PCZT pipeline including Halo 2 proof
-    // generation (~2-5 s on first call, cached afterwards). They are NOT
-    // `#[ignore]`'d because we need the coverage they produce on craft.rs.
+    // These tests exercise the full PCZT pipeline. They are NOT `#[ignore]`'d
+    // because we need the coverage they produce on craft.rs.
 
     #[test]
     fn private_to_private_produces_valid_pczt() {
@@ -850,6 +1461,8 @@ mod tests {
         // MIN_ACTIONS = 2, so n_actions >= 1 holds comfortably.
         assert!(out.n_actions_orchard >= 1);
         assert!(out.fee >= 10_000);
+        assert_eq!(out.n_transparent_inputs, 0);
+        assert_eq!(out.n_transparent_outputs, 0);
     }
 
     #[test]
@@ -964,6 +1577,8 @@ mod tests {
         let out = build_transaction(inputs).expect("private→public must succeed");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
         assert!(out.n_actions_orchard >= 1);
+        assert_eq!(out.n_transparent_inputs, 0);
+        assert_eq!(out.n_transparent_outputs, 1);
     }
 
     #[test]
@@ -995,10 +1610,13 @@ mod tests {
 
         let out_value = 10_000u64;
         // 2 spends + 1 recipient + 1 change = 2 orchard outputs → 10_000.
-        let fee = zip317_fee(2, 2, 0);
+        let fee = zip317_fee(2, 2, 0, 0);
         let total_in: u64 = spend_values.iter().sum();
         let change = total_in - out_value - fee;
-        assert!(change > 0, "test must exercise a real (positive) change output");
+        assert!(
+            change > 0,
+            "test must exercise a real (positive) change output"
+        );
 
         let spends = (0..2)
             .map(|i| OrchardSpendInput {
@@ -1013,14 +1631,18 @@ mod tests {
         let inputs = BuildInputs {
             network,
             target_height: nu5_activation_height(network) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
-            change_address: fvk.address_at(0u32, Scope::Internal),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
             fee,
             spends,
+            transparent_inputs: vec![],
             outputs: vec![OutputRequest {
                 destination: Destination::Orchard(recipient),
                 value: out_value,
@@ -1033,15 +1655,6 @@ mod tests {
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
         // 2 spends + 2 outputs (recipient + change) → exactly 2 orchard actions.
         assert_eq!(out.n_actions_orchard, 2);
-
-        let parsed = Pczt::parse(&out.pczt_bytes).expect("PCZT must parse");
-        Updater::new(parsed)
-            .update_orchard_with(|updater| {
-                // Both actions carry an output note (recipient + change).
-                assert_eq!(updater.bundle().actions().len(), 2);
-                Ok(())
-            })
-            .expect("updater read-back must succeed");
     }
 
     #[test]
@@ -1070,13 +1683,16 @@ mod tests {
         // surplus cannot fund the +5_000 extra-action cost → rejected. This is
         // the band the old dead "surplus-into-fee" branch tried (and failed) to
         // absorb.
-        let fee = 10_000u64; // == zip317_fee(1, 2, 0)
+        let fee = 10_000u64; // == zip317_fee(1, 2, 0, 0)
         let inputs = BuildInputs {
             network,
             target_height: nu5_activation_height(network) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: fvk.address_at(0u32, Scope::Internal),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1088,6 +1704,7 @@ mod tests {
                 rseed: *rseed.as_bytes(),
                 merkle_path: path,
             }],
+            transparent_inputs: vec![],
             outputs: vec![
                 OutputRequest {
                     destination: Destination::Orchard(recipient),
@@ -1130,9 +1747,12 @@ mod tests {
         let inputs = BuildInputs {
             network,
             target_height: nu5_activation_height(network) + 1,
-            orchard_fvk: fvk.clone(),
+            orchard_fvk: Some(fvk.clone()),
             ovk: None,
-            change_address: fvk.address_at(0u32, Scope::Internal),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
             anchor,
             seed_fingerprint: [0x42; 32],
             account_index: 0,
@@ -1144,6 +1764,7 @@ mod tests {
                 rseed: *rseed.as_bytes(),
                 merkle_path: path,
             }],
+            transparent_inputs: vec![],
             outputs: vec![OutputRequest {
                 destination: Destination::Orchard(recipient),
                 value: 10_000,
@@ -1165,5 +1786,302 @@ mod tests {
         // Subsequent call must return the same pointer (same OnceLock cell).
         let pk2: *const ProvingKey = proving_key();
         assert_eq!(pk1, pk2, "proving_key() must return cached pointer");
+    }
+
+    // ── Public→Public happy path ───────────────────────────────────────────────
+
+    /// Public→Public: one transparent input + two transparent outputs (recipient + change).
+    /// Must produce a PCZT with a transparent bundle and NO Orchard bundle.
+    #[test]
+    fn public_to_public_produces_transparent_only_pczt() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
+        let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
+        // 1 t_in + 2 t_out → max(1,2) = 2 transparent actions → grace → 10_000.
+        let fee = zip317_fee(0, 0, 1, 2); // 10_000
+        let out_value = 15_000u64;
+        let change_value = 5_000u64;
+        let total_in = out_value + change_value + fee;
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(make_test_pubkey()),
+            transparent_change_address_index: Some(0),
+            anchor: [0u8; 32], // ignored for transparent-only
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→public must succeed");
+        assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert_eq!(
+            out.n_actions_orchard, 0,
+            "Public→Public must have no Orchard actions"
+        );
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(out.n_transparent_outputs, 2, "recipient + change");
+        assert_eq!(out.fee, fee);
+    }
+
+    /// Public→Public: re-parse the serialized PCZT and assert that the device's
+    /// hard requirements are met — every transparent input carries exactly one
+    /// `bip32_derivation` (its signing path), the change output carries one (so
+    /// the device recognizes it as change), and the recipient output carries none
+    /// (so the device shows it as an external payment).
+    #[test]
+    fn public_to_public_stamps_transparent_bip32_derivations() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let input_pubkey = make_test_pubkey();
+        let change_pubkey = {
+            use secp256k1::{Secp256k1, SecretKey};
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+        };
+        let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
+        let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 2);
+        let out_value = 15_000u64;
+        let change_value = 5_000u64;
+        let total_in = out_value + change_value + fee;
+        let seed_fingerprint = [0x42u8; 32];
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(change_pubkey),
+            transparent_change_address_index: Some(7),
+            anchor: [0u8; 32],
+            seed_fingerprint,
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: input_pubkey,
+                txid: [0x01u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script(pubkey_hash160(&input_pubkey)),
+                value: total_in,
+                derivation_scope: 0,
+                derivation_address_index: 3,
+            }],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→public must succeed");
+        let parsed = Pczt::parse(&out.pczt_bytes).expect("PCZT must re-parse");
+
+        Updater::new(parsed)
+            .update_transparent_with(|updater| {
+                let bundle = updater.bundle();
+
+                // Input: exactly one derivation keyed by the input pubkey, at the
+                // expected external signing path m/44'/133'/0'/0/3.
+                let input = &bundle.inputs()[0];
+                assert_eq!(
+                    input.bip32_derivation().len(),
+                    1,
+                    "device requires exactly one transparent input bip32 derivation"
+                );
+                let in_deriv = input
+                    .bip32_derivation()
+                    .get(&input_pubkey)
+                    .expect("input derivation must be keyed by the input pubkey");
+                // `bip32::ChildNumber::index()` strips the hardened bit, so compare
+                // de-hardened indices and hardened flags separately. Expected
+                // external signing path m/44'/133'/0'/0/3.
+                let in_indices: Vec<u32> =
+                    in_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let in_hardened: Vec<bool> = in_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.is_hardened())
+                    .collect();
+                assert_eq!(in_indices, vec![44, 133, 0, 0, 3]);
+                assert_eq!(in_hardened, vec![true, true, true, false, false]);
+                assert_eq!(in_deriv.seed_fingerprint(), &seed_fingerprint);
+
+                // Outputs: recipient (index 0) has no derivation; change (index 1,
+                // appended last) has one, keyed by the change pubkey, at the
+                // internal change path m/44'/133'/0'/1/7.
+                let recipient = &bundle.outputs()[0];
+                assert!(
+                    recipient.bip32_derivation().is_empty(),
+                    "recipient output must have no bip32 derivation"
+                );
+                let change = &bundle.outputs()[1];
+                let out_deriv = change
+                    .bip32_derivation()
+                    .get(&change_pubkey)
+                    .expect("change output must carry a derivation keyed by the change pubkey");
+                // Expected internal change path m/44'/133'/0'/1/7.
+                let out_indices: Vec<u32> =
+                    out_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let out_hardened: Vec<bool> = out_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.is_hardened())
+                    .collect();
+                assert_eq!(out_indices, vec![44, 133, 0, 1, 7]);
+                assert_eq!(out_hardened, vec![true, true, true, false, false]);
+                assert_eq!(out_deriv.seed_fingerprint(), &seed_fingerprint);
+                Ok(())
+            })
+            .expect("transparent updater read-back must succeed");
+    }
+
+    /// Public→Public with exact balance (no change needed).
+    #[test]
+    fn public_to_public_exact_balance_no_change() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 1); // 10_000
+        let out_value = 10_000u64;
+        let total_in = out_value + fee;
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None, // no change needed
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→public exact balance must succeed");
+        assert_eq!(out.n_actions_orchard, 0);
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(out.n_transparent_outputs, 1);
+    }
+
+    // ── Public→Private happy path ──────────────────────────────────────────────
+
+    /// Public→Private: one transparent input + one Orchard output (anchor-only).
+    ///
+    /// There are no real Orchard spends, so the builder injects dummy (value-0)
+    /// spends to populate the bundle. A dummy spend's in-circuit Merkle-root
+    /// check is disabled, so any validly-encoded anchor is accepted — this is the
+    /// exact situation `zcash_sync::witness::fetch_orchard_anchor` serves (it
+    /// returns an anchor with an empty witness list). The result must carry BOTH
+    /// a transparent bundle (the input) and an Orchard bundle (output + dummies).
+    #[test]
+    fn public_to_private_produces_orchard_output_pczt() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        // A validly-encoded anchor from a synthetic one-leaf tree. Its value is
+        // irrelevant here because only value-0 dummy spends are present, but it
+        // must decode via `orchard::Anchor::from_bytes`.
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let anchor_note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed)
+            .into_option()
+            .unwrap();
+        let leaf =
+            MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
+        let (anchor, _path) = synthetic_anchor_and_path(leaf);
+
+        // 1 transparent input, 1 Orchard output, no change (exact balance).
+        // orchard_actions = max(MIN=2, max(0,1)) = 2; transparent = max(1,0) = 1;
+        // logical = 3 → 15_000.
+        let fee = zip317_fee(0, 1, 1, 0);
+        assert_eq!(fee, 15_000);
+        let out_value = 10_000u64;
+        let total_in = out_value + fee;
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None, // exact balance: no change
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Orchard(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→private must succeed");
+        assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert_eq!(&out.pczt_bytes[4..8], &1u32.to_le_bytes());
+        // The Orchard bundle pads to MIN_ACTIONS = 2 (one real output + dummies).
+        assert!(
+            out.n_actions_orchard >= 1,
+            "Public→Private must carry an Orchard bundle"
+        );
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(
+            out.n_transparent_outputs, 0,
+            "exact balance leaves no transparent change"
+        );
+        assert_eq!(out.fee, fee);
+    }
+
+    /// Regression: existing Private→Private tests still pass with the new fields
+    /// `transparent_inputs: vec![]` and `transparent_change_address: None`.
+    #[test]
+    fn private_to_private_regression_with_new_fields() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let mut inputs = make_single_spend_inputs(
+            Network::MainNetwork,
+            Destination::Orchard(recipient),
+            10_000,
+        );
+        inputs.transparent_inputs = vec![];
+        inputs.transparent_change_address = None;
+        let out = build_transaction(inputs).expect("regression: private→private must still pass");
+        assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert!(out.n_actions_orchard >= 1);
     }
 }

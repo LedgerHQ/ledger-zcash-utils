@@ -260,6 +260,63 @@ mod tests {
         }
     }
 
+    // ── Regression: anchor-only path returns a non-zero, frontier-derived anchor ─
+    //
+    // Guards the Public→Private (transparent inputs + Orchard output) flow, which
+    // calls `build_witnesses` with empty `notes` and empty `shard_leaves` — only a
+    // real on-chain frontier. In that mode the per-note `root(cmx) == anchor`
+    // cross-check (step 6) runs zero times, so this test is the sole assertion that
+    // the anchor is (a) derived from the frontier and (b) never the all-zero
+    // sentinel. A bogus `[0u8; 32]` anchor would be accepted locally but rejected
+    // by validators.
+    #[test]
+    fn anchor_only_path_returns_nonzero_frontier_anchor() {
+        // Non-empty frontier with a handful of (empty) leaves — stands in for the
+        // real `TreeState.orchard_tree` bytes fetched at the anchor height.
+        let (frontier_bytes, frontier) = build_frontier_bytes(4);
+        let expected_anchor = frontier.root().to_bytes();
+
+        let inputs = WitnessInputs {
+            cap_roots: vec![],
+            frontier_bytes,
+            anchor_height: 1,
+            shard_leaves: vec![],
+            notes: vec![],
+        };
+
+        let out = build_witnesses(&inputs).expect("anchor-only build_witnesses failed");
+
+        // No notes requested → no witnesses produced.
+        assert!(out.witnesses.is_empty());
+        // The anchor is the real frontier root, not a fabricated value.
+        assert_eq!(out.anchor, expected_anchor);
+        // And it is never the all-zero sentinel the reviewer worried about.
+        assert_ne!(out.anchor, [0u8; 32]);
+    }
+
+    // ── Regression: empty-frontier (genesis) anchor is the non-zero empty root ───
+    //
+    // The only "empty" anchor scenario. Confirms it resolves to the Orchard
+    // empty-tree root (uncommitted leaf = pallas::Base(2)), which is a fixed,
+    // non-zero constant — emphatically not `[0u8; 32]`.
+    #[test]
+    fn empty_frontier_anchor_is_nonzero_empty_root() {
+        let inputs = WitnessInputs {
+            cap_roots: vec![],
+            frontier_bytes: vec![],
+            anchor_height: 1,
+            shard_leaves: vec![],
+            notes: vec![],
+        };
+
+        let out = build_witnesses(&inputs).expect("genesis anchor-only build_witnesses failed");
+
+        let expected_empty =
+            <MerkleHashOrchard as Hashable>::empty_root(Level::from(ORCHARD_DEPTH)).to_bytes();
+        assert_eq!(out.anchor, expected_empty);
+        assert_ne!(out.anchor, [0u8; 32]);
+    }
+
     // ── 5. Invalid cmx bytes (off-curve) → Error::InvalidLeaf ────────────────
 
     #[test]

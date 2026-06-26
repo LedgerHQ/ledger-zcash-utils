@@ -3208,6 +3208,7 @@ dependencies = [
  "rand_core",
  "rayon",
  "sapling-crypto",
+ "secp256k1",
  "shardtree",
  "thiserror 1.0.69",
  "time",
@@ -3253,6 +3254,8 @@ dependencies = [
  "zcash_keys",
  "zcash_primitives",
  "zcash_protocol",
+ "zcash_transparent",
+ "zip32",
 ]
 
 [[package]]

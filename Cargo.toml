@@ -17,8 +17,7 @@ default-members = ["crates/zcash-crypto"]
 # Zcash ecosystem
 zcash_client_backend  = { version = "0.23", default-features = false }
 zcash_keys            = { version = "0.14", features = ["orchard", "sapling"] }
-# Note: `transparent-inputs` is NOT in workspace features — it is opt-in via
-# zcash-crypto's `transparent-inputs` feature, enabled only by zcash-cli.
+# Note: `transparent-inputs` is now a default feature of zcash-crypto.
 zcash_address         = "0.12"
 zcash_note_encryption = "0.4"
 zcash_primitives      = { version = "0.28", default-features = false }
@@ -39,8 +38,12 @@ napi         = { version = "2.16", features = ["async"] }
 napi-derive  = "2.16"
 
 # Key derivation
-bip39   = "2"
-bitcoin = "0.32"
+bip39     = "2"
+bitcoin   = "0.32"
+# secp256k1 0.29.x is already in Cargo.lock (transitive via bitcoin + zcash_transparent).
+# Declared explicitly here so zcash-crypto can name the secp256k1::PublicKey that
+# zcash_primitives::Builder::add_transparent_p2pkh_input expects.
+secp256k1 = { version = "0.29", features = ["alloc"] }
 
 # Parallelism
 rayon   = "1"

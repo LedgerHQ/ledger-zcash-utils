@@ -11,33 +11,33 @@
  */
 export interface SyncParams {
   /** gRPC endpoint URL (e.g. `"https://zaino-zec-testnet.nodes.stg.ledger-test.com/"`). */
-  grpcUrl: string;
+  grpcUrl: string
   /** Unified Full Viewing Key (UFVK) for the account to scan. */
-  viewingKey: string;
+  viewingKey: string
   /** First block height to scan (inclusive). */
-  startHeight: number;
+  startHeight: number
   /** Last block height to scan (inclusive). */
-  endHeight: number;
+  endHeight: number
   /** `"mainnet"` or `"testnet"` (default: `"testnet"`). */
-  network?: string;
+  network?: string
   /**
    * When `true`, Sapling outputs are stripped before trial decryption.
    * Only Orchard actions are processed — eliminates all Sapling crypto work.
    * Set to `true` for Ledger wallets (Orchard-only support).
    */
-  orchardOnly?: boolean;
+  orchardOnly?: boolean
   /**
    * Maximum retry attempts per range on transient errors (timeout, 503).
    * The failing range is split in half on each retry. Defaults to 3.
    */
-  maxRetries?: number;
+  maxRetries?: number
   /** Emit per-phase timing diagnostics to stderr every 10 seconds. */
-  verbose?: boolean;
+  verbose?: boolean
   /**
    * Hex-encoded nullifiers of notes received in previous scans that are still
    * unspent. Enables spent detection across incremental sync boundaries.
    */
-  knownNullifiers?: Array<string>;
+  knownNullifiers?: Array<string>
 }
 /**
  * A single shielded note found during decryption.
@@ -49,58 +49,58 @@ export interface SyncParams {
  */
 export interface ShieldedNote {
   /** Amount in zatoshis (f64 for JS Number compatibility). */
-  amount: number;
+  amount: number
   /** `"incoming"`, `"outgoing"`, or `"internal"`. */
-  transferType: string;
+  transferType: string
   /** Memo text decoded from the note. */
-  memo: string;
+  memo: string
   /** Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
-  nullifier?: string;
+  nullifier?: string
   /** rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts. */
-  rho?: string;
+  rho?: string
   /** Random seed (64-char hex = 32 bytes). Required for spending. */
-  rseed?: string;
+  rseed?: string
   /** Extracted note commitment cmx (64-char hex = 32 bytes). Required for Merkle witness. */
-  cmx?: string;
+  cmx?: string
   /**
    * Leaf position in the Orchard commitment tree (decimal string).
    * None when ChainMetadata is absent.
    * String avoids f64 precision loss on u64 -> f64 -> u64 round-trips.
    */
-  position?: string;
+  position?: string
   /** Recipient bytes (86-char hex = 43 bytes: 11-byte d + 32-byte pk_d). For note reconstruction. */
-  recipient?: string;
+  recipient?: string
   /** True if this note was spent in a later block within the scanned range. */
-  isSpent: boolean;
+  isSpent: boolean
 }
 /** A matched and fully-decrypted shielded transaction. */
 export interface ShieldedTransaction {
   /** Transaction ID in big-endian (display) hex order. */
-  txid: string;
+  txid: string
   /** Raw transaction bytes as a hex string. */
-  hex: string;
+  hex: string
   /** Block height at which this transaction was confirmed. */
-  blockHeight: number;
+  blockHeight: number
   /** Block hash in big-endian (display) hex order. */
-  blockHash: string;
+  blockHash: string
   /** Block timestamp (Unix seconds). */
-  blockTime: number;
+  blockTime: number
   /** Transaction fee in zatoshis (shielded bundles only). */
-  fee: number;
+  fee: number
   /** Decrypted Sapling notes belonging to this account. */
-  saplingNotes: Array<ShieldedNote>;
+  saplingNotes: Array<ShieldedNote>
   /** Decrypted Orchard notes belonging to this account. */
-  orchardNotes: Array<ShieldedNote>;
+  orchardNotes: Array<ShieldedNote>
 }
 /** Scan statistics returned once the stream is exhausted. */
 export interface SyncStats {
-  blocksScanned: number;
-  elapsedMs: number;
+  blocksScanned: number
+  elapsedMs: number
   /**
    * Hex-encoded nullifiers from `knownNullifiers` that were spent in the scanned range.
    * JS uses this to mark previously-stored notes as spent.
    */
-  spentKnownNullifiers: Array<string>;
+  spentKnownNullifiers: Array<string>
 }
 /**
  * Start scanning a range of compact blocks and return a transaction stream.
@@ -112,11 +112,9 @@ export interface SyncStats {
  * Trial decryption runs entirely in Rust (no JS event loop blocking).
  * `GetTransaction` is called only for matched transactions.
  */
-export declare function startSync(
-  params: SyncParams,
-): Promise<TransactionStream>;
+export declare function startSync(params: SyncParams): Promise<TransactionStream>
 /** Returns the current chain tip height from the gRPC endpoint. */
-export declare function getChainTip(grpcUrl: string): Promise<number>;
+export declare function getChainTip(grpcUrl: string): Promise<number>
 /**
  * Find the block height closest to the given Unix timestamp via interpolation search.
  *
@@ -124,55 +122,89 @@ export declare function getChainTip(grpcUrl: string): Promise<number>;
  * If the timestamp is before genesis, returns the genesis height.
  * If the timestamp is after the chain tip, returns the tip height.
  */
-export declare function findBlockHeight(
-  grpcUrl: string,
-  timestamp: number,
-): Promise<number>;
+export declare function findBlockHeight(grpcUrl: string, timestamp: number): Promise<number>
 export interface OrchardSpendInputJs {
   /** 86-char hex (43 bytes: 11-byte diversifier + 32-byte pk_d). */
-  recipient: string;
+  recipient: string
   /** Decimal u64 (string to avoid f64 precision loss). */
-  valueZat: string;
+  valueZat: string
   /** 64-char hex (32 bytes). */
-  rho: string;
+  rho: string
   /** 64-char hex. */
-  rseed: string;
+  rseed: string
   /** 64-char hex. */
-  cmx: string;
+  cmx: string
   /** Decimal u64 leaf position in the Orchard commitment tree. */
-  position: string;
+  position: string
 }
 export interface OutputRequestJs {
   /**
    * Destination address: t-addr (P2PKH/P2SH) or u-addr (Orchard receiver).
    * Sapling z-addresses and TEX (ZIP-320) addresses are rejected.
    */
-  address: string;
-  valueZat: string;
-  memo?: string;
+  address: string
+  valueZat: string
+  memo?: string
+}
+/** One transparent (P2PKH) UTXO to spend. */
+export interface TransparentInputJs {
+  /**
+   * 64-char hex (32 bytes) prevout txid in internal (little-endian) byte order.
+   * Ledger Live surfaces txids in display (big-endian) order; callers must
+   * reverse before passing.
+   */
+  txid: string
+  /** Output index within the origin transaction. */
+  vout: number
+  /**
+   * Hex-encoded raw scriptPubKey bytes (no CompactSize length prefix).
+   * Exposed to JS as `scriptPubKey` (canonical Bitcoin/Zcash casing) rather
+   * than napi's default `scriptPubkey` camelCasing of the Rust field name.
+   */
+  scriptPubKey: string
+  /** UTXO value in zatoshis (decimal string to avoid f64 precision loss). */
+  valueZat: string
+  /** 66-char hex (33 bytes) compressed secp256k1 pubkey controlling the UTXO. */
+  pubkey: string
+  /**
+   * BIP-44 chain (scope) the controlling key lives on: `0` = external,
+   * `1` = internal (change). With `address_index` this identifies the UTXO's
+   * signing key under the account. It is verified against the UFVK (the
+   * derived pubkey must equal `pubkey`) and stamped into the PCZT as the
+   * input's `bip32_derivation`, which the Ledger device uses as the signing
+   * path (the PCZT sign APDU carries no path).
+   */
+  derivationScope: number
+  /**
+   * Non-hardened BIP-44 address index of the controlling key (see
+   * `derivation_scope`).
+   */
+  addressIndex: number
 }
 export interface BuildTransactionParams {
-  grpcUrl: string;
-  ufvk: string;
-  network?: string;
+  grpcUrl: string
+  ufvk: string
+  network?: string
   /**
    * 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
    * read from the device. Stamped onto each real spend so the device can
    * confirm the PCZT belongs to its seed before signing.
    */
-  seedFingerprint: string;
+  seedFingerprint: string
   /** ZIP-32 account index the UFVK was derived at. */
-  accountIndex: number;
+  accountIndex: number
   /**
    * Caller-owned fee in zatoshis (decimal string to avoid f64 precision
    * loss). Per FR-4 the fee is selected by ledger-live; this
    * crate validates it against ZIP-317 and derives change from it rather
    * than computing a fee itself.
    */
-  feeZat: string;
-  spends: Array<OrchardSpendInputJs>;
-  outputs: Array<OutputRequestJs>;
-  anchorHeight?: number;
+  feeZat: string
+  spends: Array<OrchardSpendInputJs>
+  /** Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows. */
+  transparentInputs: Array<TransparentInputJs>
+  outputs: Array<OutputRequestJs>
+  anchorHeight?: number
 }
 export interface BuildTransactionResult {
   /**
@@ -180,23 +212,27 @@ export interface BuildTransactionResult {
    * postcard payload). Ready for the device APDU streaming layer. Carries
    * each real spend's ZIP-32 derivation path for on-device signing.
    */
-  pcztHex: string;
+  pcztHex: string
   /** Decimal fee in zatoshis. */
-  feeZat: string;
+  feeZat: string
   /** Block height the Merkle paths were computed against. */
-  anchorHeight: number;
+  anchorHeight: number
   /** Orchard action count after dummy padding. */
-  nActionsOrchard: number;
+  nActionsOrchard: number
+  /** Transparent input count. */
+  nTransparentInputs: number
+  /** Transparent output count (including change). */
+  nTransparentOutputs: number
 }
 /**
- * Build, prove, and serialize a PCZT for an Orchard send.
+ * Build, prove, and serialize a PCZT for a send transaction.
  *
- * Halo 2 proof generation happens here (~2-5 s first call, ~hundreds of ms
- * thereafter thanks to the process-global ProvingKey cache).
+ * Supports Orchard-source (Private→*) and transparent-source (Public→*)
+ * flows. Halo 2 proof generation happens here for Orchard-bundle transactions
+ * (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
+ * ProvingKey cache). Transparent-only transactions skip the Orchard prover.
  */
-export declare function buildTransaction(
-  params: BuildTransactionParams,
-): Promise<BuildTransactionResult>;
+export declare function buildTransaction(params: BuildTransactionParams): Promise<BuildTransactionResult>
 /**
  * Async iterator over matched shielded transactions.
  *
@@ -219,7 +255,7 @@ export declare class TransactionStream {
    * napi-rs requires `unsafe` for `&mut self` in async methods.
    * This method is safe to call — it only mutates the internal channel receiver.
    */
-  next(): Promise<ShieldedTransaction | null>;
+  next(): Promise<ShieldedTransaction | null>
   /**
    * Cancels the background scan immediately.
    *
@@ -228,7 +264,7 @@ export declare class TransactionStream {
    * return `null` once the buffer is drained. `stats()` will return an error
    * after cancellation.
    */
-  cancel(): void;
+  cancel(): void
   /**
    * Returns scan statistics once the stream is exhausted (i.e. after `next()`
    * returns `null`). Calling this before the stream is done will wait until
@@ -238,5 +274,5 @@ export declare class TransactionStream {
    *
    * napi-rs requires `unsafe` for `&mut self` in async methods.
    */
-  stats(): Promise<SyncStats>;
+  stats(): Promise<SyncStats>
 }
