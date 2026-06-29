@@ -350,6 +350,11 @@ pub struct BuildTransactionResult {
 /// flows. Halo 2 proof generation happens here for Orchard-bundle transactions
 /// (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
 /// ProvingKey cache). Transparent-only transactions skip the Orchard prover.
+///
+/// Note: unlike `finalize_transaction` (purely CPU-bound, offloaded via
+/// `spawn_blocking`), this is an async orchestrator that interleaves gRPC
+/// witness fetches with the CPU-bound proving step, so it cannot be wrapped in a
+/// single `spawn_blocking` call — the proving cost is borne inline.
 #[napi]
 pub async fn build_transaction(
     params: BuildTransactionParams,
@@ -427,6 +432,125 @@ pub async fn build_transaction(
 fn parse_u64(s: &str, field: &str) -> napi::Result<u64> {
     s.parse::<u64>()
         .map_err(|e| napi::Error::from_reason(format!("invalid {field}: {e}")))
+}
+
+// ─── Finalize + broadcast ─────────────────────────────────────────────────────
+
+/// Parameters for finalizing a PCZT with device-provided signatures.
+#[napi(object)]
+pub struct FinalizeTransactionParams {
+    /// Hex-encoded canonical PCZT bytes from `buildTransaction`.
+    pub pczt: String,
+    /// One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
+    /// in PCZT-action order over the unsigned actions.
+    pub orchard_signatures: Vec<String>,
+    /// One DER-hex secp256k1 signature per transparent input (empty for pure Orchard).
+    pub transparent_signatures: Vec<String>,
+}
+
+/// Result of a successful `finalizeTransaction` call.
+#[napi(object)]
+#[derive(Debug)]
+pub struct FinalizeTransactionResult {
+    /// Hex-encoded signed V5 transaction bytes (ready for `broadcastTransaction`).
+    pub tx_hex: String,
+    /// 64-char hex transaction id, big-endian *display* order (matches the sync
+    /// path's `ShieldedTransaction.txid` and the Ledger Live operation hash).
+    pub txid: String,
+}
+
+/// Inject device signatures into a PCZT and extract the final signed V5 transaction.
+///
+/// Accepts the PCZT from `buildTransaction`, one 64-byte RedPallas signature per
+/// real (unsigned) Orchard action, and one DER secp256k1 signature per transparent
+/// input. The Orchard binding signature is computed host-side.
+///
+/// CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
+/// to `tokio::task::spawn_blocking` so the async executor is not starved.
+#[napi]
+pub async fn finalize_transaction(
+    params: FinalizeTransactionParams,
+) -> napi::Result<FinalizeTransactionResult> {
+    // Decode the PCZT hex.
+    let pczt_bytes = hex::decode(&params.pczt)
+        .map_err(|e| napi::Error::from_reason(format!("pczt hex decode: {e}")))?;
+
+    // Decode each Orchard signature (128 hex chars → 64 bytes).
+    let orchard_signatures: Vec<[u8; 64]> = params
+        .orchard_signatures
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let v = hex::decode(s).map_err(|e| {
+                napi::Error::from_reason(format!("orchard_signatures[{i}] hex decode: {e}"))
+            })?;
+            v.try_into().map_err(|got: Vec<u8>| {
+                napi::Error::from_reason(format!(
+                    "orchard_signatures[{i}] must be 64 bytes (got {} bytes)",
+                    got.len()
+                ))
+            })
+        })
+        .collect::<napi::Result<_>>()?;
+
+    // Decode each transparent signature (DER hex → bytes).
+    let transparent_signatures: Vec<Vec<u8>> = params
+        .transparent_signatures
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            hex::decode(s).map_err(|e| {
+                napi::Error::from_reason(format!("transparent_signatures[{i}] hex decode: {e}"))
+            })
+        })
+        .collect::<napi::Result<_>>()?;
+
+    // Run the CPU-bound finalization in a blocking thread so the tokio executor
+    // is not starved during proof verification (VerifyingKey build ~2-5 s first
+    // call; cached thereafter via the OnceLock in finalize.rs).
+    let result = tokio::task::spawn_blocking(move || {
+        zcash_crypto::finalize::finalize_transaction(zcash_crypto::finalize::FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures,
+            transparent_signatures,
+        })
+    })
+    .await
+    .map_err(|e| {
+        let kind = if e.is_cancelled() {
+            "was cancelled"
+        } else {
+            "panicked"
+        };
+        napi::Error::from_reason(format!("finalization task {kind}: {e}"))
+    })?
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    // `result.txid` is internal little-endian; surface it in big-endian display
+    // order to match the sync path (`ShieldedTransaction.txid`) and the txid
+    // Ledger Live records as the operation hash.
+    let mut txid_be = result.txid;
+    txid_be.reverse();
+
+    Ok(FinalizeTransactionResult {
+        tx_hex: hex::encode(&result.tx_bytes),
+        txid: hex::encode(txid_be),
+    })
+}
+
+/// Submit a signed transaction to a lightwalletd / Zaino endpoint.
+///
+/// Returns the txid (64-char hex, big-endian display order — matches the sync
+/// path and the Ledger Live operation hash) on success (`errorCode == 0`).
+/// Returns a descriptive error on a non-zero `errorCode` (carrying the server's
+/// `errorMessage`) or on a gRPC transport failure.
+#[napi]
+pub async fn broadcast_transaction(grpc_url: String, tx_hex: String) -> napi::Result<String> {
+    let tx_bytes = hex::decode(&tx_hex)
+        .map_err(|e| napi::Error::from_reason(format!("tx_hex decode: {e}")))?;
+    zcash_sync::client::broadcast_transaction(grpc_url, tx_bytes)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -631,6 +755,66 @@ mod tests {
         };
         let napi = grpc_tx_to_napi(grpc);
         assert_eq!(napi.orchard_notes[0].amount, 2_100_000_000_000_000.0_f64);
+    }
+
+    // ── finalize_transaction / broadcast_transaction — error paths ───────────
+
+    /// Malformed PCZT hex must return a NAPI error, not a panic.
+    #[tokio::test]
+    async fn finalize_transaction_malformed_pczt_hex_returns_napi_error() {
+        let params = FinalizeTransactionParams {
+            pczt: "not valid hex @@@@".to_string(),
+            orchard_signatures: vec![],
+            transparent_signatures: vec![],
+        };
+        let err = finalize_transaction(params).await.unwrap_err();
+        assert!(
+            !err.reason.is_empty(),
+            "expected non-empty NAPI error reason"
+        );
+    }
+
+    /// Valid hex that is not a PCZT must also return a NAPI error (not panic).
+    #[tokio::test]
+    async fn finalize_transaction_non_pczt_hex_returns_napi_error() {
+        let params = FinalizeTransactionParams {
+            pczt: hex::encode(b"definitely not a pczt"),
+            orchard_signatures: vec![],
+            transparent_signatures: vec![],
+        };
+        let err = finalize_transaction(params).await.unwrap_err();
+        assert!(
+            !err.reason.is_empty(),
+            "expected non-empty NAPI error reason"
+        );
+    }
+
+    /// Malformed URL must return a NAPI error from broadcast_transaction.
+    #[tokio::test]
+    async fn broadcast_transaction_malformed_url_returns_napi_error() {
+        let err = broadcast_transaction("invalid gRPC URL".to_string(), hex::encode(b"fake tx"))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.reason.is_empty(),
+            "expected non-empty NAPI error reason"
+        );
+    }
+
+    /// Malformed tx_hex (non-hex chars) must return a decode error.
+    #[tokio::test]
+    async fn broadcast_transaction_malformed_tx_hex_returns_napi_error() {
+        let err = broadcast_transaction(
+            "https://zaino-zec-testnet.nodes.stg.ledger-test.com/".to_string(),
+            "not valid hex @@".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.reason.contains("tx_hex decode"),
+            "expected tx_hex decode error, got: {}",
+            err.reason
+        );
     }
 
     // ── get_chain_tip — error paths ───────────────────────────────────────────

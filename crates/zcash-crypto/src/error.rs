@@ -57,6 +57,11 @@ pub enum Error {
     /// PCZT role error, proof generation failure, or insufficient funds).
     #[error("craft error: {0}")]
     Craft(String),
+
+    /// Transaction finalization failed: PCZT parse/role error, signature
+    /// rejected during injection, proof verification failure, or serialization error.
+    #[error("finalize error: {0}")]
+    Finalize(String),
 }
 
 impl Error {
@@ -134,6 +139,12 @@ mod tests {
     fn test_craft_error_display() {
         let e = Error::Craft("bad anchor".into());
         assert_eq!(e.to_string(), "craft error: bad anchor");
+    }
+
+    #[test]
+    fn test_finalize_error_display() {
+        let e = Error::Finalize("PCZT parse failed".into());
+        assert_eq!(e.to_string(), "finalize error: PCZT parse failed");
     }
 
     #[test]

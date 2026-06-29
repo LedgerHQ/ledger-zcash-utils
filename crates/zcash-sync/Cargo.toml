@@ -36,3 +36,7 @@ tokio = { workspace = true, features = ["test-util", "net"] }
 orchard               = { workspace = true }
 incrementalmerkletree = { workspace = true }
 zcash_primitives      = { workspace = true }
+# Hand-rolled mock gRPC server for the broadcast_transaction happy-path test.
+# zcash_client_backend only generates the CompactTxStreamer *client*, so the test
+# builds a minimal server out of tonic's server primitives + the prost codec.
+tonic-prost = "0.14"

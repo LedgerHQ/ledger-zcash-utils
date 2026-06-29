@@ -3248,6 +3248,7 @@ dependencies = [
  "pczt",
  "tokio",
  "tonic",
+ "tonic-prost",
  "zcash-crypto",
  "zcash_address",
  "zcash_client_backend",
