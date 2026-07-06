@@ -28,6 +28,14 @@ zcash_protocol        = "0.9"
 zip32                 = "0.2"
 orchard               = { version = "0.14", default-features = false }
 sapling-crypto        = { version = "0.7", default-features = false }
+# Field-element trait (`PrimeField::to_repr`) used to serialize the Orchard
+# spend-auth randomizer `alpha` back to bytes when parsing a PCZT. Pinned to the
+# same 0.13 line that `orchard` already depends on (no lockfile churn).
+ff                    = "0.13"
+# Transparent script (de)serialization: the `Evaluable::to_bytes` trait used to
+# read a PCZT input/output `script_pubkey` back to raw bytes. Pinned to the 0.4
+# line already pulled transitively by `zcash_transparent`.
+zcash_script          = "0.4"
 
 # Async / gRPC (only zcash-sync and its dependents need these)
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }

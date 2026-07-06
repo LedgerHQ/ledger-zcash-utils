@@ -27,7 +27,8 @@ pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 > **Note:** Key derivation (`derive_keys`) is available in the CLI (`zcash-cli
 > derive`) and in the `zcash-crypto` Rust crate, but is not exported by the
 > Node.js binding. Exported functions: `startSync`, `getChainTip`,
-> `findBlockHeight`, `buildTransaction`, and the `TransactionStream` class.
+> `findBlockHeight`, `buildTransaction`, `parsePczt`, `finalizeTransaction`,
+> `broadcastTransaction`, and the `TransactionStream` class.
 
 ### Block scanning
 
@@ -114,6 +115,31 @@ const result: BuildTransactionResult = await buildTransaction({
 // result.anchorHeight   — height the Merkle paths were computed against
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex)
+```
+
+### Parsing a PCZT for the device signer
+
+`buildTransaction` returns `pcztHex` (canonical PCZT bytes). The device signer
+(`@ledgerhq/device-signer-kit-zcash`'s `DmkSignerZcash.signPcztTransaction`),
+however, needs a structured `PcztTransaction` object. The PCZT binary format
+(postcard) is not trivially parseable in TypeScript, so `parsePczt` decodes it
+in Rust and breaks it out field-by-field.
+
+```typescript
+import { buildTransaction, parsePczt, PcztTransaction } from './index.js'
+
+const { pcztHex } = await buildTransaction(/* ... */)
+
+// Byte fields are Uint8Array; zatoshi values are bigint; signing paths are
+// strings without the `m/` prefix and with `'` on hardened indices.
+const pczt: PcztTransaction = parsePczt(pcztHex)
+
+// pczt.global               — txVersion, coinType, expiryHeight, ...
+// pczt.transparentInputs[]  — prevoutTxid, value (bigint), derivation, ...
+// pczt.transparentOutputs[] — value (bigint), scriptPubKey, derivation?
+// pczt.orchardBundle        — actions[], flags, valueBalance (bigint), anchor
+//                             (null when there are no Orchard actions)
+const sigs = await signer.signPcztTransaction(pczt)
 ```
 
 ## Adding a new exported function

@@ -62,6 +62,11 @@ pub enum Error {
     /// rejected during injection, proof verification failure, or serialization error.
     #[error("finalize error: {0}")]
     Finalize(String),
+
+    /// PCZT parsing failed: malformed bytes, an unparseable protocol bundle, or a
+    /// field required by the device signer missing from the (unsigned) PCZT.
+    #[error("parse error: {0}")]
+    Parse(String),
 }
 
 impl Error {

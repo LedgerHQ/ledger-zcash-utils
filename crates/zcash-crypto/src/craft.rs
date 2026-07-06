@@ -1837,6 +1837,111 @@ mod tests {
         assert_eq!(out.fee, fee);
     }
 
+    // ── parse::parse_pczt round-trips ─────────────────────────────────────────
+
+    /// A private→public transaction (Orchard spend → transparent output) built
+    /// here must round-trip through [`crate::parse::parse_pczt`] into the
+    /// structured form the device signer consumes: an Orchard bundle with fully
+    /// populated actions plus one transparent (recipient) output.
+    #[test]
+    fn parse_pczt_private_to_public_roundtrips() {
+        let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let inputs =
+            make_single_spend_inputs(Network::MainNetwork, Destination::Transparent(t_addr), 10_000);
+        let out = build_transaction(inputs).expect("private→public must succeed");
+
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+
+        // Global header (mainnet → coin type 133, V5).
+        assert_eq!(parsed.global.tx_version, 5);
+        assert_eq!(parsed.global.coin_type, 133);
+
+        // Orchard bundle present with fully-populated actions.
+        let bundle = parsed.orchard_bundle.expect("orchard bundle must be present");
+        assert!(!bundle.actions.is_empty(), "expected >= 1 orchard action");
+        assert_eq!(bundle.anchor.len(), 32);
+        for action in &bundle.actions {
+            // Fixed-width fields at the sizes the device parser expects.
+            assert_eq!(action.spend_recipient.len(), 43);
+            assert_eq!(action.recipient.len(), 43);
+            assert_eq!(action.alpha.len(), 32);
+            assert_eq!(action.rcv.len(), 32);
+            assert_eq!(action.enc_ciphertext.len(), 580);
+            assert_eq!(action.out_ciphertext.len(), 80);
+            // The Orchard spend path is fully hardened: 32'/133'/<account>'.
+            assert_eq!(action.signing_path, "32'/133'/0'");
+            assert_eq!(action.seed_fingerprint, [0x42u8; 32]);
+        }
+
+        // One transparent recipient output, no change derivation on it.
+        assert!(parsed.transparent_inputs.is_empty());
+        assert_eq!(parsed.transparent_outputs.len(), 1);
+        assert!(parsed.transparent_outputs[0].derivation.is_none());
+        assert_eq!(parsed.transparent_outputs[0].value, 10_000);
+    }
+
+    /// A public→public transaction (transparent input + recipient + change) must
+    /// round-trip with no Orchard bundle, the input carrying its single signing
+    /// derivation, and exactly one of the two outputs (the change) carrying one.
+    #[test]
+    fn parse_pczt_public_to_public_roundtrips() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
+        let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 2);
+        let out_value = 15_000u64;
+        let change_value = 5_000u64;
+        let total_in = out_value + change_value + fee;
+        let input_pubkey = make_test_pubkey();
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(make_test_pubkey()),
+            transparent_change_address_index: Some(0),
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("public→public must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+
+        // Purely transparent: no Orchard bundle.
+        assert!(parsed.orchard_bundle.is_none());
+
+        // Single input carries exactly one derivation at m/44'/133'/0'/0/0.
+        assert_eq!(parsed.transparent_inputs.len(), 1);
+        let input = &parsed.transparent_inputs[0];
+        assert_eq!(input.value, total_in);
+        assert_eq!(input.prevout_txid, [0x01u8; 32]);
+        assert_eq!(input.sighash_type, 1, "SIGHASH_ALL");
+        assert_eq!(input.derivation.pubkey, input_pubkey);
+        assert_eq!(input.derivation.signing_path, "44'/133'/0'/0/0");
+
+        // Recipient + change outputs; exactly the change carries a derivation.
+        assert_eq!(parsed.transparent_outputs.len(), 2);
+        let with_deriv = parsed
+            .transparent_outputs
+            .iter()
+            .filter(|o| o.derivation.is_some())
+            .count();
+        assert_eq!(with_deriv, 1, "only the change output carries a derivation");
+    }
+
     /// Public→Public: re-parse the serialized PCZT and assert that the device's
     /// hard requirements are met — every transparent input carries exactly one
     /// `bip32_derivation` (its signing path), the change output carries one (so

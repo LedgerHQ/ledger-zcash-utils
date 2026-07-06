@@ -1,3 +1,4 @@
+use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -551,6 +552,223 @@ pub async fn broadcast_transaction(grpc_url: String, tx_hex: String) -> napi::Re
     zcash_sync::client::broadcast_transaction(grpc_url, tx_bytes)
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+// ─── Parse PCZT (canonical bytes → structured device-signer input) ────────────
+
+/// PCZT header (`common::Global`) fields.
+#[napi(object)]
+pub struct PcztGlobal {
+    /// Transaction version (V5 = 5).
+    pub tx_version: u32,
+    pub version_group_id: u32,
+    pub consensus_branch_id: u32,
+    /// `null` encodes the absent optional lock time.
+    pub fallback_lock_time: Option<u32>,
+    pub expiry_height: u32,
+    /// SLIP-44 coin type (133 mainnet, 1 testnet).
+    pub coin_type: u32,
+    pub tx_modifiable: u32,
+}
+
+/// A `bip32_derivation` entry for a transparent input/output.
+#[napi(object)]
+pub struct PcztBip32Derivation {
+    /// Derivation path (no `m/` prefix, hardened indices suffixed with `'`).
+    pub signing_path: String,
+    /// Compressed secp256k1 public key, 33 bytes.
+    pub pubkey: Uint8Array,
+    /// ZIP-32 seed fingerprint, 32 bytes.
+    pub seed_fingerprint: Uint8Array,
+}
+
+/// A single transparent input.
+#[napi(object)]
+pub struct PcztTransparentInput {
+    /// Previous output txid, 32 bytes (internal byte order, as stored in the PCZT).
+    pub prevout_txid: Uint8Array,
+    pub prevout_index: u32,
+    /// `null` encodes the absent optional sequence number (final `0xffffffff`).
+    pub sequence: Option<u32>,
+    /// Input value in zatoshis.
+    pub value: BigInt,
+    #[napi(js_name = "scriptPubKey")]
+    pub script_pubkey: Uint8Array,
+    /// Sighash type (`SIGHASH_ALL` = `0x01`).
+    pub sighash_type: u32,
+    pub derivation: PcztBip32Derivation,
+}
+
+/// A single transparent output.
+#[napi(object)]
+pub struct PcztTransparentOutput {
+    /// Output value in zatoshis.
+    pub value: BigInt,
+    #[napi(js_name = "scriptPubKey")]
+    pub script_pubkey: Uint8Array,
+    /// Present (change output) or `null` (external recipient).
+    pub derivation: Option<PcztBip32Derivation>,
+}
+
+/// A single Orchard action (spend + output halves), flattened for the device.
+#[napi(object)]
+pub struct PcztOrchardAction {
+    /// Value commitment, 32 bytes.
+    pub cv_net: Uint8Array,
+    /// Spend nullifier, 32 bytes.
+    pub nullifier: Uint8Array,
+    /// Randomized verification key, 32 bytes.
+    pub rk: Uint8Array,
+    /// Raw Orchard address of the spent note, 43 bytes.
+    pub spend_recipient: Uint8Array,
+    /// Spent-note value in zatoshis.
+    pub spend_value: BigInt,
+    /// Spend rho, 32 bytes.
+    pub spend_rho: Uint8Array,
+    /// Spend rseed, 32 bytes.
+    pub spend_rseed: Uint8Array,
+    /// Spend-authorization randomizer, 32 bytes.
+    pub alpha: Uint8Array,
+    /// ZIP-32 derivation path of the signing key.
+    pub signing_path: String,
+    /// ZIP-32 seed fingerprint, 32 bytes.
+    pub seed_fingerprint: Uint8Array,
+    /// Note commitment x-coordinate, 32 bytes.
+    pub cmx: Uint8Array,
+    /// Ephemeral key, 32 bytes.
+    pub ephemeral_key: Uint8Array,
+    pub enc_ciphertext: Uint8Array,
+    pub out_ciphertext: Uint8Array,
+    /// Raw Orchard address of the output note, 43 bytes.
+    pub recipient: Uint8Array,
+    /// Output-note value in zatoshis.
+    pub value: BigInt,
+    /// Output rseed, 32 bytes.
+    pub rseed: Uint8Array,
+    /// Value commitment randomness, 32 bytes.
+    pub rcv: Uint8Array,
+}
+
+/// The Orchard action bundle plus its trailer.
+#[napi(object)]
+pub struct PcztOrchardBundle {
+    pub actions: Vec<PcztOrchardAction>,
+    pub flags: u32,
+    /// Net value balance in zatoshis (signed).
+    pub value_balance: BigInt,
+    /// Orchard commitment-tree anchor, 32 bytes.
+    pub anchor: Uint8Array,
+}
+
+/// A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`.
+#[napi(object)]
+pub struct PcztTransaction {
+    pub global: PcztGlobal,
+    pub transparent_inputs: Vec<PcztTransparentInput>,
+    pub transparent_outputs: Vec<PcztTransparentOutput>,
+    /// `null` when the transaction has no Orchard actions.
+    pub orchard_bundle: Option<PcztOrchardBundle>,
+}
+
+/// Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
+/// structured `PcztTransaction` object the Ledger device signer consumes.
+///
+/// The PCZT binary format (postcard) is not trivially parseable in TypeScript;
+/// this decodes it in Rust and breaks out the transparent inputs/outputs and
+/// each Orchard action field-by-field. Fails if the input is not a valid PCZT,
+/// or if a field the device requires to sign is missing from it.
+#[napi]
+pub fn parse_pczt(pczt_hex: String) -> napi::Result<PcztTransaction> {
+    let bytes = hex::decode(&pczt_hex)
+        .map_err(|e| napi::Error::from_reason(format!("pczt hex decode: {e}")))?;
+    let parsed = zcash_crypto::parse::parse_pczt(&bytes)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(parsed_pczt_to_napi(parsed))
+}
+
+fn bytes_to_napi(bytes: impl Into<Vec<u8>>) -> Uint8Array {
+    Uint8Array::from(bytes.into())
+}
+
+fn derivation_to_napi(d: zcash_crypto::parse::ParsedBip32Derivation) -> PcztBip32Derivation {
+    PcztBip32Derivation {
+        signing_path: d.signing_path,
+        pubkey: bytes_to_napi(d.pubkey.to_vec()),
+        seed_fingerprint: bytes_to_napi(d.seed_fingerprint.to_vec()),
+    }
+}
+
+fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOrchardAction {
+    PcztOrchardAction {
+        cv_net: bytes_to_napi(a.cv_net.to_vec()),
+        nullifier: bytes_to_napi(a.nullifier.to_vec()),
+        rk: bytes_to_napi(a.rk.to_vec()),
+        spend_recipient: bytes_to_napi(a.spend_recipient.to_vec()),
+        spend_value: BigInt::from(a.spend_value),
+        spend_rho: bytes_to_napi(a.spend_rho.to_vec()),
+        spend_rseed: bytes_to_napi(a.spend_rseed.to_vec()),
+        alpha: bytes_to_napi(a.alpha.to_vec()),
+        signing_path: a.signing_path,
+        seed_fingerprint: bytes_to_napi(a.seed_fingerprint.to_vec()),
+        cmx: bytes_to_napi(a.cmx.to_vec()),
+        ephemeral_key: bytes_to_napi(a.ephemeral_key.to_vec()),
+        enc_ciphertext: bytes_to_napi(a.enc_ciphertext),
+        out_ciphertext: bytes_to_napi(a.out_ciphertext),
+        recipient: bytes_to_napi(a.recipient.to_vec()),
+        value: BigInt::from(a.value),
+        rseed: bytes_to_napi(a.rseed.to_vec()),
+        rcv: bytes_to_napi(a.rcv.to_vec()),
+    }
+}
+
+fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransaction {
+    let global = PcztGlobal {
+        tx_version: parsed.global.tx_version,
+        version_group_id: parsed.global.version_group_id,
+        consensus_branch_id: parsed.global.consensus_branch_id,
+        fallback_lock_time: parsed.global.fallback_lock_time,
+        expiry_height: parsed.global.expiry_height,
+        coin_type: parsed.global.coin_type,
+        tx_modifiable: u32::from(parsed.global.tx_modifiable),
+    };
+
+    let transparent_inputs = parsed
+        .transparent_inputs
+        .into_iter()
+        .map(|i| PcztTransparentInput {
+            prevout_txid: bytes_to_napi(i.prevout_txid.to_vec()),
+            prevout_index: i.prevout_index,
+            sequence: i.sequence,
+            value: BigInt::from(i.value),
+            script_pubkey: bytes_to_napi(i.script_pubkey),
+            sighash_type: u32::from(i.sighash_type),
+            derivation: derivation_to_napi(i.derivation),
+        })
+        .collect();
+
+    let transparent_outputs = parsed
+        .transparent_outputs
+        .into_iter()
+        .map(|o| PcztTransparentOutput {
+            value: BigInt::from(o.value),
+            script_pubkey: bytes_to_napi(o.script_pubkey),
+            derivation: o.derivation.map(derivation_to_napi),
+        })
+        .collect();
+
+    let orchard_bundle = parsed.orchard_bundle.map(|b| PcztOrchardBundle {
+        actions: b.actions.into_iter().map(orchard_action_to_napi).collect(),
+        flags: u32::from(b.flags),
+        value_balance: BigInt::from(b.value_balance),
+        anchor: bytes_to_napi(b.anchor.to_vec()),
+    });
+
+    PcztTransaction {
+        global,
+        transparent_inputs,
+        transparent_outputs,
+        orchard_bundle,
+    }
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────

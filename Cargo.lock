@@ -3200,6 +3200,7 @@ version = "0.1.0"
 dependencies = [
  "bip39",
  "bitcoin",
+ "ff",
  "hex",
  "incrementalmerkletree",
  "orchard",
@@ -3209,6 +3210,7 @@ dependencies = [
  "rayon",
  "sapling-crypto",
  "secp256k1",
+ "serde_json",
  "shardtree",
  "thiserror 1.0.69",
  "time",
@@ -3219,6 +3221,7 @@ dependencies = [
  "zcash_note_encryption",
  "zcash_primitives",
  "zcash_protocol",
+ "zcash_script",
  "zcash_transparent",
  "zip32",
 ]
