@@ -47,3 +47,10 @@ pczt                  = { workspace = true }
 rand                  = { workspace = true }
 rand_core             = { workspace = true }
 zcash_transparent     = { workspace = true }
+# `PrimeField::to_repr` for serializing the Orchard `alpha` scalar in `parse.rs`.
+ff                    = { workspace = true }
+# `Evaluable::to_bytes` to read transparent `script_pubkey` bytes in `parse.rs`.
+zcash_script          = { workspace = true }
+# Reads the PCZT global fields that the `pczt` crate keeps `pub(crate)` without a
+# getter (`coin_type`, `fallback_lock_time`, `tx_modifiable`) via serde.
+serde_json            = { workspace = true }

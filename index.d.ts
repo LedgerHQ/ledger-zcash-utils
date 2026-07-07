@@ -231,8 +231,163 @@ export interface BuildTransactionResult {
  * flows. Halo 2 proof generation happens here for Orchard-bundle transactions
  * (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
  * ProvingKey cache). Transparent-only transactions skip the Orchard prover.
+ *
+ * Note: unlike `finalize_transaction` (purely CPU-bound, offloaded via
+ * `spawn_blocking`), this is an async orchestrator that interleaves gRPC
+ * witness fetches with the CPU-bound proving step, so it cannot be wrapped in a
+ * single `spawn_blocking` call — the proving cost is borne inline.
  */
 export declare function buildTransaction(params: BuildTransactionParams): Promise<BuildTransactionResult>
+/** Parameters for finalizing a PCZT with device-provided signatures. */
+export interface FinalizeTransactionParams {
+  /** Hex-encoded canonical PCZT bytes from `buildTransaction`. */
+  pczt: string
+  /**
+   * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
+   * in PCZT-action order over the unsigned actions.
+   */
+  orchardSignatures: Array<string>
+  /** One DER-hex secp256k1 signature per transparent input (empty for pure Orchard). */
+  transparentSignatures: Array<string>
+}
+/** Result of a successful `finalizeTransaction` call. */
+export interface FinalizeTransactionResult {
+  /** Hex-encoded signed V5 transaction bytes (ready for `broadcastTransaction`). */
+  txHex: string
+  /**
+   * 64-char hex transaction id, big-endian *display* order (matches the sync
+   * path's `ShieldedTransaction.txid` and the Ledger Live operation hash).
+   */
+  txid: string
+}
+/**
+ * Inject device signatures into a PCZT and extract the final signed V5 transaction.
+ *
+ * Accepts the PCZT from `buildTransaction`, one 64-byte RedPallas signature per
+ * real (unsigned) Orchard action, and one DER secp256k1 signature per transparent
+ * input. The Orchard binding signature is computed host-side.
+ *
+ * CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
+ * to `tokio::task::spawn_blocking` so the async executor is not starved.
+ */
+export declare function finalizeTransaction(params: FinalizeTransactionParams): Promise<FinalizeTransactionResult>
+/**
+ * Submit a signed transaction to a lightwalletd / Zaino endpoint.
+ *
+ * Returns the txid (64-char hex, big-endian display order — matches the sync
+ * path and the Ledger Live operation hash) on success (`errorCode == 0`).
+ * Returns a descriptive error on a non-zero `errorCode` (carrying the server's
+ * `errorMessage`) or on a gRPC transport failure.
+ */
+export declare function broadcastTransaction(grpcUrl: string, txHex: string): Promise<string>
+/** PCZT header (`common::Global`) fields. */
+export interface PcztGlobal {
+  /** Transaction version (V5 = 5). */
+  txVersion: number
+  versionGroupId: number
+  consensusBranchId: number
+  /** `null` encodes the absent optional lock time. */
+  fallbackLockTime?: number
+  expiryHeight: number
+  /** SLIP-44 coin type (133 mainnet, 1 testnet). */
+  coinType: number
+  txModifiable: number
+}
+/** A `bip32_derivation` entry for a transparent input/output. */
+export interface PcztBip32Derivation {
+  /** Derivation path (no `m/` prefix, hardened indices suffixed with `'`). */
+  signingPath: string
+  /** Compressed secp256k1 public key, 33 bytes. */
+  pubkey: Uint8Array
+  /** ZIP-32 seed fingerprint, 32 bytes. */
+  seedFingerprint: Uint8Array
+}
+/** A single transparent input. */
+export interface PcztTransparentInput {
+  /** Previous output txid, 32 bytes (internal byte order, as stored in the PCZT). */
+  prevoutTxid: Uint8Array
+  prevoutIndex: number
+  /** `null` encodes the absent optional sequence number (final `0xffffffff`). */
+  sequence?: number
+  /** Input value in zatoshis. */
+  value: bigint
+  scriptPubKey: Uint8Array
+  /** Sighash type (`SIGHASH_ALL` = `0x01`). */
+  sighashType: number
+  derivation: PcztBip32Derivation
+}
+/** A single transparent output. */
+export interface PcztTransparentOutput {
+  /** Output value in zatoshis. */
+  value: bigint
+  scriptPubKey: Uint8Array
+  /** Present (change output) or `null` (external recipient). */
+  derivation?: PcztBip32Derivation
+}
+/** A single Orchard action (spend + output halves), flattened for the device. */
+export interface PcztOrchardAction {
+  /** Value commitment, 32 bytes. */
+  cvNet: Uint8Array
+  /** Spend nullifier, 32 bytes. */
+  nullifier: Uint8Array
+  /** Randomized verification key, 32 bytes. */
+  rk: Uint8Array
+  /** Raw Orchard address of the spent note, 43 bytes. */
+  spendRecipient: Uint8Array
+  /** Spent-note value in zatoshis. */
+  spendValue: bigint
+  /** Spend rho, 32 bytes. */
+  spendRho: Uint8Array
+  /** Spend rseed, 32 bytes. */
+  spendRseed: Uint8Array
+  /** Spend-authorization randomizer, 32 bytes. */
+  alpha: Uint8Array
+  /** ZIP-32 derivation path of the signing key. */
+  signingPath: string
+  /** ZIP-32 seed fingerprint, 32 bytes. */
+  seedFingerprint: Uint8Array
+  /** Note commitment x-coordinate, 32 bytes. */
+  cmx: Uint8Array
+  /** Ephemeral key, 32 bytes. */
+  ephemeralKey: Uint8Array
+  encCiphertext: Uint8Array
+  outCiphertext: Uint8Array
+  /** Raw Orchard address of the output note, 43 bytes. */
+  recipient: Uint8Array
+  /** Output-note value in zatoshis. */
+  value: bigint
+  /** Output rseed, 32 bytes. */
+  rseed: Uint8Array
+  /** Value commitment randomness, 32 bytes. */
+  rcv: Uint8Array
+}
+/** The Orchard action bundle plus its trailer. */
+export interface PcztOrchardBundle {
+  actions: Array<PcztOrchardAction>
+  flags: number
+  /** Net value balance in zatoshis (signed). */
+  valueBalance: bigint
+  /** Orchard commitment-tree anchor, 32 bytes. */
+  anchor: Uint8Array
+}
+/** A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`. */
+export interface PcztTransaction {
+  global: PcztGlobal
+  transparentInputs: Array<PcztTransparentInput>
+  transparentOutputs: Array<PcztTransparentOutput>
+  /** `null` when the transaction has no Orchard actions. */
+  orchardBundle?: PcztOrchardBundle
+}
+/**
+ * Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
+ * structured `PcztTransaction` object the Ledger device signer consumes.
+ *
+ * The PCZT binary format (postcard) is not trivially parseable in TypeScript;
+ * this decodes it in Rust and breaks out the transparent inputs/outputs and
+ * each Orchard action field-by-field. Fails if the input is not a valid PCZT,
+ * or if a field the device requires to sign is missing from it.
+ */
+export declare function parsePczt(pcztHex: string): PcztTransaction
 /**
  * Async iterator over matched shielded transactions.
  *

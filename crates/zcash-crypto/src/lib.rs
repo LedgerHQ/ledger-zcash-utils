@@ -12,6 +12,7 @@
 //! - [`tree`]: On-demand Orchard ShardTree assembly and Merkle witness extraction
 //! - [`craft`]: Build, prove, and serialize a PCZT for the Orchard send flows
 //! - [`finalize`]: Inject device signatures into a PCZT and extract the final signed V5 transaction
+//! - [`parse`]: Parse canonical PCZT bytes into a structured, device-signer-ready form
 
 pub mod craft;
 pub mod decrypt;
@@ -19,4 +20,5 @@ pub mod error;
 pub mod finalize;
 pub mod keys;
 pub mod network;
+pub mod parse;
 pub mod tree;
