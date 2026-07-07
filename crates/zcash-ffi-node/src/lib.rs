@@ -1,4 +1,4 @@
-use napi::bindgen_prelude::{BigInt, Uint8Array};
+use napi::bindgen_prelude::Uint8Array;
 use napi_derive::napi;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -590,8 +590,8 @@ pub struct PcztTransparentInput {
     pub prevout_index: u32,
     /// `null` encodes the absent optional sequence number (final `0xffffffff`).
     pub sequence: Option<u32>,
-    /// Input value in zatoshis.
-    pub value: BigInt,
+    /// Input value in zatoshis (decimal string to avoid f64 precision loss).
+    pub value: String,
     #[napi(js_name = "scriptPubKey")]
     pub script_pubkey: Uint8Array,
     /// Sighash type (`SIGHASH_ALL` = `0x01`).
@@ -602,8 +602,8 @@ pub struct PcztTransparentInput {
 /// A single transparent output.
 #[napi(object)]
 pub struct PcztTransparentOutput {
-    /// Output value in zatoshis.
-    pub value: BigInt,
+    /// Output value in zatoshis (decimal string to avoid f64 precision loss).
+    pub value: String,
     #[napi(js_name = "scriptPubKey")]
     pub script_pubkey: Uint8Array,
     /// Present (change output) or `null` (external recipient).
@@ -621,8 +621,8 @@ pub struct PcztOrchardAction {
     pub rk: Uint8Array,
     /// Raw Orchard address of the spent note, 43 bytes.
     pub spend_recipient: Uint8Array,
-    /// Spent-note value in zatoshis.
-    pub spend_value: BigInt,
+    /// Spent-note value in zatoshis (decimal string to avoid f64 precision loss).
+    pub spend_value: String,
     /// Spend rho, 32 bytes.
     pub spend_rho: Uint8Array,
     /// Spend rseed, 32 bytes.
@@ -641,8 +641,8 @@ pub struct PcztOrchardAction {
     pub out_ciphertext: Uint8Array,
     /// Raw Orchard address of the output note, 43 bytes.
     pub recipient: Uint8Array,
-    /// Output-note value in zatoshis.
-    pub value: BigInt,
+    /// Output-note value in zatoshis (decimal string to avoid f64 precision loss).
+    pub value: String,
     /// Output rseed, 32 bytes.
     pub rseed: Uint8Array,
     /// Value commitment randomness, 32 bytes.
@@ -654,8 +654,8 @@ pub struct PcztOrchardAction {
 pub struct PcztOrchardBundle {
     pub actions: Vec<PcztOrchardAction>,
     pub flags: u32,
-    /// Net value balance in zatoshis (signed).
-    pub value_balance: BigInt,
+    /// Net value balance in zatoshis (signed decimal string, lossless for i128).
+    pub value_balance: String,
     /// Orchard commitment-tree anchor, 32 bytes.
     pub anchor: Uint8Array,
 }
@@ -704,7 +704,7 @@ fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOr
         nullifier: bytes_to_napi(a.nullifier.to_vec()),
         rk: bytes_to_napi(a.rk.to_vec()),
         spend_recipient: bytes_to_napi(a.spend_recipient.to_vec()),
-        spend_value: BigInt::from(a.spend_value),
+        spend_value: a.spend_value.to_string(),
         spend_rho: bytes_to_napi(a.spend_rho.to_vec()),
         spend_rseed: bytes_to_napi(a.spend_rseed.to_vec()),
         alpha: bytes_to_napi(a.alpha.to_vec()),
@@ -715,7 +715,7 @@ fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOr
         enc_ciphertext: bytes_to_napi(a.enc_ciphertext),
         out_ciphertext: bytes_to_napi(a.out_ciphertext),
         recipient: bytes_to_napi(a.recipient.to_vec()),
-        value: BigInt::from(a.value),
+        value: a.value.to_string(),
         rseed: bytes_to_napi(a.rseed.to_vec()),
         rcv: bytes_to_napi(a.rcv.to_vec()),
     }
@@ -739,7 +739,7 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
             prevout_txid: bytes_to_napi(i.prevout_txid.to_vec()),
             prevout_index: i.prevout_index,
             sequence: i.sequence,
-            value: BigInt::from(i.value),
+            value: i.value.to_string(),
             script_pubkey: bytes_to_napi(i.script_pubkey),
             sighash_type: u32::from(i.sighash_type),
             derivation: derivation_to_napi(i.derivation),
@@ -750,7 +750,7 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
         .transparent_outputs
         .into_iter()
         .map(|o| PcztTransparentOutput {
-            value: BigInt::from(o.value),
+            value: o.value.to_string(),
             script_pubkey: bytes_to_napi(o.script_pubkey),
             derivation: o.derivation.map(derivation_to_napi),
         })
@@ -759,7 +759,7 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
     let orchard_bundle = parsed.orchard_bundle.map(|b| PcztOrchardBundle {
         actions: b.actions.into_iter().map(orchard_action_to_napi).collect(),
         flags: u32::from(b.flags),
-        value_balance: BigInt::from(b.value_balance),
+        value_balance: b.value_balance.to_string(),
         anchor: bytes_to_napi(b.anchor.to_vec()),
     });
 
@@ -1276,15 +1276,6 @@ mod tests {
     // in `parsed_pczt_to_napi` / `orchard_action_to_napi` / `derivation_to_napi`
     // against mis-copied fields, value truncation, and `Option -> null` regressions.
 
-    /// Reads a non-negative `BigInt` back as `u64`, asserting the conversion is
-    /// lossless (the whole point of using `BigInt` over `f64` for zatoshi values).
-    fn bigint_u64(b: &BigInt) -> u64 {
-        let (sign, value, lossless) = b.get_u64();
-        assert!(!sign, "expected a non-negative BigInt");
-        assert!(lossless, "expected a lossless u64 BigInt");
-        value
-    }
-
     fn make_derivation() -> ParsedBip32Derivation {
         ParsedBip32Derivation {
             signing_path: "44'/133'/0'/0/0".to_string(),
@@ -1391,7 +1382,7 @@ mod tests {
         assert_eq!(input.prevout_txid.to_vec(), vec![0x21u8; 32]);
         assert_eq!(input.prevout_index, 3);
         assert_eq!(input.sequence, Some(0xffff_fffe));
-        assert_eq!(bigint_u64(&input.value), 500_000);
+        assert_eq!(input.value, "500000");
         // `script_pubkey` is surfaced to JS as `scriptPubKey` via
         // `#[napi(js_name)]`; the Rust value must pass through unchanged (the
         // js_name casing itself is asserted by the generated `index.d.ts`).
@@ -1407,7 +1398,7 @@ mod tests {
         let napi = parsed_pczt_to_napi(make_parsed_pczt());
         assert_eq!(napi.transparent_outputs.len(), 1);
         let output = &napi.transparent_outputs[0];
-        assert_eq!(bigint_u64(&output.value), 400_000);
+        assert_eq!(output.value, "400000");
         assert_eq!(output.script_pubkey.to_vec(), vec![0xa9u8, 0x14]);
         let deriv = output
             .derivation
@@ -1447,7 +1438,7 @@ mod tests {
             vec![0x04u8; 43],
             "spend_recipient"
         );
-        assert_eq!(bigint_u64(&a.spend_value), 111_111, "spend_value");
+        assert_eq!(a.spend_value, "111111", "spend_value");
         assert_eq!(a.spend_rho.to_vec(), vec![0x05u8; 32], "spend_rho");
         assert_eq!(a.spend_rseed.to_vec(), vec![0x06u8; 32], "spend_rseed");
         assert_eq!(a.alpha.to_vec(), vec![0x07u8; 32], "alpha");
@@ -1466,7 +1457,7 @@ mod tests {
         );
         assert_eq!(a.out_ciphertext.to_vec(), vec![0x0cu8; 80], "out_ciphertext");
         assert_eq!(a.recipient.to_vec(), vec![0x0du8; 43], "recipient");
-        assert_eq!(bigint_u64(&a.value), 222_222, "value");
+        assert_eq!(a.value, "222222", "value");
         assert_eq!(a.rseed.to_vec(), vec![0x0eu8; 32], "rseed");
         assert_eq!(a.rcv.to_vec(), vec![0x0fu8; 32], "rcv");
     }
@@ -1479,10 +1470,8 @@ mod tests {
             .as_ref()
             .expect("orchard bundle must be present");
         assert_eq!(bundle.flags, 0b0000_0011);
-        let (balance, lossless) = bundle.value_balance.get_i128();
-        assert!(lossless, "value_balance must be lossless");
         assert_eq!(
-            balance, -100_000,
+            bundle.value_balance, "-100000",
             "negative value_balance sign must be preserved"
         );
         assert_eq!(bundle.anchor.to_vec(), vec![0x31u8; 32]);
@@ -1500,8 +1489,8 @@ mod tests {
     }
 
     /// Zatoshi values above f64's safe-integer range must survive the mapping
-    /// intact — this is the reason these fields are `BigInt`, not `f64`. A silent
-    /// narrowing to `f64` would corrupt `9_007_199_254_740_993` (2^53 + 1).
+    /// intact — this is the reason these fields are decimal `String`, not `f64`.
+    /// A silent narrowing to `f64` would corrupt `9_007_199_254_740_993` (2^53 + 1).
     #[test]
     fn parsed_pczt_to_napi_preserves_value_above_f64_safe_integer() {
         let big_value: u64 = 9_007_199_254_740_993;
@@ -1511,13 +1500,13 @@ mod tests {
 
         let napi = parsed_pczt_to_napi(parsed);
         assert_eq!(
-            bigint_u64(&napi.orchard_bundle.unwrap().actions[0].value),
-            big_value,
+            napi.orchard_bundle.unwrap().actions[0].value,
+            big_value.to_string(),
             "orchard output value must not be truncated"
         );
         assert_eq!(
-            bigint_u64(&napi.transparent_inputs[0].value),
-            big_value,
+            napi.transparent_inputs[0].value,
+            big_value.to_string(),
             "transparent input value must not be truncated"
         );
     }
@@ -1537,8 +1526,8 @@ mod tests {
         let napi = parsed_pczt_to_napi(parsed);
         let bundle = napi.orchard_bundle.unwrap();
         assert_eq!(bundle.actions.len(), 3);
-        assert_eq!(bigint_u64(&bundle.actions[0].value), 1);
-        assert_eq!(bigint_u64(&bundle.actions[1].value), 2);
-        assert_eq!(bigint_u64(&bundle.actions[2].value), 3);
+        assert_eq!(bundle.actions[0].value, "1");
+        assert_eq!(bundle.actions[1].value, "2");
+        assert_eq!(bundle.actions[2].value, "3");
     }
 }

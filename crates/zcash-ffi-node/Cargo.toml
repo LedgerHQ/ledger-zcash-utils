@@ -12,9 +12,7 @@ crate-type = ["cdylib"]
 zcash-sync   = { path = "../zcash-sync" }
 zcash-crypto = { path = "../zcash-crypto" }
 
-# `napi6` enables the `BigInt` type used by `parsePczt` to return u64/i128
-# zatoshi values without f64 precision loss.
-napi        = { workspace = true, features = ["napi6"] }
+napi        = { workspace = true }
 napi-derive = { workspace = true }
 tokio       = { workspace = true }
 hex         = { workspace = true }
