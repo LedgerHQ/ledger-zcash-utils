@@ -104,6 +104,10 @@ pub struct ShieldedNote {
     pub transfer_type: String,
     /// Memo text (UTF-8, null-trimmed).
     pub memo: String,
+    /// `"sapling"`, `"orchard"`, or `"ironwood"` — the shielded pool this note
+    /// belongs to. Mapped from `zcash_crypto::decrypt::DecryptedOutput::pool`
+    /// (itself sourced from upstream's `value_pool()`), not a locally invented tag.
+    pub pool: String,
 
     /// Orchard nullifier (32 bytes, hex-encoded). Present for incoming/internal notes.
     /// Used for spent-tracking and as identifier for spending.
@@ -158,6 +162,10 @@ pub struct ShieldedTransaction {
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
     pub orchard_notes: Vec<ShieldedNote>,
+    /// Decrypted Ironwood (NU6.3) notes belonging to this account. Additive and
+    /// parallel to `orchard_notes` — Ironwood is a second, separate Orchard-family
+    /// pool with its own commitment tree and nullifier set.
+    pub ironwood_notes: Vec<ShieldedNote>,
 }
 
 /// Result returned after scanning a block range.
@@ -428,6 +436,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 
     for result in &block_results {
         let (tree_size_before_block, tx_action_start_map) = compute_block_position_ctx(result);
+        let (ironwood_tree_size_before_block, ironwood_tx_action_start_map) =
+            compute_ironwood_block_position_ctx(result);
 
         for txid_hex in &result.matched_txids {
             let tx_action_start = match tx_action_start_map.get(txid_hex.as_str()) {
@@ -440,6 +450,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                     0
                 }
             };
+            let ironwood_tx_action_start =
+                ironwood_tx_action_start_map.get(txid_hex.as_str()).copied().unwrap_or(0);
 
             if let Some((tx, nullifiers)) = fetch_and_decrypt_tx(
                 &mut client,
@@ -452,28 +464,33 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                     network,
                     tree_size_before_block,
                     tx_action_start,
+                    ironwood_tree_size_before_block,
+                    ironwood_tx_action_start,
                 },
                 &mut get_transaction_ms,
                 &mut full_decrypt_ms,
             )
             .await?
             {
-                // Collect Orchard nullifiers from incoming/internal notes.
+                // Collect Orchard/Ironwood nullifiers from incoming/internal notes.
                 // These enable Phase 4: detecting txs that spend our notes (outgoing txs
                 // that are invisible to trial decryption because they create no outputs for us).
+                // `our_nullifiers` stays a single flat set across both pools — see the Phase
+                // 4/5 comments below for why pool-scoping is only needed at the matching step.
                 our_nullifiers.extend(nullifiers);
                 all_transactions.push(tx);
             }
         }
     }
 
-    // 8. Phase 4 — detect outgoing transactions via Orchard nullifier matching.
+    // 8. Phase 4 — detect outgoing transactions via Orchard/Ironwood nullifier matching.
     //
     //    For each block in the scanned range, check whether any transaction spends
-    //    a nullifier that corresponds to a note we received in Phase 2. Such a tx
-    //    is an outgoing (spending) transaction that would not have been found by
-    //    trial decryption alone, because trial decryption only identifies txs that
-    //    create outputs *for us*.
+    //    a nullifier that corresponds to a note we received in Phase 2 — via EITHER
+    //    pool's actions (Ironwood spends must be detected too, not only Orchard).
+    //    Such a tx is an outgoing (spending) transaction that would not have been
+    //    found by trial decryption alone, because trial decryption only identifies
+    //    txs that create outputs *for us*.
     //
     //    We only run this pass when we actually received notes (our_nullifiers is
     //    non-empty) to avoid unnecessary work on scanning-only runs.
@@ -483,16 +500,27 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 
         for result in &block_results {
             let (tree_size_before_block, tx_action_start_map) = compute_block_position_ctx(result);
+            let (ironwood_tree_size_before_block, ironwood_tx_action_start_map) =
+                compute_ironwood_block_position_ctx(result);
 
-            for (txid, nfs) in &result.tx_nullifiers {
-                if already_found.contains(txid) {
+            // Merge the two pools' per-tx nullifier lists so a tx that spends via
+            // either pool's actions is visited exactly once. The *trigger* check
+            // ("does this tx touch a note we hold, from either pool") is pool-agnostic
+            // by design; pool-scoped matching happens in Phase 5 below, per note.
+            let mut per_txid_nfs: std::collections::HashMap<&str, Vec<[u8; 32]>> = Default::default();
+            for (txid, nfs) in result.tx_nullifiers.iter().chain(result.tx_ironwood_nullifiers.iter()) {
+                per_txid_nfs.entry(txid.as_str()).or_default().extend(nfs.iter().copied());
+            }
+
+            for (txid, nfs) in &per_txid_nfs {
+                if already_found.contains(*txid) {
                     continue; // already processed in Phase 2 (e.g. self-send)
                 }
                 if !nfs.iter().any(|nf| our_nullifiers.contains(nf)) {
                     continue; // does not spend any of our notes
                 }
 
-                let tx_action_start = match tx_action_start_map.get(txid.as_str()) {
+                let tx_action_start = match tx_action_start_map.get(*txid) {
                     Some(&offset) => offset,
                     None => {
                         eprintln!(
@@ -502,6 +530,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                         0
                     }
                 };
+                let ironwood_tx_action_start =
+                    ironwood_tx_action_start_map.get(*txid).copied().unwrap_or(0);
 
                 // This tx spends one of our received notes — fetch and full-decrypt it.
                 if let Some((tx, _)) = fetch_and_decrypt_tx(
@@ -515,6 +545,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
                         network,
                         tree_size_before_block,
                         tx_action_start,
+                        ironwood_tree_size_before_block,
+                        ironwood_tx_action_start,
                     },
                     &mut get_transaction_ms,
                     &mut full_decrypt_ms,
@@ -535,40 +567,29 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     // Collect all nullifiers that were spent in any transaction within the scanned
     // range. A note is spent if its nullifier appears as a spent nullifier in any
     // block (regardless of whether the spending tx was Phase-2 or Phase-4 detected).
+    //
+    // Kept POOL-SCOPED (nullifier sets are pool-scoped):
+    // an Orchard note's `is_spent` is decided only by nullifiers spent in Orchard
+    // actions, and an Ironwood note's only by nullifiers spent in Ironwood actions.
+    // Merging the two into a single set would risk a false `is_spent` on a
+    // cross-pool nullifier collision.
     let spent_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
         .iter()
         .flat_map(|r| r.tx_nullifiers.iter())
         .flat_map(|(_, nfs)| nfs.iter().copied())
         .filter(|nf| our_nullifiers.contains(nf))
         .collect();
+    let spent_ironwood_nullifiers: std::collections::HashSet<[u8; 32]> = block_results
+        .iter()
+        .flat_map(|r| r.tx_ironwood_nullifiers.iter())
+        .flat_map(|(_, nfs)| nfs.iter().copied())
+        .filter(|nf| our_nullifiers.contains(nf))
+        .collect();
 
-    if !spent_nullifiers.is_empty() {
+    if !spent_nullifiers.is_empty() || !spent_ironwood_nullifiers.is_empty() {
         for tx in &mut all_transactions {
-            for note in &mut tx.orchard_notes {
-                if let Some(ref nf_hex) = note.nullifier {
-                    match hex::decode(nf_hex) {
-                        Ok(nf_bytes) => {
-                            if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes.as_slice()) {
-                                if spent_nullifiers.contains(&nf_arr) {
-                                    note.is_spent = true;
-                                }
-                            } else {
-                                eprintln!(
-                                    "WARN: is_spent: nullifier hex has wrong length ({} bytes), skipping",
-                                    nf_hex.len() / 2
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "WARN: is_spent: malformed nullifier hex {:?}: {}",
-                                &nf_hex[..nf_hex.len().min(16)],
-                                e
-                            );
-                        }
-                    }
-                }
-            }
+            mark_spent(&mut tx.orchard_notes, &spent_nullifiers);
+            mark_spent(&mut tx.ironwood_notes, &spent_ironwood_nullifiers);
         }
     }
 
@@ -612,8 +633,12 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
             }
         })
         .collect();
+    // Cross-scan spent_known_nullifiers stays pool-agnostic on purpose (see the
+    // module-level rationale in Phase 4): a `known_nullifiers` entry from a
+    // previous scan carries no pool tag, so both pools' spent sets are checked.
     let spent_known_nullifiers: Vec<String> = spent_nullifiers
         .iter()
+        .chain(spent_ironwood_nullifiers.iter())
         .filter(|nf| known_nf_set.contains(*nf))
         .map(hex::encode)
         .collect();
@@ -632,45 +657,105 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 
 // ─── private helpers ──────────────────────────────────────────────────────────
 
-/// Compute the Orchard commitment tree size before a block and the cumulative
-/// action offset for each transaction in the block. Used by both Phase 2 and
-/// Phase 4 to derive per-note positions.
-fn compute_block_position_ctx(result: &TrialResult) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
-    let total_actions_in_block: u32 = result
-        .tx_orchard_action_counts
-        .iter()
-        .map(|(_, c)| c)
-        .sum();
-    let tree_size_before_block: Option<u64> = result
-        .orchard_tree_size_after
-        .and_then(|sz| {
-            let sz = sz as u64;
-            let actions = total_actions_in_block as u64;
-            if sz < actions {
-                eprintln!(
-                    "WARN: orchard_tree_size_after ({}) < total actions in block ({}) at height {} \
-                     -- chain_metadata may be corrupt, skipping position tracking for this block",
-                    sz, actions, result.height,
-                );
-                None
-            } else {
-                Some(sz - actions)
+/// Marks `is_spent = true` on every note in `notes` whose hex-decoded
+/// nullifier appears in `spent`. Shared by the Orchard and Ironwood Phase-5
+/// passes in `run_sync_inner` so the two pools use identical matching logic
+/// against their own pool-scoped spent-nullifier set (
+/// nullifier sets are pool-scoped).
+fn mark_spent(notes: &mut [ShieldedNote], spent: &std::collections::HashSet<[u8; 32]>) {
+    for note in notes {
+        if let Some(ref nf_hex) = note.nullifier {
+            match hex::decode(nf_hex) {
+                Ok(nf_bytes) => {
+                    if let Ok(nf_arr) = <[u8; 32]>::try_from(nf_bytes.as_slice()) {
+                        if spent.contains(&nf_arr) {
+                            note.is_spent = true;
+                        }
+                    } else {
+                        eprintln!(
+                            "WARN: is_spent: nullifier hex has wrong length ({} bytes), skipping",
+                            nf_hex.len() / 2
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: is_spent: malformed nullifier hex {:?}: {}",
+                        &nf_hex[..nf_hex.len().min(16)],
+                        e
+                    );
+                }
             }
-        });
+        }
+    }
+}
+
+/// Compute the commitment tree size before a block and the cumulative action
+/// offset for each transaction in the block, for a single pool. Shared by
+/// `compute_block_position_ctx` (Orchard) and `compute_ironwood_block_position_ctx`
+/// (Ironwood) — both pools derive position with the exact same formula, just
+/// against their own separate tree-size counter and action-count list.
+fn compute_pool_position_ctx<'a>(
+    height: u32,
+    pool_name: &str,
+    tree_size_after: Option<u32>,
+    action_counts: &'a [(String, u32)],
+) -> (Option<u64>, std::collections::HashMap<&'a str, u64>) {
+    let total_actions_in_block: u32 = action_counts.iter().map(|(_, c)| c).sum();
+    let tree_size_before_block: Option<u64> = tree_size_after.and_then(|sz| {
+        let sz = sz as u64;
+        let actions = total_actions_in_block as u64;
+        if sz < actions {
+            eprintln!(
+                "WARN: {pool_name}_tree_size_after ({}) < total actions in block ({}) at height {} \
+                 -- chain_metadata may be corrupt, skipping position tracking for this block",
+                sz, actions, height,
+            );
+            None
+        } else {
+            Some(sz - actions)
+        }
+    });
 
     let mut cumulative: u64 = 0;
     let mut tx_action_start_map: std::collections::HashMap<&str, u64> = Default::default();
-    for (txid, count) in &result.tx_orchard_action_counts {
+    for (txid, count) in action_counts {
         if let Some(prev) = tx_action_start_map.insert(txid.as_str(), cumulative) {
             eprintln!(
-                "WARN: duplicate txid {} in block {} (previous offset {}, new {})",
-                txid, result.height, prev, cumulative,
+                "WARN: duplicate txid {} in block {} (previous offset {}, new {}) [{pool_name}]",
+                txid, height, prev, cumulative,
             );
         }
         cumulative += *count as u64;
     }
 
     (tree_size_before_block, tx_action_start_map)
+}
+
+/// Compute the Orchard commitment tree size before a block and the cumulative
+/// action offset for each transaction in the block. Used by both Phase 2 and
+/// Phase 4 to derive per-note positions.
+fn compute_block_position_ctx(result: &TrialResult) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
+    compute_pool_position_ctx(
+        result.height,
+        "orchard",
+        result.orchard_tree_size_after,
+        &result.tx_orchard_action_counts,
+    )
+}
+
+/// Compute the Ironwood commitment tree size before a block and the cumulative
+/// action offset for each transaction in the block. Mirrors
+/// `compute_block_position_ctx`, reading the separate Ironwood counters.
+fn compute_ironwood_block_position_ctx(
+    result: &TrialResult,
+) -> (Option<u64>, std::collections::HashMap<&str, u64>) {
+    compute_pool_position_ctx(
+        result.height,
+        "ironwood",
+        result.ironwood_tree_size_after,
+        &result.tx_ironwood_action_counts,
+    )
 }
 
 /// Per-block context passed to `fetch_and_decrypt_tx` to avoid exceeding the
@@ -684,6 +769,11 @@ struct BlockFetchCtx<'a> {
     network: Network,
     tree_size_before_block: Option<u64>,
     tx_action_start: u64,
+    /// Ironwood-pool twin of `tree_size_before_block`, computed from the
+    /// separate `ironwood_commitment_tree_size` counter.
+    ironwood_tree_size_before_block: Option<u64>,
+    /// Ironwood-pool twin of `tx_action_start`.
+    ironwood_tx_action_start: u64,
 }
 
 /// Intermediate result produced by the trial-decrypt pipeline for one compact block.
@@ -692,19 +782,32 @@ struct TrialResult {
     hash: String,
     time: u32,
     matched_txids: Vec<String>,
-    /// Per-tx nullifiers: (txid, [nf_bytes, …]) for Phase 4 outgoing-tx detection.
-    /// Each entry records the nullifiers spent by that transaction so we can match
-    /// against nullifiers of notes we received in Phase 2.
+    /// Per-tx nullifiers spent in Orchard actions: (txid, [nf_bytes, …]) for
+    /// Phase 4 outgoing-tx detection. Each entry records the nullifiers spent
+    /// by that transaction so we can match against nullifiers of Orchard notes
+    /// we received in Phase 2.
     tx_nullifiers: Vec<(String, Vec<[u8; 32]>)>,
+    /// Per-tx nullifiers spent in Ironwood actions — kept separate from
+    /// `tx_nullifiers` (Ironwood spent-matching stays pool-scoped so an
+    /// Ironwood note is only ever matched against Ironwood-action spends).
+    tx_ironwood_nullifiers: Vec<(String, Vec<[u8; 32]>)>,
 
     /// Orchard commitment tree size after this block (from CompactBlock.chain_metadata).
     /// `None` if chain_metadata is absent or orchard_commitment_tree_size is 0.
     orchard_tree_size_after: Option<u32>,
+    /// Ironwood commitment tree size after this block (from
+    /// `CompactBlock.chain_metadata.ironwood_commitment_tree_size` — a separate
+    /// counter from the Orchard one). `None` if chain_metadata is absent or the
+    /// counter is 0.
+    ironwood_tree_size_after: Option<u32>,
     /// Per-transaction Orchard action counts in block order: (txid, action_count).
     /// Used to compute per-note position offsets within the block.
     /// Txids are expected to be unique within a block; duplicates are logged as
     /// warnings by `compute_block_position_ctx`.
     tx_orchard_action_counts: Vec<(String, u32)>,
+    /// Per-transaction Ironwood action counts in block order, mirroring
+    /// `tx_orchard_action_counts` for the Ironwood pool.
+    tx_ironwood_action_counts: Vec<(String, u32)>,
 }
 
 /// Parse the network string, prepare IVKs, and decode the UFVK.
@@ -769,11 +872,21 @@ async fn process_compact_block(
     let block_time = block.time;
 
     // Fast path: when orchard_only is set, skip spawn_blocking entirely
-    // for blocks where no transaction has any Orchard actions. This is an
-    // O(1) check per block and eliminates all Rayon overhead for the
+    // for blocks where no transaction has any Orchard OR Ironwood action. This
+    // is an O(1) check per block and eliminates all Rayon overhead for the
     // pre-NU5 era and for the vast majority of post-NU5 blocks that carry
     // only Sapling spam (sandblasting attack zone 1,687,104–2,100,000).
-    if orchard_only && block.vtx.iter().all(|tx| tx.actions.is_empty()) {
+    //
+    // This guard must account for Ironwood actions too. Checking
+    // only `tx.actions` (Orchard) would silently skip — and lose every note
+    // in — a block whose transactions carry Ironwood actions but zero Orchard
+    // actions (entirely plausible once Ironwood-only sends exist post-NU6.3).
+    if orchard_only
+        && block
+            .vtx
+            .iter()
+            .all(|tx| tx.actions.is_empty() && tx.ironwood_actions.is_empty())
+    {
         blocks_ref.fetch_add(1, Ordering::Relaxed);
         if let Some(ref cb) = on_block_done {
             cb();
@@ -784,8 +897,11 @@ async fn process_compact_block(
             time: block_time,
             matched_txids: vec![],
             tx_nullifiers: vec![],
+            tx_ironwood_nullifiers: vec![],
             orchard_tree_size_after: None,
+            ironwood_tree_size_after: None,
             tx_orchard_action_counts: vec![],
+            tx_ironwood_action_counts: vec![],
         });
     }
 
@@ -800,12 +916,16 @@ async fn process_compact_block(
                 ctx.outputs.iter().map(proto_sapling_to_compact).collect()
             },
             orchard_actions: ctx.actions.iter().map(proto_orchard_to_compact).collect(),
+            // Ironwood is treated on par with Orchard (not gated by `orchard_only`,
+            // which only ever meant "skip Sapling") — always processed.
+            ironwood_actions: ctx.ironwood_actions.iter().map(proto_orchard_to_compact).collect(),
         })
         .collect();
 
     // Collect spent nullifiers per tx before moving compact_txs into
     // spawn_blocking. These are used in Phase 4 to detect outgoing txs
-    // whose inputs spend notes we received in Phase 2.
+    // whose inputs spend notes we received in Phase 2. Kept pool-scoped
+    // (separate Orchard / Ironwood lists).
     let tx_nullifiers: Vec<(String, Vec<[u8; 32]>)> = compact_txs
         .iter()
         .map(|tx| {
@@ -817,21 +937,42 @@ async fn process_compact_block(
             (tx.txid.clone(), nfs)
         })
         .collect();
+    let tx_ironwood_nullifiers: Vec<(String, Vec<[u8; 32]>)> = compact_txs
+        .iter()
+        .map(|tx| {
+            let nfs: Vec<[u8; 32]> = tx
+                .ironwood_actions
+                .iter()
+                .filter_map(|a| a.nf.as_slice().try_into().ok())
+                .collect();
+            (tx.txid.clone(), nfs)
+        })
+        .collect();
 
-    // Extract Orchard commitment tree size from chain_metadata.
-    // If chain_metadata is absent or zero, position tracking falls back to None for this block.
+    // Extract Orchard / Ironwood commitment tree sizes from chain_metadata.
+    // These are separate counters â if either is absent or zero,
+    // position tracking falls back to None for that pool in this block.
     let orchard_tree_size_after: Option<u32> = block
         .chain_metadata
         .as_ref()
         .map(|m| m.orchard_commitment_tree_size)
         .filter(|&sz| sz > 0);
+    let ironwood_tree_size_after: Option<u32> = block
+        .chain_metadata
+        .as_ref()
+        .map(|m| m.ironwood_commitment_tree_size)
+        .filter(|&sz| sz > 0);
 
-    // Record per-tx Orchard action counts (in the same order as block.vtx).
+    // Record per-tx Orchard / Ironwood action counts (in the same order as block.vtx).
     // Used to compute per-note positions: each note's position = tree_size_before_block
     // + cumulative actions before this tx + note's action_index within the tx.
     let tx_orchard_action_counts: Vec<(String, u32)> = compact_txs
         .iter()
         .map(|tx| (tx.txid.clone(), tx.orchard_actions.len() as u32))
+        .collect();
+    let tx_ironwood_action_counts: Vec<(String, u32)> = compact_txs
+        .iter()
+        .map(|tx| (tx.txid.clone(), tx.ironwood_actions.len() as u32))
         .collect();
 
     // Offload CPU-bound trial decryption to the blocking thread pool.
@@ -856,8 +997,11 @@ async fn process_compact_block(
         time: block_time,
         matched_txids,
         tx_nullifiers,
+        tx_ironwood_nullifiers,
         orchard_tree_size_after,
+        ironwood_tree_size_after,
         tx_orchard_action_counts,
+        tx_ironwood_action_counts,
     })
 }
 
@@ -881,6 +1025,8 @@ async fn fetch_and_decrypt_tx(
         network,
         tree_size_before_block,
         tx_action_start,
+        ironwood_tree_size_before_block,
+        ironwood_tx_action_start,
     } = ctx;
     // GetTransaction — TxFilter.hash expects internal (little-endian) byte order.
     let txid_bytes_le: Vec<u8> = hex::decode(txid_hex)
@@ -920,14 +1066,18 @@ async fn fetch_and_decrypt_tx(
     };
     *full_decrypt_ms += t_decrypt.elapsed().as_millis() as u64;
 
-    // Collect received Orchard nullifiers before consuming decrypted.orchard_outputs.
+    // Collect received Orchard + Ironwood nullifiers before consuming
+    // decrypted.{orchard,ironwood}_outputs. `our_nullifiers` in run_sync_inner
+    // stays a single flat (pool-agnostic) set — see the Phase 4/5 comments
+    // there for why that is safe — so both pools are merged here.
     let received_nullifiers: Vec<[u8; 32]> = decrypted
         .orchard_outputs
         .iter()
+        .chain(decrypted.ironwood_outputs.iter())
         .filter_map(|note| note.nullifier)
         .collect();
 
-    // Sapling spent-tracking is out of scope: Ledger only supports Orchard spending.
+    // Sapling spent-tracking is out of scope: Ledger only supports Orchard/Ironwood spending.
     let sapling_notes: Vec<ShieldedNote> = decrypted
         .sapling_outputs
         .into_iter()
@@ -935,6 +1085,7 @@ async fn fetch_and_decrypt_tx(
             amount: o.amount,
             transfer_type: o.transfer_type,
             memo: o.memo,
+            pool: pool_tag(o.pool),
             nullifier: None,
             rho: None,
             rseed: None,
@@ -960,6 +1111,35 @@ async fn fetch_and_decrypt_tx(
                 amount: note.amount,
                 transfer_type: note.transfer_type.clone(),
                 memo: note.memo.clone(),
+                pool: pool_tag(note.pool),
+                nullifier: note.nullifier.map(hex::encode),
+                rho: note.rho.map(hex::encode),
+                rseed: note.rseed.map(hex::encode),
+                cmx: note.cmx.map(hex::encode),
+                position,
+                recipient: note.recipient.map(hex::encode),
+                is_spent: false, // set by Phase 5 post-processing
+            }
+        })
+        .collect();
+
+    // Ironwood notes mirror the Orchard mapping above exactly, except position
+    // is derived from the SEPARATE Ironwood tree-size counter â never
+    // mixed with the Orchard one.
+    let ironwood_notes: Vec<ShieldedNote> = decrypted
+        .ironwood_outputs
+        .iter()
+        .map(|note| {
+            let position = ironwood_tree_size_before_block.and_then(|tree_size| {
+                note.action_index
+                    .map(|idx| tree_size + ironwood_tx_action_start + idx as u64)
+            });
+
+            ShieldedNote {
+                amount: note.amount,
+                transfer_type: note.transfer_type.clone(),
+                memo: note.memo.clone(),
+                pool: pool_tag(note.pool),
                 nullifier: note.nullifier.map(hex::encode),
                 rho: note.rho.map(hex::encode),
                 rseed: note.rseed.map(hex::encode),
@@ -980,9 +1160,21 @@ async fn fetch_and_decrypt_tx(
         fee_zatoshis: decrypted.fee_zatoshis,
         sapling_notes,
         orchard_notes,
+        ironwood_notes,
     };
 
     Ok(Some((tx, received_nullifiers)))
+}
+
+/// Maps a `zcash_crypto::decrypt` pool tag to the NAPI-facing string used by
+/// `ShieldedNote.pool`.
+fn pool_tag(pool: zcash_protocol::ShieldedPool) -> String {
+    match pool {
+        zcash_protocol::ShieldedPool::Sapling => "sapling",
+        zcash_protocol::ShieldedPool::Orchard => "orchard",
+        zcash_protocol::ShieldedPool::Ironwood => "ironwood",
+    }
+    .to_string()
 }
 
 // ─── proto conversion helpers ─────────────────────────────────────────────────
@@ -1088,6 +1280,7 @@ mod tests {
             cmx: None,
             recipient: None,
             action_index: None,
+            pool: zcash_protocol::ShieldedPool::Orchard,
         };
         // Inline mapping (mirrors the production code path in fetch_and_decrypt_tx).
         let note = ShieldedNote {
@@ -1101,6 +1294,7 @@ mod tests {
             position: None,
             recipient: dec.recipient.map(hex::encode),
             is_spent: false,
+            pool: "orchard".to_string(),
         };
         assert_eq!(note.amount, 42_000_000);
         assert_eq!(note.memo, "test memo");
@@ -1130,6 +1324,9 @@ mod tests {
                 ("txA".to_string(), 3),
                 ("txB".to_string(), 2),
             ],
+            tx_ironwood_nullifiers: vec![],
+            ironwood_tree_size_after: None,
+            tx_ironwood_action_counts: vec![],
         };
 
         let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
@@ -1161,6 +1358,9 @@ mod tests {
             tx_nullifiers: vec![],
             orchard_tree_size_after: None,
             tx_orchard_action_counts: vec![("txA".to_string(), 3)],
+            tx_ironwood_nullifiers: vec![],
+            ironwood_tree_size_after: None,
+            tx_ironwood_action_counts: vec![],
         };
 
         let total_actions_in_block: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
@@ -1190,6 +1390,9 @@ mod tests {
                 ("txA".to_string(), 3),
                 ("txB".to_string(), 3),
             ],
+            tx_ironwood_nullifiers: vec![],
+            ironwood_tree_size_after: None,
+            tx_ironwood_action_counts: vec![],
         };
 
         let total_actions: u32 = result.tx_orchard_action_counts.iter().map(|(_, c)| c).sum();
@@ -1223,6 +1426,7 @@ mod tests {
             amount: 1_000,
             transfer_type: "incoming".to_string(),
             memo: String::new(),
+            pool: "orchard".to_string(),
             nullifier: Some(nf_hex.to_string()),
             rho: None,
             rseed: None,
@@ -1240,8 +1444,11 @@ mod tests {
             time: 0,
             matched_txids: vec![],
             tx_nullifiers: vec![(txid.to_string(), vec![nf_bytes])],
+            tx_ironwood_nullifiers: vec![],
             orchard_tree_size_after: None,
+            ironwood_tree_size_after: None,
             tx_orchard_action_counts: vec![],
+            tx_ironwood_action_counts: vec![],
         }
     }
 
@@ -1261,6 +1468,7 @@ mod tests {
             fee_zatoshis: 0,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+            ironwood_notes: vec![],
         }];
 
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
@@ -1312,6 +1520,7 @@ mod tests {
             fee_zatoshis: 0,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+            ironwood_notes: vec![],
         }];
 
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
@@ -1364,6 +1573,7 @@ mod tests {
             fee_zatoshis: 0,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&our_nf_hex)],
+            ironwood_notes: vec![],
         }];
 
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
@@ -1421,6 +1631,7 @@ mod tests {
             fee_zatoshis: 0,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
+            ironwood_notes: vec![],
         }];
 
         let mut our_nullifiers: std::collections::HashSet<[u8; 32]> = Default::default();
@@ -1660,5 +1871,229 @@ mod tests {
             .collect();
 
         assert!(spent_known.is_empty());
+    }
+
+    // ── Ironwood (NU6.3) — orchard_only fast-path guard ──────────────────────
+
+    /// Regression guard for the orchard_only fast-path. A block with
+    /// `orchard_only == true`, zero Orchard actions, and at least one Ironwood
+    /// action must NOT be skipped by the fast path — it must be fully processed
+    /// so the Ironwood action is trial-decrypted. This test fails against the
+    /// unfixed guard (`block.vtx.iter().all(|tx| tx.actions.is_empty())`),
+    /// which would incorrectly treat this block as "nothing to scan".
+    ///
+    /// We assert on `tx_ironwood_action_counts` rather than `matched_txids`:
+    /// the fast path's early-return always produces an EMPTY
+    /// `tx_ironwood_action_counts` (see the early `Ok(TrialResult { .. })` in
+    /// `process_compact_block`), while the full path always populates it from
+    /// `compact_txs` regardless of whether the ivks actually match anything.
+    /// A non-empty count here is therefore direct proof the fast path was not
+    /// taken, independent of trial-decryption match/no-match.
+    #[tokio::test]
+    async fn fast_path_not_skipped_for_orchard_only_block_with_only_ironwood_actions() {
+        use zcash_client_backend::proto::compact_formats::{
+            ChainMetadata, CompactBlock as ProtoCompactBlock, CompactTx,
+        };
+
+        let block = ProtoCompactBlock {
+            height: 3_500_000,
+            hash: vec![0xAB; 32],
+            time: 1_800_000_000,
+            vtx: vec![CompactTx {
+                index: 0,
+                txid: vec![0x01; 32],
+                actions: vec![], // zero Orchard actions
+                ironwood_actions: vec![ProtoOrchardAction {
+                    nullifier: vec![0u8; 32],
+                    cmx: vec![0u8; 32],
+                    ephemeral_key: vec![0u8; 32],
+                    ciphertext: vec![0u8; 52],
+                }],
+                ..Default::default()
+            }],
+            chain_metadata: Some(ChainMetadata {
+                orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let ivks = Arc::new(decrypt::prepare_ivks(TEST_UFVK).unwrap());
+        let trial_ms = Arc::new(AtomicU64::new(0));
+        let blocks = Arc::new(AtomicU64::new(0));
+
+        let result = process_compact_block(
+            block,
+            ivks,
+            /* orchard_only */ true,
+            Network::MainNetwork,
+            trial_ms,
+            blocks,
+            None,
+        )
+        .await
+        .expect("process_compact_block must not error");
+
+        assert_eq!(
+            result.tx_ironwood_action_counts,
+            vec![("0101010101010101010101010101010101010101010101010101010101010101".to_string(), 1)],
+            "an Ironwood-only block must be fully processed (fast path must not skip it),              proven by a populated tx_ironwood_action_counts"
+        );
+    }
+
+    /// Regression companion: a block with zero Orchard AND zero Ironwood actions
+    /// (the true "nothing to scan" case) must still take the fast path.
+    #[tokio::test]
+    async fn fast_path_still_skips_block_with_no_orchard_and_no_ironwood_actions() {
+        use zcash_client_backend::proto::compact_formats::CompactBlock as ProtoCompactBlock;
+
+        let block = ProtoCompactBlock {
+            height: 3_500_001,
+            hash: vec![0xCD; 32],
+            time: 1_800_000_100,
+            vtx: vec![],
+            ..Default::default()
+        };
+
+        let ivks = Arc::new(decrypt::prepare_ivks(TEST_UFVK).unwrap());
+        let trial_ms = Arc::new(AtomicU64::new(0));
+        let blocks = Arc::new(AtomicU64::new(0));
+
+        let result = process_compact_block(
+            block,
+            ivks,
+            true,
+            Network::MainNetwork,
+            trial_ms,
+            blocks,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result.tx_ironwood_action_counts.is_empty(),
+            "a truly empty block must still take the fast path"
+        );
+        assert!(result.tx_orchard_action_counts.is_empty());
+    }
+
+    // ── Ironwood position — separate tree-size counter ─────────────────
+
+    /// Ironwood position must be derived from `ironwood_commitment_tree_size`,
+    /// never from the Orchard counter — even when the two differ substantially.
+    #[test]
+    fn ironwood_position_uses_separate_tree_size_counter() {
+        let result = TrialResult {
+            height: 3_500_000,
+            hash: String::new(),
+            time: 0,
+            matched_txids: vec![],
+            tx_nullifiers: vec![],
+            tx_ironwood_nullifiers: vec![],
+            orchard_tree_size_after: Some(1_000),
+            ironwood_tree_size_after: Some(6),
+            tx_orchard_action_counts: vec![("tx".to_string(), 4)],
+            tx_ironwood_action_counts: vec![("tx".to_string(), 2)],
+        };
+
+        let (orchard_tree_size_before, orchard_starts) = compute_block_position_ctx(&result);
+        let (ironwood_tree_size_before, ironwood_starts) =
+            compute_ironwood_block_position_ctx(&result);
+
+        assert_eq!(orchard_tree_size_before, Some(996), "1000 - 4 orchard actions");
+        assert_eq!(ironwood_tree_size_before, Some(4), "6 - 2 ironwood actions");
+        assert_ne!(
+            orchard_tree_size_before, ironwood_tree_size_before,
+            "the two pools must never share a tree-size base"
+        );
+        assert_eq!(orchard_starts["tx"], 0);
+        assert_eq!(ironwood_starts["tx"], 0);
+    }
+
+    // ── is_spent — pool-scoped matching ────────────────
+
+    /// An Ironwood note must NOT be marked spent by a nullifier that was only
+    /// observed as spent in an ORCHARD action (and vice versa) — nullifier sets
+    /// stay pool-scoped even when (by coincidence, as constructed here) the same
+    /// 32-byte value appears in both an Orchard-scoped and an Ironwood-scoped
+    /// spent set.
+    #[test]
+    fn is_spent_marking_is_pool_scoped_between_orchard_and_ironwood() {
+        let shared_nf = [0x77u8; 32];
+        let shared_nf_hex = hex::encode(shared_nf);
+
+        let mut orchard_notes = vec![make_note_with_nullifier(&shared_nf_hex)];
+        let mut ironwood_notes = vec![make_note_with_nullifier(&shared_nf_hex)];
+
+        // Only the ORCHARD spent-set contains the nullifier.
+        let mut spent_orchard: std::collections::HashSet<[u8; 32]> = Default::default();
+        spent_orchard.insert(shared_nf);
+        let spent_ironwood: std::collections::HashSet<[u8; 32]> = Default::default();
+
+        mark_spent(&mut orchard_notes, &spent_orchard);
+        mark_spent(&mut ironwood_notes, &spent_ironwood);
+
+        assert!(
+            orchard_notes[0].is_spent,
+            "orchard note must be marked spent from the orchard-scoped set"
+        );
+        assert!(
+            !ironwood_notes[0].is_spent,
+            "ironwood note sharing the same nullifier value must NOT be marked spent              from an orchard-only spend — pool scoping must prevent cross-contamination"
+        );
+    }
+
+    // ── ShieldedTransaction — Ironwood/Orchard note separation ───────────────
+
+    /// Regression: an Orchard/Sapling-only transaction produces an empty
+    /// `ironwood_notes` list and leaves `orchard_notes` unaffected — the new
+    /// field does not alter existing behaviour.
+    #[test]
+    fn orchard_only_transaction_has_empty_ironwood_notes() {
+        let tx = ShieldedTransaction {
+            txid: "abc123".to_string(),
+            hex: String::new(),
+            block_height: 1,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier("aa")],
+            ironwood_notes: vec![],
+        };
+        assert!(tx.ironwood_notes.is_empty());
+        assert_eq!(tx.orchard_notes.len(), 1);
+    }
+
+    /// Ironwood and Orchard notes on the same transaction stay in their own
+    /// lists — no cross-contamination between `orchard_notes` and
+    /// `ironwood_notes`.
+    #[test]
+    fn mixed_transaction_keeps_orchard_and_ironwood_notes_separate() {
+        let tx = ShieldedTransaction {
+            txid: "mixed".to_string(),
+            hex: String::new(),
+            block_height: 1,
+            block_hash: String::new(),
+            block_time: 0,
+            fee_zatoshis: 0,
+            sapling_notes: vec![],
+            orchard_notes: vec![make_note_with_nullifier("aa")],
+            ironwood_notes: vec![make_note_with_nullifier("bb")],
+        };
+        assert_eq!(tx.orchard_notes.len(), 1);
+        assert_eq!(tx.ironwood_notes.len(), 1);
+        assert_ne!(tx.orchard_notes[0].nullifier, tx.ironwood_notes[0].nullifier);
+    }
+
+    // ── pool_tag ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pool_tag_maps_all_three_shielded_pools() {
+        assert_eq!(pool_tag(zcash_protocol::ShieldedPool::Sapling), "sapling");
+        assert_eq!(pool_tag(zcash_protocol::ShieldedPool::Orchard), "orchard");
+        assert_eq!(pool_tag(zcash_protocol::ShieldedPool::Ironwood), "ironwood");
     }
 }

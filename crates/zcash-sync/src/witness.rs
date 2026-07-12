@@ -15,11 +15,48 @@ use zcash_crypto::tree::{
     ORCHARD_SHARD_HEIGHT,
 };
 
-use crate::client::{chain_tip_with_client, connect, get_orchard_subtree_roots, get_tree_state_at};
+use crate::client::{
+    chain_tip_with_client, connect, get_ironwood_subtree_roots, get_orchard_subtree_roots,
+    get_tree_state_at,
+};
 
 /// Default safety margin (in blocks) below the chain tip when the caller does
 /// not pin a specific anchor height. Matches the zcashd / zecwallet default.
 const DEFAULT_ANCHOR_DEPTH_BLOCKS: u32 = 10;
+
+/// The shielded pool a witness/anchor is computed against. Orchard and Ironwood
+/// share the exact same commitment-tree cryptography (Pallas/Sinsemilla,
+/// `ShardTree<32,16>` — see `zcash_crypto::tree::build_witnesses`) — only the
+/// gRPC pool selector (`GetSubtreeRoots`) and the `TreeState` field consulted
+/// (`orchard_tree` vs `ironwood_tree`) differ between the two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pool {
+    Orchard,
+    Ironwood,
+}
+
+impl Pool {
+    /// Reads the pool's commitment-tree frontier hex string out of a `TreeState`.
+    fn tree_state_hex(self, ts: &zcash_client_backend::proto::service::TreeState) -> &str {
+        match self {
+            Pool::Orchard => &ts.orchard_tree,
+            Pool::Ironwood => &ts.ironwood_tree,
+        }
+    }
+}
+
+/// Fetch completed shard roots for `pool`, dispatching to the pool-specific
+/// `GetSubtreeRoots` call.
+async fn get_subtree_roots(
+    client: &mut CompactTxStreamerClient<Channel>,
+    pool: Pool,
+    start_index: u32,
+) -> Result<Vec<zcash_client_backend::proto::service::SubtreeRoot>> {
+    match pool {
+        Pool::Orchard => get_orchard_subtree_roots(client, start_index).await,
+        Pool::Ironwood => get_ironwood_subtree_roots(client, start_index).await,
+    }
+}
 
 /// A note for which a witness is requested.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +97,31 @@ pub async fn fetch_orchard_anchor(
     anchor_height: Option<u32>,
     anchor_depth_blocks: Option<u32>,
 ) -> Result<WitnessOutput> {
+    fetch_anchor_for_pool(Pool::Orchard, grpc_url, anchor_height, anchor_depth_blocks).await
+}
+
+/// Ironwood (NU6.3) sibling of [`fetch_orchard_anchor`]: fetches the Ironwood
+/// anchor (frontier root) at `anchor_height` without computing any per-note
+/// witnesses, reusing the exact same ShardTree assembly.
+///
+/// # Errors
+///
+/// Returns an error if the gRPC connection fails or if tree-state decoding fails.
+pub async fn fetch_ironwood_anchor(
+    grpc_url: &str,
+    anchor_height: Option<u32>,
+    anchor_depth_blocks: Option<u32>,
+) -> Result<WitnessOutput> {
+    fetch_anchor_for_pool(Pool::Ironwood, grpc_url, anchor_height, anchor_depth_blocks).await
+}
+
+/// Shared implementation behind [`fetch_orchard_anchor`] / [`fetch_ironwood_anchor`].
+async fn fetch_anchor_for_pool(
+    pool: Pool,
+    grpc_url: &str,
+    anchor_height: Option<u32>,
+    anchor_depth_blocks: Option<u32>,
+) -> Result<WitnessOutput> {
     let channel = connect(grpc_url).await?;
     let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
 
@@ -75,10 +137,10 @@ pub async fn fetch_orchard_anchor(
 
     // Fetch tree state at the anchor.
     let tree_state = get_tree_state_at(&mut client, resolved_height).await?;
-    let frontier_bytes = hex::decode(&tree_state.orchard_tree)
-        .map_err(|e| anyhow!("TreeState.orchard_tree hex decode failed: {}", e))?;
+    let frontier_bytes = hex::decode(pool.tree_state_hex(&tree_state))
+        .map_err(|e| anyhow!("TreeState frontier hex decode failed: {}", e))?;
 
-    let subtree_roots = get_orchard_subtree_roots(&mut client, 0).await?;
+    let subtree_roots = get_subtree_roots(&mut client, pool, 0).await?;
     let cap_roots: Vec<(u32, [u8; 32])> = subtree_roots
         .iter()
         .enumerate()
@@ -110,6 +172,24 @@ pub async fn fetch_orchard_anchor(
 /// Returns an error if the notes list is empty, if the gRPC connection fails,
 /// or if the pure witness assembly fails (e.g. anchor mismatch).
 pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
+    compute_witnesses_for_pool(Pool::Orchard, req).await
+}
+
+/// Ironwood (NU6.3) sibling of [`compute_witnesses`]: computes Merkle witnesses
+/// for notes in the Ironwood commitment tree, reusing the exact same ShardTree
+/// assembly (`zcash_crypto::tree::build_witnesses` is pool-agnostic — spec
+/// constraint "same cryptography as Orchard — reuse, do not reimplement").
+///
+/// # Errors
+///
+/// Returns an error if the notes list is empty, if the gRPC connection fails,
+/// or if the pure witness assembly fails (e.g. anchor mismatch).
+pub async fn compute_ironwood_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
+    compute_witnesses_for_pool(Pool::Ironwood, req).await
+}
+
+/// Shared implementation behind [`compute_witnesses`] / [`compute_ironwood_witnesses`].
+async fn compute_witnesses_for_pool(pool: Pool, req: WitnessRequest) -> Result<WitnessOutput> {
     if req.notes.is_empty() {
         return Err(anyhow!("compute_witnesses: notes list is empty"));
     }
@@ -131,16 +211,16 @@ pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
 
     // 2. Fetch tree state at the anchor (frontier + boundary metadata).
     let tree_state = get_tree_state_at(&mut client, anchor_height).await?;
-    let frontier_bytes = hex::decode(&tree_state.orchard_tree)
-        .map_err(|e| anyhow!("TreeState.orchard_tree hex decode failed: {}", e))?;
+    let frontier_bytes = hex::decode(pool.tree_state_hex(&tree_state))
+        .map_err(|e| anyhow!("TreeState frontier hex decode failed: {}", e))?;
 
     // Total commitments at the anchor — used to bound the frontier shard and to
     // trim per-shard fetches by absolute position.
     let anchor_total_leaves =
         frontier_leaf_count(&frontier_bytes).map_err(|e| anyhow!("frontier leaf count: {}", e))?;
 
-    // 3. Fetch every completed Orchard shard root.
-    let subtree_roots = get_orchard_subtree_roots(&mut client, 0).await?;
+    // 3. Fetch every completed shard root for this pool.
+    let subtree_roots = get_subtree_roots(&mut client, pool, 0).await?;
 
     // 4. Determine which shards contain at least one requested note.
     let needed_shards: std::collections::BTreeSet<u32> = req
@@ -152,6 +232,7 @@ pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
     // 5. For each needed shard, find its block-height range and fetch cmxs.
     let shard_leaves = fetch_shard_leaves(
         &mut client,
+        pool,
         &subtree_roots,
         anchor_height,
         anchor_total_leaves,
@@ -200,6 +281,7 @@ pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
 /// size at the block just before the scan starts.
 async fn fetch_shard_leaves(
     client: &mut CompactTxStreamerClient<Channel>,
+    pool: Pool,
     subtree_roots: &[zcash_client_backend::proto::service::SubtreeRoot],
     anchor_height: u32,
     anchor_total_leaves: u64,
@@ -211,7 +293,7 @@ async fn fetch_shard_leaves(
         // Scan range: from the previous shard's completing block (inclusive) so
         // any of this shard's leaves that spilled into that block are captured.
         let start_height = if shard_idx == 0 {
-            // Orchard activation is enforced server-side; clamp to 1.
+            // Pool activation is enforced server-side; clamp to 1.
             1u32
         } else {
             let prev = subtree_roots.get((shard_idx - 1) as usize).ok_or_else(|| {
@@ -231,8 +313,8 @@ async fn fetch_shard_leaves(
 
         // Absolute position of the first commitment in `start_height` = number of
         // commitments present at the end of the preceding block.
-        let base_offset = tree_size_at(client, start_height.saturating_sub(1)).await?;
-        let raw = collect_orchard_cmxs(client, start_height, end_height).await?;
+        let base_offset = tree_size_at(client, pool, start_height.saturating_sub(1)).await?;
+        let raw = collect_cmxs(client, pool, start_height, end_height).await?;
 
         let (lo, hi) = shard_leaf_bounds(
             shard_idx,
@@ -249,15 +331,19 @@ async fn fetch_shard_leaves(
     Ok(out)
 }
 
-/// Number of Orchard commitments present at the end of block `height`
+/// Number of commitments present at the end of block `height` for `pool`
 /// (0 for height 0 / pre-activation), derived from `GetTreeState`'s frontier.
-async fn tree_size_at(client: &mut CompactTxStreamerClient<Channel>, height: u32) -> Result<u64> {
+async fn tree_size_at(
+    client: &mut CompactTxStreamerClient<Channel>,
+    pool: Pool,
+    height: u32,
+) -> Result<u64> {
     if height == 0 {
         return Ok(0);
     }
     let ts = get_tree_state_at(client, height).await?;
-    let bytes = hex::decode(&ts.orchard_tree)
-        .map_err(|e| anyhow!("TreeState.orchard_tree hex decode at {}: {}", height, e))?;
+    let bytes = hex::decode(pool.tree_state_hex(&ts))
+        .map_err(|e| anyhow!("TreeState frontier hex decode at {}: {}", height, e))?;
     frontier_leaf_count(&bytes).map_err(|e| anyhow!("frontier leaf count at {}: {}", height, e))
 }
 
@@ -299,8 +385,9 @@ fn shard_leaf_bounds(
     Ok((lo, hi))
 }
 
-async fn collect_orchard_cmxs(
+async fn collect_cmxs(
     client: &mut CompactTxStreamerClient<Channel>,
+    pool: Pool,
     start: u32,
     end: u32,
 ) -> Result<Vec<[u8; 32]>> {
@@ -327,14 +414,18 @@ async fn collect_orchard_cmxs(
         .await
         .map_err(|e| anyhow!("GetBlockRange stream error: {}", e))?
     {
-        push_block_cmxs(&block, &mut out)?;
+        push_block_cmxs(&block, pool, &mut out)?;
     }
     Ok(out)
 }
 
-fn push_block_cmxs(block: &CompactBlock, out: &mut Vec<[u8; 32]>) -> Result<()> {
+fn push_block_cmxs(block: &CompactBlock, pool: Pool, out: &mut Vec<[u8; 32]>) -> Result<()> {
     for tx in &block.vtx {
-        for action in &tx.actions {
+        let actions = match pool {
+            Pool::Orchard => &tx.actions,
+            Pool::Ironwood => &tx.ironwood_actions,
+        };
+        for action in actions {
             let bytes: [u8; 32] = action.cmx.as_slice().try_into().map_err(|_| {
                 anyhow!(
                     "cmx not 32 bytes (got {}) at block {}",
@@ -388,7 +479,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        push_block_cmxs(&block, &mut out).unwrap();
+        push_block_cmxs(&block, Pool::Orchard, &mut out).unwrap();
 
         assert_eq!(out.len(), 3);
         assert_eq!(out[0], [1u8; 32]);
@@ -413,7 +504,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        let err = push_block_cmxs(&block, &mut out).unwrap_err();
+        let err = push_block_cmxs(&block, Pool::Orchard, &mut out).unwrap_err();
         assert!(
             err.to_string().contains("cmx not 32 bytes"),
             "unexpected error: {err}"
@@ -592,5 +683,126 @@ mod tests {
             .collect();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not 32 bytes"));
+    }
+
+    // ── Pool::tree_state_hex — selects the correct TreeState field ──────────
+    //
+    // Guards the exact bug class the sync.rs fast-path regression also targets:
+    // silently reading the wrong pool's data. `TreeState` carries both
+    // `orchard_tree` and `ironwood_tree`; this proves `Pool::tree_state_hex`
+    // never accidentally reads the other pool's frontier.
+
+    #[test]
+    fn pool_tree_state_hex_selects_orchard_field() {
+        let ts = zcash_client_backend::proto::service::TreeState {
+            orchard_tree: "orchard_frontier_hex".to_string(),
+            ironwood_tree: "ironwood_frontier_hex".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(Pool::Orchard.tree_state_hex(&ts), "orchard_frontier_hex");
+    }
+
+    #[test]
+    fn pool_tree_state_hex_selects_ironwood_field() {
+        let ts = zcash_client_backend::proto::service::TreeState {
+            orchard_tree: "orchard_frontier_hex".to_string(),
+            ironwood_tree: "ironwood_frontier_hex".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(Pool::Ironwood.tree_state_hex(&ts), "ironwood_frontier_hex");
+    }
+
+    // ── push_block_cmxs — pool-scoped action selection ───────────────────────
+    //
+    // A valid ShardTree witness for an
+    // Ironwood note requires its leaves to come from `ironwood_actions`, never
+    // `actions` (Orchard) — the ShardTree assembly itself
+    // (`zcash_crypto::tree::build_witnesses`) is already exhaustively tested
+    // and is pool-agnostic; what Ironwood support adds is feeding it the right
+    // leaves, which this test proves.
+
+    #[test]
+    fn push_block_cmxs_ironwood_pool_reads_ironwood_actions_only() {
+        let block = CompactBlock {
+            height: 200,
+            vtx: vec![CompactTx {
+                actions: vec![CompactOrchardAction {
+                    cmx: vec![0xAAu8; 32], // Orchard leaf — must NOT be collected for Pool::Ironwood
+                    ..Default::default()
+                }],
+                ironwood_actions: vec![CompactOrchardAction {
+                    cmx: vec![0xBBu8; 32], // Ironwood leaf — must be collected
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        push_block_cmxs(&block, Pool::Ironwood, &mut out).unwrap();
+
+        assert_eq!(out, vec![[0xBBu8; 32]], "must collect only the Ironwood action's cmx");
+    }
+
+    #[test]
+    fn push_block_cmxs_orchard_pool_reads_orchard_actions_only() {
+        let block = CompactBlock {
+            height: 201,
+            vtx: vec![CompactTx {
+                actions: vec![CompactOrchardAction {
+                    cmx: vec![0xAAu8; 32],
+                    ..Default::default()
+                }],
+                ironwood_actions: vec![CompactOrchardAction {
+                    cmx: vec![0xBBu8; 32],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        push_block_cmxs(&block, Pool::Orchard, &mut out).unwrap();
+
+        assert_eq!(out, vec![[0xAAu8; 32]], "must collect only the Orchard action's cmx");
+    }
+
+    // ── compute_ironwood_witnesses / fetch_ironwood_anchor — connection paths ──
+    //
+    // Mirrors the existing Orchard connection-path tests: these public entry
+    // points must surface a clear connection error rather than hang or panic.
+    // (The pure ShardTree assembly they delegate to is already exhaustively
+    // tested in `zcash_crypto::tree` — see that module's `known_good_test_vector`
+    // and multi-shard tests — and is unconditionally reused, unmodified, here.)
+
+    #[tokio::test]
+    async fn compute_ironwood_witnesses_fails_on_malformed_url() {
+        let req = WitnessRequest {
+            grpc_url: "definitely not a url !!!".to_string(),
+            anchor_height: Some(1),
+            anchor_depth_blocks: None,
+            notes: vec![NoteRef {
+                position: 0,
+                cmx: [0u8; 32],
+            }],
+        };
+        let err = compute_ironwood_witnesses(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid gRPC URL"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_ironwood_anchor_fails_on_malformed_url() {
+        let err = fetch_ironwood_anchor("definitely not a url !!!", Some(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid gRPC URL"),
+            "unexpected error: {err}"
+        );
     }
 }

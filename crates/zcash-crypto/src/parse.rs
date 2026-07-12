@@ -288,9 +288,19 @@ fn convert_orchard_bundle(
         magnitude as i128
     };
 
+    // This parser only ever handles PCZTs this crate itself builds via
+    // `craft::build_transaction`, which always assembles an Orchard-pool
+    // (ProtocolVersion::V2) bundle — never Ironwood. `to_byte` now takes the
+    // bundle version explicitly because flag encodability depends on it (e.g.
+    // the v6 cross-address bit only exists from ProtocolVersion::V3 onward).
+    let flags = bundle
+        .flags()
+        .to_byte(orchard::bundle::BundleVersion::orchard_v2())
+        .ok_or("orchard bundle flags not representable for the Orchard v2 bundle version")?;
+
     Ok(Some(ParsedOrchardBundle {
         actions,
-        flags: bundle.flags().to_byte(),
+        flags,
         value_balance,
         anchor: bundle.anchor().to_bytes(),
     }))

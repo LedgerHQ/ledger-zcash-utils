@@ -54,7 +54,14 @@ export interface ShieldedNote {
   transferType: string
   /** Memo text decoded from the note. */
   memo: string
-  /** Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
+  /**
+   * `"sapling"`, `"orchard"`, or `"ironwood"` — the shielded pool this note
+   * belongs to. Additive field: existing consumers that ignore it are
+   * unaffected; new consumers use it to distinguish Orchard from Ironwood
+   * notes now that both appear in this shared `ShieldedNote` shape.
+   */
+  pool: string
+  /** Orchard/Ironwood nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
   nullifier?: string
   /** rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts. */
   rho?: string
@@ -91,6 +98,12 @@ export interface ShieldedTransaction {
   saplingNotes: Array<ShieldedNote>
   /** Decrypted Orchard notes belonging to this account. */
   orchardNotes: Array<ShieldedNote>
+  /**
+   * Decrypted Ironwood (NU6.3) notes belonging to this account. Additive
+   * field, parallel to `orchard_notes` — existing consumers that only read
+   * `orchardNotes`/`saplingNotes` are unaffected.
+   */
+  ironwoodNotes: Array<ShieldedNote>
 }
 /** Scan statistics returned once the stream is exhausted. */
 export interface SyncStats {
@@ -309,8 +322,8 @@ export interface PcztTransparentInput {
   prevoutIndex: number
   /** `null` encodes the absent optional sequence number (final `0xffffffff`). */
   sequence?: number
-  /** Input value in zatoshis. */
-  value: bigint
+  /** Input value in zatoshis (decimal string to avoid f64 precision loss). */
+  value: string
   scriptPubKey: Uint8Array
   /** Sighash type (`SIGHASH_ALL` = `0x01`). */
   sighashType: number
@@ -318,8 +331,8 @@ export interface PcztTransparentInput {
 }
 /** A single transparent output. */
 export interface PcztTransparentOutput {
-  /** Output value in zatoshis. */
-  value: bigint
+  /** Output value in zatoshis (decimal string to avoid f64 precision loss). */
+  value: string
   scriptPubKey: Uint8Array
   /** Present (change output) or `null` (external recipient). */
   derivation?: PcztBip32Derivation
@@ -334,8 +347,8 @@ export interface PcztOrchardAction {
   rk: Uint8Array
   /** Raw Orchard address of the spent note, 43 bytes. */
   spendRecipient: Uint8Array
-  /** Spent-note value in zatoshis. */
-  spendValue: bigint
+  /** Spent-note value in zatoshis (decimal string to avoid f64 precision loss). */
+  spendValue: string
   /** Spend rho, 32 bytes. */
   spendRho: Uint8Array
   /** Spend rseed, 32 bytes. */
@@ -354,8 +367,8 @@ export interface PcztOrchardAction {
   outCiphertext: Uint8Array
   /** Raw Orchard address of the output note, 43 bytes. */
   recipient: Uint8Array
-  /** Output-note value in zatoshis. */
-  value: bigint
+  /** Output-note value in zatoshis (decimal string to avoid f64 precision loss). */
+  value: string
   /** Output rseed, 32 bytes. */
   rseed: Uint8Array
   /** Value commitment randomness, 32 bytes. */
@@ -365,8 +378,8 @@ export interface PcztOrchardAction {
 export interface PcztOrchardBundle {
   actions: Array<PcztOrchardAction>
   flags: number
-  /** Net value balance in zatoshis (signed). */
-  valueBalance: bigint
+  /** Net value balance in zatoshis (signed decimal string, lossless for i128). */
+  valueBalance: string
   /** Orchard commitment-tree anchor, 32 bytes. */
   anchor: Uint8Array
 }

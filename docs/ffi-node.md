@@ -48,8 +48,8 @@ const stream: TransactionStream = await startSync({
 let tx: ShieldedTransaction | null
 while ((tx = await stream.next()) !== null) {
   // tx.txid, tx.blockHeight, tx.blockTime, tx.fee (zatoshis)
-  // tx.saplingNotes, tx.orchardNotes — each note has:
-  //   amount, transferType, memo
+  // tx.saplingNotes, tx.orchardNotes, tx.ironwoodNotes — each note has:
+  //   amount, transferType, memo, pool ("sapling" | "orchard" | "ironwood")
   //   nullifier, rseed, cmx, position, recipient (hex | null)
   //   isSpent (boolean)
   console.log(tx)

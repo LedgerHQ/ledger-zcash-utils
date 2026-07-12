@@ -9,7 +9,8 @@
 //! Pipeline:
 //!   1. `Pczt::parse(bytes)`.
 //!   2. Identify the unsigned Orchard action indices (real spends).
-//!   2b. If there are transparent inputs, stamp each input's `hash160_preimage`
+//!
+//!      2b. If there are transparent inputs, stamp each input's `hash160_preimage`
 //!      with its controlling pubkey (taken from the `bip32_derivation` the craft
 //!      step recorded). `append_transparent_signature` and `SpendFinalizer` need
 //!      that pubkey to verify the device signature and rebuild the `script_sig`;
@@ -26,7 +27,7 @@
 
 use std::sync::OnceLock;
 
-use orchard::{circuit::VerifyingKey, primitives::redpallas};
+use orchard::{circuit::{OrchardCircuitVersion, VerifyingKey}, primitives::redpallas};
 use pczt::{
     roles::{
         signer::Signer, spend_finalizer::SpendFinalizer, tx_extractor::TransactionExtractor,
@@ -64,7 +65,9 @@ pub struct FinalizeOutput {
 /// thereafter. Mirrors the `ProvingKey` cache in `craft.rs`.
 fn verifying_key() -> &'static VerifyingKey {
     static VK: OnceLock<VerifyingKey> = OnceLock::new();
-    VK.get_or_init(VerifyingKey::build)
+    // Mirrors `craft::proving_key`: this pipeline only ever verifies Orchard-pool
+    // (ProtocolVersion::V2) proofs — no behavior change from the bump.
+    VK.get_or_init(|| VerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
 }
 
 /// Inject device signatures into a proven PCZT and extract the final V5 transaction.
@@ -446,9 +449,15 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value: u64 = 20_000;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let ovk = Some(fvk.to_ovk(Scope::External));
@@ -551,6 +560,7 @@ mod tests {
     ///   - 1 transparent P2PKH input (value 15_000) → device DER signature required.
     ///   - 1 Orchard recipient output (value 10_000).
     ///   - Orchard change (10_000) is added automatically by the builder.
+    ///
     /// ZIP-317: orchard_actions = max(2, max(1 spend, 2 outputs)) = 2,
     /// transparent_actions = max(1 in, 0 out) = 1 → fee = 5_000 × 3 = 15_000.
     fn build_mixed_pczt() -> (Vec<u8>, secp256k1::SecretKey) {
@@ -565,9 +575,15 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value: u64 = 20_000;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            orchard::note::NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let ovk = Some(fvk.to_ovk(Scope::External));

@@ -15,18 +15,35 @@ default-members = ["crates/zcash-crypto"]
 [workspace.dependencies]
 
 # Zcash ecosystem
-zcash_client_backend  = { version = "0.23", default-features = false }
-zcash_keys            = { version = "0.14", features = ["orchard", "sapling"] }
+#
+# Ironwood (NU6.3) pin: `zcash_client_backend` carries the wallet-side
+# Ironwood API, which is not yet published to crates.io, so it is pinned to a
+# librustzcash `main` commit. Within that repo `zcash_client_backend`,
+# `zcash_keys`, `zcash_primitives`, `zcash_protocol`, `zcash_transparent`,
+# `zcash_address` and `pczt` are intra-workspace *path* dependencies of one
+# another — pinning only `zcash_client_backend` to git while leaving its
+# siblings on crates.io produces two distinct copies of each sibling crate
+# (same version number, different source: git-path vs crates.io registry),
+# which Rust treats as unrelated types at any API boundary crossing them
+# (confirmed by the duplicate-type errors the bump produced before this fix).
+# All of them are therefore pinned to the SAME rev. `orchard`, `sapling-crypto`,
+# `shardtree` and `incrementalmerkletree` stay on crates.io because
+# librustzcash's own workspace also consumes those as ordinary crates.io
+# dependencies (not path members), so a single crates.io version resolves
+# consistently on both sides. Re-pin explicitly (never a floating branch) once
+# the wallet-side crates are published.
+zcash_client_backend  = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1", default-features = false }
+zcash_keys            = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1", features = ["orchard", "sapling"] }
 # Note: `transparent-inputs` is now a default feature of zcash-crypto.
-zcash_address         = "0.12"
+zcash_address         = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1" }
 zcash_note_encryption = "0.4"
-zcash_primitives      = { version = "0.28", default-features = false }
+zcash_primitives      = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1", default-features = false }
 # Transparent-pool address + script types; pulled by zcash_primitives internally
 # under the local alias `transparent`. We depend on it directly to avoid that alias.
-zcash_transparent     = "0.8"
-zcash_protocol        = "0.9"
+zcash_transparent     = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1" }
+zcash_protocol        = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1" }
 zip32                 = "0.2"
-orchard               = { version = "0.14", default-features = false }
+orchard               = { version = "0.15", default-features = false }
 sapling-crypto        = { version = "0.7", default-features = false }
 # Field-element trait (`PrimeField::to_repr`) used to serialize the Orchard
 # spend-auth randomizer `alpha` back to bytes when parsing a PCZT. Pinned to the
@@ -66,7 +83,10 @@ shardtree             = "0.6"
 # Partially Created Zcash Transaction format (wire format + role helpers).
 # Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
 # (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
-pczt = { version = "0.7", default-features = false, features = [
+# Pinned to the same librustzcash `main` rev as the rest of the family (see
+# above): the published pczt 0.7.0 requires orchard "0.14" / zcash_transparent
+# "0.8" / zcash_primitives "0.28", incompatible with the NU6.3 bump.
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "a97a3d5f46d096b94ceb71271c7d38f20af4e1f1", default-features = false, features = [
     "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
     "signer", "tx-extractor", "spend-finalizer",
 ] }

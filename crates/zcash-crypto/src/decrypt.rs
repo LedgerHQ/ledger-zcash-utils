@@ -9,7 +9,7 @@ use orchard::{
         ExtractedNoteCommitment as OrchardExtractedNoteCommitment,
         Nullifier as OrchardNullifier,
     },
-    note_encryption::{CompactAction, OrchardDomain},
+    note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
 use sapling_crypto::{
     note::ExtractedNoteCommitment as SaplingExtractedNoteCommitment,
@@ -28,6 +28,7 @@ use zcash_protocol::{
     consensus::{BlockHeight, BranchId, Network},
     memo::MemoBytes,
     value::{BalanceError, Zatoshis},
+    ShieldedPool,
 };
 
 use crate::error::Error;
@@ -75,6 +76,14 @@ pub struct CompactTransaction {
     pub sapling_outputs: Vec<CompactSaplingOutput>,
     /// Orchard shielded actions in this transaction.
     pub orchard_actions: Vec<CompactOrchardAction>,
+    /// Ironwood (NU6.3) shielded actions in this transaction.
+    ///
+    /// Ironwood reuses the exact `OrchardAction` wire encoding (same 820 B/action
+    /// shape as `orchard_actions`), so it is represented with the same
+    /// [`CompactOrchardAction`] type — only the note-plaintext version decrypted
+    /// from it differs (Ironwood = ZIP 2005 `0x03`, decrypted with the SAME
+    /// Orchard incoming viewing keys as `orchard_actions`; no separate ivk).
+    pub ironwood_actions: Vec<CompactOrchardAction>,
 }
 
 // ─── prepared IVKs ────────────────────────────────────────────────────────────
@@ -99,8 +108,15 @@ pub struct DecryptedOutput {
     pub memo: String,
     /// `"incoming"`, `"outgoing"`, or `"internal"`.
     pub transfer_type: String,
-    /// Orchard nullifier for this note (32 bytes).
-    /// `Some` for incoming/internal Orchard notes; `None` for Sapling or outgoing.
+    /// The shielded pool this note belongs to (Sapling, Orchard, or Ironwood).
+    ///
+    /// Carried straight from upstream's `DecryptedOutput::value_pool()` — this
+    /// crate does not invent its own pool enum. This is the field that lets a
+    /// consumer distinguish an Ironwood note from an Orchard note; both use the
+    /// same `orchard::Note` representation and the same spending-field shape.
+    pub pool: ShieldedPool,
+    /// Orchard/Ironwood nullifier for this note (32 bytes).
+    /// `Some` for incoming/internal Orchard-family notes; `None` for Sapling or outgoing.
     /// Used by the sync engine to detect when received notes are later spent
     /// (outgoing transactions that would otherwise be invisible to trial decryption).
     pub nullifier: Option<[u8; 32]>,
@@ -136,7 +152,11 @@ pub struct DecryptedOutput {
 pub struct DecryptedTx {
     pub sapling_outputs: Vec<DecryptedOutput>,
     pub orchard_outputs: Vec<DecryptedOutput>,
-    /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard).
+    /// Decrypted Ironwood (NU6.3) outputs. Additive and parallel to
+    /// `orchard_outputs` — Ironwood is a second, separate Orchard-family pool
+    /// with its own commitment tree and nullifier set (see `docs/architecture.md`).
+    pub ironwood_outputs: Vec<DecryptedOutput>,
+    /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard + valueBalanceIronwood).
     /// Always ≥ 0 for valid fully-shielded transactions.
     pub fee_zatoshis: i64,
 }
@@ -308,6 +328,30 @@ pub fn trial_decrypt_block(
         }
     }
 
+    // Ironwood actions reuse the exact CompactOrchardAction wire shape, so parsing
+    // is identical to the Orchard path above. Only the domain type used for trial
+    // decryption differs (IronwoodDomain vs OrchardDomain), and the ivks are the
+    // SAME Orchard ivks (one ivk decrypts both pools).
+    let ironwood_raw: Vec<(usize, CompactAction)> = txs
+        .iter()
+        .enumerate()
+        .flat_map(|(tx_idx, tx)| {
+            tx.ironwood_actions.iter().filter_map(move |a| {
+                parse_compact_orchard_action(a).ok().map(|action| (tx_idx, action))
+            })
+        })
+        .collect();
+
+    {
+        let total: usize = txs.iter().map(|tx| tx.ironwood_actions.len()).sum();
+        let skipped = total - ironwood_raw.len();
+        if skipped > 0 {
+            eprintln!(
+                "WARN: trial_decrypt_block skipped {skipped} malformed Ironwood action(s) at height {height}"
+            );
+        }
+    }
+
     let n_threads = rayon::current_num_threads().max(1);
 
     // ── Parallel chunked batch Sapling ────────────────────────────────────────
@@ -354,10 +398,35 @@ pub fn trial_decrypt_block(
             .collect()
     };
 
+    // ── Parallel chunked batch Ironwood (same ivks as Orchard) ───────────────
+    let ironwood_matched: std::collections::HashSet<usize> = if ironwood_raw.is_empty() {
+        Default::default()
+    } else {
+        let chunk_size = (ironwood_raw.len() / n_threads).max(1);
+        ironwood_raw
+            .par_chunks(chunk_size)
+            .flat_map(|chunk| {
+                let outputs: Vec<(IronwoodDomain, CompactAction)> = chunk
+                    .iter()
+                    .map(|(_, a)| (IronwoodDomain::for_compact_action(a), a.clone()))
+                    .collect();
+                let results = batch::try_compact_note_decryption(&orchard_ivks, &outputs);
+                chunk
+                    .iter()
+                    .zip(results)
+                    .filter_map(|((idx, _), r)| r.map(|_| *idx))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
     txs.iter()
         .enumerate()
         .filter_map(|(i, tx)| {
-            if sapling_matched.contains(&i) || orchard_matched.contains(&i) {
+            if sapling_matched.contains(&i)
+                || orchard_matched.contains(&i)
+                || ironwood_matched.contains(&i)
+            {
                 Some(tx.txid.clone())
             } else {
                 None
@@ -401,6 +470,7 @@ pub fn full_decrypt_tx_with_ufvk(
             amount: decode_note_value(f.note_value()),
             memo: decode_memo(f.memo().clone()),
             transfer_type: decode_transfer_type(f.transfer_type()),
+            pool: f.value_pool(),
             nullifier: None, // Sapling nullifier tracking not needed (Ledger is Orchard-only)
             rho: None,
             rseed: None,
@@ -413,58 +483,17 @@ pub fn full_decrypt_tx_with_ufvk(
     let orchard_outputs = decrypted
         .orchard_outputs()
         .iter()
-        .map(|f| {
-            // Compute the nullifier for incoming/internal notes so the sync engine
-            // can later detect when these notes are spent (Phase 4 outgoing-tx detection).
-            // Outgoing notes do not generate a nullifier we need to track.
-            let is_outgoing = matches!(
-                f.transfer_type(),
-                zcash_client_backend::TransferType::Outgoing
-            );
+        .map(|f| map_orchard_family_output(f, ufvk))
+        .collect();
 
-            let nullifier = if is_outgoing {
-                None
-            } else {
-                ufvk.orchard().map(|fvk| f.note().nullifier(fvk).to_bytes())
-            };
-
-            // Extract spending fields for incoming/internal notes.
-            // All fields are populated together: all or none.
-            let (rho, rseed, cmx, recipient, action_index) = if is_outgoing {
-                (None, None, None, None, None)
-            } else {
-                let note = f.note();
-
-                let rho_bytes: [u8; 32] = note.rho().to_bytes();
-                let rseed_bytes: [u8; 32] = *note.rseed().as_bytes();
-
-                let cmx_bytes: [u8; 32] = {
-                    let nc = note.commitment();
-                    OrchardExtractedNoteCommitment::from(nc).to_bytes()
-                };
-
-                // to_raw_address_bytes() returns [u8; 43]: 11-byte diversifier + 32-byte pk_d.
-                let recipient_bytes: [u8; 43] = note.recipient().to_raw_address_bytes();
-
-                // index() returns the 0-based action index within the Orchard bundle.
-                // Cast to u32 is safe: action counts per transaction are always < 2^32.
-                let idx: u32 = f.index() as u32;
-
-                (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(recipient_bytes), Some(idx))
-            };
-
-            DecryptedOutput {
-                amount: decode_note_value(f.note_value()),
-                memo: decode_memo(f.memo().clone()),
-                transfer_type: decode_transfer_type(f.transfer_type()),
-                nullifier,
-                rho,
-                rseed,
-                cmx,
-                recipient,
-                action_index,
-            }
-        })
+    // Ironwood (NU6.3) is a second, separate Orchard-family pool. Its outputs are
+    // Orchard-shaped (`orchard::Note`) and decrypted with the SAME Orchard ivks —
+    // `map_orchard_family_output` is pool-agnostic and reads the real pool tag
+    // (`f.value_pool()`) from upstream, so no separate mapping logic is needed here.
+    let ironwood_outputs = decrypted
+        .ironwood_outputs()
+        .iter()
+        .map(|f| map_orchard_family_output(f, ufvk))
         .collect();
 
     // Use TransactionData::fee_paid for an accurate protocol-level fee calculation.
@@ -479,7 +508,79 @@ pub fn full_decrypt_tx_with_ufvk(
         .map(|z| z.into_u64() as i64)
         .unwrap_or(0);
 
-    Ok(DecryptedTx { sapling_outputs, orchard_outputs, fee_zatoshis })
+    Ok(DecryptedTx { sapling_outputs, orchard_outputs, ironwood_outputs, fee_zatoshis })
+}
+
+/// Maps one upstream Orchard-family decrypted output (Orchard OR Ironwood — both
+/// are `orchard::Note` tagged with an `orchard::ValuePool`) to our [`DecryptedOutput`].
+///
+/// Shared by both `orchard_outputs()` and `ironwood_outputs()` mapping in
+/// [`full_decrypt_tx_with_ufvk`]: the two pools use identical spending-field
+/// extraction and the SAME Orchard full viewing key for the nullifier
+/// (one ivk/fvk scope covers both pools). The real pool tag
+/// (`f.value_pool()`) — not an assumption baked into the caller — determines
+/// `pool` on the output.
+fn map_orchard_family_output(
+    f: &zcash_client_backend::DecryptedOutput<(orchard::Note, orchard::ValuePool), Uuid>,
+    ufvk: &UnifiedFullViewingKey,
+) -> DecryptedOutput {
+    // Compute the nullifier for incoming/internal notes so the sync engine
+    // can later detect when these notes are spent (Phase 4 outgoing-tx detection).
+    // Outgoing notes do not generate a nullifier we need to track.
+    let is_outgoing = matches!(
+        f.transfer_type(),
+        zcash_client_backend::TransferType::Outgoing
+    );
+
+    // `f.note()` now returns `&(orchard::Note, orchard::ValuePool)` — destructure
+    // to get at the note; the pool element is intentionally unused here because
+    // `f.value_pool()` (below) is the authoritative, upstream-computed pool tag.
+    let (note, _) = f.note();
+
+    let nullifier = if is_outgoing {
+        None
+    } else {
+        ufvk.orchard().map(|fvk| note.nullifier(fvk).to_bytes())
+    };
+
+    // Extract spending fields for incoming/internal notes.
+    // All fields are populated together: all or none.
+    let (rho, rseed, cmx, recipient, action_index) = if is_outgoing {
+        (None, None, None, None, None)
+    } else {
+        let rho_bytes: [u8; 32] = note.rho().to_bytes();
+        let rseed_bytes: [u8; 32] = *note.rseed().as_bytes();
+
+        let cmx_bytes: [u8; 32] = {
+            let nc = note.commitment();
+            OrchardExtractedNoteCommitment::from(nc).to_bytes()
+        };
+
+        // to_raw_address_bytes() returns [u8; 43]: 11-byte diversifier + 32-byte pk_d.
+        let recipient_bytes: [u8; 43] = note.recipient().to_raw_address_bytes();
+
+        // index() returns the 0-based action index within the containing bundle.
+        // Cast to u32 is safe: action counts per transaction are always < 2^32.
+        let idx: u32 = f.index() as u32;
+
+        (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(recipient_bytes), Some(idx))
+    };
+
+    DecryptedOutput {
+        // `note.value()` (orchard::value::NoteValue) replaces the removed
+        // `DecryptedOutput::note_value()` accessor, which is no longer implemented
+        // for the `(Note, ValuePool)` tuple note type introduced by the bump.
+        amount: note.value().inner(),
+        memo: decode_memo(f.memo().clone()),
+        transfer_type: decode_transfer_type(f.transfer_type()),
+        pool: f.value_pool(),
+        nullifier,
+        rho,
+        rseed,
+        cmx,
+        recipient,
+        action_index,
+    }
 }
 
 /// Full decryption of a raw transaction hex using the UFVK.
@@ -670,6 +771,7 @@ mod tests {
             txid: "deadbeef".to_string(),
             sapling_outputs: vec![],
             orchard_actions: vec![],
+            ironwood_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
@@ -687,6 +789,7 @@ mod tests {
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
             orchard_actions: vec![],
+            ironwood_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty(), "invalid output should be skipped, not panic");
@@ -704,6 +807,7 @@ mod tests {
                 ephemeral_key: vec![0u8; 32],
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
+            ironwood_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
@@ -721,6 +825,7 @@ mod tests {
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
             orchard_actions: vec![],
+            ironwood_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
@@ -738,6 +843,7 @@ mod tests {
                 ephemeral_key: vec![0u8; 32],
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
+            ironwood_actions: vec![],
         };
         let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
         assert!(result.is_empty());
@@ -755,6 +861,7 @@ mod tests {
                     ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
                 }],
                 orchard_actions: vec![],
+                ironwood_actions: vec![],
             })
             .collect();
         let result = trial_decrypt_block(&txs, &ivks, TEST_HEIGHT, &Network::TestNetwork);
@@ -967,6 +1074,7 @@ mod tests {
                 ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
             }],
             orchard_actions: vec![],
+            ironwood_actions: vec![],
         };
         // Below mainnet Heartwood (903_800) — ZIP-212 Off
         let result = trial_decrypt_block(
@@ -1002,6 +1110,7 @@ mod tests {
                     ephemeral_key: vec![0u8; 32],
                     ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
                 }],
+                ironwood_actions: vec![],
             })
             .collect();
         let result = trial_decrypt_block(&txs, &ivks, TEST_HEIGHT, &Network::TestNetwork);
@@ -1029,6 +1138,7 @@ mod tests {
             cmx: None,
             recipient: None,
             action_index: None,
+            pool: ShieldedPool::Orchard,
         };
         assert_eq!(output.transfer_type, "outgoing");
         assert!(output.rseed.is_none(), "outgoing: rseed must be None");
@@ -1054,6 +1164,7 @@ mod tests {
             cmx: None,
             recipient: None,
             action_index: None,
+            pool: ShieldedPool::Sapling,
         };
         assert!(output.rseed.is_none(), "Sapling: rseed must be None");
         assert!(output.cmx.is_none(), "Sapling: cmx must be None");
@@ -1080,6 +1191,7 @@ mod tests {
             cmx: Some(cmx),
             recipient: Some(recipient),
             action_index: Some(0),
+            pool: ShieldedPool::Orchard,
         };
 
         let r = output.rseed.unwrap();
@@ -1107,6 +1219,7 @@ mod tests {
             cmx: None,
             recipient: None,
             action_index: Some(idx),
+            pool: ShieldedPool::Orchard,
         };
         assert_eq!(make(0).action_index, Some(0));
         assert_eq!(make(7).action_index, Some(7));
@@ -1175,5 +1288,169 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Decrypt(_)));
         assert!(err.to_string().contains("TX parse failed"));
+    }
+
+    // ── Ironwood (NU6.3) — trial decryption ──────────────────────────────────
+    //
+    // Full end-to-end decryption of a real V6/Ironwood transaction (0x03 note
+    // reconstruction against genuine on-chain data) cannot be exercised yet: no
+    // NU6.3 transaction exists on any chain this dry-run can reach (no Ledger
+    // Ironwood endpoint is reachable from this dry-run yet), so no
+    // real fixture bytes exist to capture (mirroring `known_vectors.rs`, which
+    // captures real mainnet/testnet V4/V5 bytes — none exist for V6 yet). The
+    // trial-decrypt round-trip below instead constructs a *synthetic* Ironwood
+    // action directly from the public `orchard` note-encryption API (the same
+    // approach the `orchard` crate's own test suite uses internally), which
+    // exercises genuine cryptography — real Note/RandomSeed/Rho values, a real
+    // Ironwood-domain encryption, and the real `try_compact_note_decryption`
+    // path — without needing chain data.
+
+    /// Builds a synthetic, correctly-encrypted `CompactOrchardAction` for
+    /// Alice's external Orchard address, encrypted under the Ironwood note
+    /// plaintext version (`NoteVersion::V3`, ZIP 2005 lead byte `0x03`).
+    ///
+    /// Returns the compact action alongside the note's `rho` (== the `nf` byte
+    /// value it derives from, since `Rho::from_nf_old` is the identity on the
+    /// underlying field element) so callers can assert on `cmx` reconstruction.
+    fn make_ironwood_compact_action() -> (CompactOrchardAction, [u8; 32]) {
+        use orchard::note::{Note, NoteVersion, RandomSeed, Rho};
+        use orchard::note_encryption::IronwoodNoteEncryption;
+        use orchard::value::NoteValue;
+        use zcash_note_encryption::Domain;
+
+        let (_network, ufvk_str) = Ufvk::decode(ALICE_UFVK).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
+        let fvk = ufvk.orchard().expect("Alice's UFVK carries an Orchard component");
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        // rho == nf_old's field element (Rho::from_nf_old(nf) is nf reinterpreted
+        // as a Rho), so encoding the same 32 zero bytes for both keeps them equal.
+        let rho_bytes = [0u8; 32];
+        let rho = Rho::from_bytes(&rho_bytes).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xcdu8; 32], &rho).into_option().unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1_000_000),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .expect("Note::from_parts must produce a canonical V3 note");
+
+        let cmx_bytes: [u8; 32] =
+            OrchardExtractedNoteCommitment::from(note.commitment()).to_bytes();
+
+        let enc = IronwoodNoteEncryption::new(None, note, [0u8; 512]);
+        let full_ciphertext = enc.encrypt_note_plaintext();
+        let ephemeral_key = IronwoodDomain::epk_bytes(enc.epk());
+
+        let action = CompactOrchardAction {
+            nf: rho_bytes.to_vec(),
+            cmx: cmx_bytes.to_vec(),
+            ephemeral_key: ephemeral_key.0.to_vec(),
+            ciphertext: full_ciphertext[..COMPACT_NOTE_SIZE].to_vec(),
+        };
+        (action, rho_bytes)
+    }
+
+    /// Verifies sync detects and fully-decrypts Ironwood notes
+    /// from V6 Ironwood bundles (trial-decrypt half). An Ironwood action,
+    /// correctly encrypted under a real Orchard ivk, must be found by
+    /// `trial_decrypt_block` using the SAME ivk set `prepare_ivks` derives for
+    /// Orchard — no separate Ironwood ivk is ever derived.
+    #[test]
+    fn ironwood_action_trial_decrypts_with_orchard_ivk_matches() {
+        let (action, _rho_bytes) = make_ironwood_compact_action();
+        let ivks = prepare_ivks(ALICE_UFVK).unwrap();
+        let tx = CompactTransaction {
+            txid: "ironwood00".to_string(),
+            sapling_outputs: vec![],
+            orchard_actions: vec![],
+            ironwood_actions: vec![action],
+        };
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
+        assert_eq!(
+            result,
+            vec!["ironwood00".to_string()],
+            "a correctly-encrypted Ironwood action must be matched by trial_decrypt_block              using the same ivks prepared for Orchard"
+        );
+    }
+
+    /// Regression: a transaction with only an (unmatched) Orchard action and a
+    /// separate, empty `ironwood_actions` list is unaffected by the new field —
+    /// no match is fabricated out of an empty Ironwood list.
+    #[test]
+    fn ironwood_actions_empty_does_not_affect_orchard_only_tx() {
+        let ivks = prepare_ivks(ALICE_UFVK).unwrap();
+        let tx = CompactTransaction {
+            txid: "orchardonly".to_string(),
+            sapling_outputs: vec![],
+            orchard_actions: vec![CompactOrchardAction {
+                nf: vec![0u8; 32],
+                cmx: vec![0u8; 32],
+                ephemeral_key: vec![0u8; 32],
+                ciphertext: vec![0u8; COMPACT_NOTE_SIZE],
+            }],
+            ironwood_actions: vec![],
+        };
+        let result = trial_decrypt_block(&[tx], &ivks, TEST_HEIGHT, &Network::TestNetwork);
+        assert!(result.is_empty(), "all-zero Orchard action must still not match");
+    }
+
+    // ── DecryptedOutput.pool / DecryptedTx.ironwood_outputs — structural ─────
+
+    /// `DecryptedOutput.pool` carries the Ironwood tag distinctly from Orchard —
+    /// this is the field the sync layer relies on to distinguish the two pools
+    /// at the NAPI boundary.
+    #[test]
+    fn decrypted_output_pool_tags_ironwood_distinctly_from_orchard() {
+        let orchard = DecryptedOutput {
+            amount: 1,
+            memo: String::new(),
+            transfer_type: "incoming".to_string(),
+            pool: ShieldedPool::Orchard,
+            nullifier: None,
+            rho: None,
+            rseed: None,
+            cmx: None,
+            recipient: None,
+            action_index: None,
+        };
+        let ironwood = DecryptedOutput {
+            pool: ShieldedPool::Ironwood,
+            ..orchard.clone()
+        };
+        assert_eq!(orchard.pool, ShieldedPool::Orchard);
+        assert_eq!(ironwood.pool, ShieldedPool::Ironwood);
+        assert_ne!(orchard.pool, ironwood.pool);
+    }
+
+    /// `DecryptedTx.ironwood_outputs` is additive and independent from
+    /// `orchard_outputs` — constructing one does not implicitly populate or
+    /// alter the other (regression guard for the DecryptedTx field addition).
+    #[test]
+    fn decrypted_tx_ironwood_outputs_independent_of_orchard_outputs() {
+        let ironwood_note = DecryptedOutput {
+            amount: 42,
+            memo: String::new(),
+            transfer_type: "incoming".to_string(),
+            pool: ShieldedPool::Ironwood,
+            nullifier: Some([0u8; 32]),
+            rho: Some([0u8; 32]),
+            rseed: Some([0u8; 32]),
+            cmx: Some([0u8; 32]),
+            recipient: Some([0u8; 43]),
+            action_index: Some(0),
+        };
+        let tx = DecryptedTx {
+            sapling_outputs: vec![],
+            orchard_outputs: vec![],
+            ironwood_outputs: vec![ironwood_note],
+            fee_zatoshis: 0,
+        };
+        assert!(tx.orchard_outputs.is_empty());
+        assert_eq!(tx.ironwood_outputs.len(), 1);
+        assert_eq!(tx.ironwood_outputs[0].pool, ShieldedPool::Ironwood);
     }
 }
