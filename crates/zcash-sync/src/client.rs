@@ -196,9 +196,30 @@ pub(crate) async fn get_orchard_subtree_roots(
     client: &mut CompactTxStreamerClient<Channel>,
     start_index: u32,
 ) -> Result<Vec<SubtreeRoot>> {
+    get_subtree_roots_for_protocol(client, ShieldedProtocol::Orchard, start_index).await
+}
+
+/// Fetch all completed Ironwood (NU6.3) shard roots starting at `start_index`.
+///
+/// Mirrors [`get_orchard_subtree_roots`] exactly, using the Ironwood pool
+/// selector instead of Orchard's — both pools share the same
+/// `GetSubtreeRoots` RPC shape, just with a different `shielded_protocol` value.
+pub(crate) async fn get_ironwood_subtree_roots(
+    client: &mut CompactTxStreamerClient<Channel>,
+    start_index: u32,
+) -> Result<Vec<SubtreeRoot>> {
+    get_subtree_roots_for_protocol(client, ShieldedProtocol::Ironwood, start_index).await
+}
+
+/// Shared `GetSubtreeRoots` implementation for a given pool selector.
+async fn get_subtree_roots_for_protocol(
+    client: &mut CompactTxStreamerClient<Channel>,
+    shielded_protocol: ShieldedProtocol,
+    start_index: u32,
+) -> Result<Vec<SubtreeRoot>> {
     let req = tonic::Request::new(GetSubtreeRootsArg {
         start_index,
-        shielded_protocol: ShieldedProtocol::Orchard as i32,
+        shielded_protocol: shielded_protocol as i32,
         max_entries: 0,
     });
     let mut stream = client

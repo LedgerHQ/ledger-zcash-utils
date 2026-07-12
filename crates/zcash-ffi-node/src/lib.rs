@@ -53,8 +53,13 @@ pub struct ShieldedNote {
     pub transfer_type: String,
     /// Memo text decoded from the note.
     pub memo: String,
+    /// `"sapling"`, `"orchard"`, or `"ironwood"` — the shielded pool this note
+    /// belongs to. Additive field: existing consumers that ignore it are
+    /// unaffected; new consumers use it to distinguish Orchard from Ironwood
+    /// notes now that both appear in this shared `ShieldedNote` shape.
+    pub pool: String,
 
-    /// Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT.
+    /// Orchard/Ironwood nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT.
     pub nullifier: Option<String>,
     /// rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts.
     pub rho: Option<String>,
@@ -91,6 +96,10 @@ pub struct ShieldedTransaction {
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
     pub orchard_notes: Vec<ShieldedNote>,
+    /// Decrypted Ironwood (NU6.3) notes belonging to this account. Additive
+    /// field, parallel to `orchard_notes` — existing consumers that only read
+    /// `orchardNotes`/`saplingNotes` are unaffected.
+    pub ironwood_notes: Vec<ShieldedNote>,
 }
 
 /// Scan statistics returned once the stream is exhausted.
@@ -791,6 +800,7 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
                 amount: n.amount as f64,
                 transfer_type: n.transfer_type,
                 memo: n.memo,
+                pool: n.pool,
                 nullifier: None,
                 rho: None,
                 rseed: None,
@@ -807,6 +817,26 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
                 amount: n.amount as f64,
                 transfer_type: n.transfer_type,
                 memo: n.memo,
+                pool: n.pool,
+                nullifier: n.nullifier,
+                rho: n.rho,
+                rseed: n.rseed,
+                cmx: n.cmx,
+                position: n.position.map(|p| p.to_string()),
+                recipient: n.recipient,
+                is_spent: n.is_spent,
+            })
+            .collect(),
+        // Additive: same mapping shape as orchard_notes, sourced from the
+        // separate ironwood_notes list zcash-sync populates.
+        ironwood_notes: tx
+            .ironwood_notes
+            .into_iter()
+            .map(|n| ShieldedNote {
+                amount: n.amount as f64,
+                transfer_type: n.transfer_type,
+                memo: n.memo,
+                pool: n.pool,
                 nullifier: n.nullifier,
                 rho: n.rho,
                 rseed: n.rseed,
@@ -842,6 +872,7 @@ mod tests {
             fee_zatoshis: 10_000,
             sapling_notes: vec![],
             orchard_notes: vec![],
+            ironwood_notes: vec![],
         }
     }
 
@@ -857,6 +888,7 @@ mod tests {
             position: None,
             recipient: None,
             is_spent: false,
+            pool: "orchard".to_string(),
         }
     }
 
@@ -924,6 +956,61 @@ mod tests {
         assert_eq!(napi.orchard_notes[0].amount, 100_000_000.0_f64);
         assert_eq!(napi.orchard_notes[0].transfer_type, "incoming");
         assert_eq!(napi.orchard_notes[0].memo, "hello");
+        assert_eq!(napi.orchard_notes[0].pool, "orchard");
+    }
+
+    // ── grpc_tx_to_napi — Ironwood (additive, backward-compatible) ──────────
+
+    /// Additive: `ironwoodNotes` is mapped with the exact same shape as
+    /// `orchardNotes`, and its `pool` discriminator reads `"ironwood"` —
+    /// letting NAPI consumers distinguish the two pools.
+    #[test]
+    fn grpc_tx_to_napi_converts_ironwood_note_fields() {
+        let mut note = make_grpc_note(250_000_000, "internal", "ironwood memo");
+        note.pool = "ironwood".to_string();
+        let grpc = GrpcTx {
+            ironwood_notes: vec![note],
+            ..make_grpc_tx()
+        };
+        let napi = grpc_tx_to_napi(grpc);
+        assert_eq!(napi.ironwood_notes.len(), 1);
+        assert_eq!(napi.ironwood_notes[0].amount, 250_000_000.0_f64);
+        assert_eq!(napi.ironwood_notes[0].transfer_type, "internal");
+        assert_eq!(napi.ironwood_notes[0].memo, "ironwood memo");
+        assert_eq!(napi.ironwood_notes[0].pool, "ironwood");
+    }
+
+    /// Backward-compatibility regression: a transaction with only Orchard notes
+    /// produces an empty `ironwoodNotes` array; `orchardNotes`/`saplingNotes`
+    /// mapping is unaffected by the additive field — existing consumers that
+    /// only read those two arrays see no behavioral change.
+    #[test]
+    fn grpc_tx_to_napi_orchard_only_tx_has_empty_ironwood_notes() {
+        let grpc = GrpcTx {
+            orchard_notes: vec![make_grpc_note(1_000, "incoming", "")],
+            ..make_grpc_tx()
+        };
+        let napi = grpc_tx_to_napi(grpc);
+        assert!(napi.ironwood_notes.is_empty());
+        assert_eq!(napi.orchard_notes.len(), 1);
+    }
+
+    /// `pool` on a Sapling note forwards whatever the sync layer tagged it with
+    /// (always `"sapling"` in production — see `zcash-sync`'s `pool_tag`), and
+    /// is distinct from an Orchard/Ironwood note's tag on the same transaction.
+    #[test]
+    fn grpc_tx_to_napi_sapling_note_pool_is_distinguishable() {
+        let mut sapling_note = make_grpc_note(1, "incoming", "");
+        sapling_note.pool = "sapling".to_string();
+        let grpc = GrpcTx {
+            sapling_notes: vec![sapling_note],
+            orchard_notes: vec![make_grpc_note(2, "incoming", "")],
+            ..make_grpc_tx()
+        };
+        let napi = grpc_tx_to_napi(grpc);
+        assert_eq!(napi.sapling_notes[0].pool, "sapling");
+        assert_eq!(napi.orchard_notes[0].pool, "orchard");
+        assert_ne!(napi.sapling_notes[0].pool, napi.orchard_notes[0].pool);
     }
 
     #[test]
@@ -1142,6 +1229,7 @@ mod tests {
                 position: Some(position_u64),
                 recipient: Some(recipient_hex.clone()),
                 is_spent: true,
+                pool: "orchard".to_string(),
             }],
             ..make_grpc_tx()
         };
@@ -1193,6 +1281,7 @@ mod tests {
                 position: None,
                 recipient: None,
                 is_spent: false,
+                pool: "orchard".to_string(),
             }],
             ..make_grpc_tx()
         };
@@ -1253,6 +1342,7 @@ mod tests {
                 position: Some(position_u64),
                 recipient: None,
                 is_spent: false,
+                pool: "orchard".to_string(),
             }],
             ..make_grpc_tx()
         };

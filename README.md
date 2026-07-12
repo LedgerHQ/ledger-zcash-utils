@@ -100,6 +100,7 @@ interface ShieldedTransaction {
   fee: number; // Fee in zatoshis
   saplingNotes: ShieldedNote[];
   orchardNotes: ShieldedNote[];
+  ironwoodNotes: ShieldedNote[]; // Ironwood (NU6.3) pool notes
 }
 ```
 
@@ -110,6 +111,7 @@ interface ShieldedNote {
   amount: number; // Amount in zatoshis
   transferType: string; // "incoming", "outgoing", or "internal"
   memo: string;
+  pool: string; // "sapling", "orchard", or "ironwood" — the shielded pool this note belongs to
 }
 ```
 
