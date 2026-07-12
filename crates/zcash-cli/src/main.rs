@@ -660,6 +660,7 @@ async fn cmd_sync(args: SyncArgs) {
                                 "position": n.position,
                                 "recipient": n.recipient,
                                 "is_spent": n.is_spent,
+                                "pool": n.pool,
                             })
                         })
                         .collect::<Vec<_>>()
@@ -676,6 +677,7 @@ async fn cmd_sync(args: SyncArgs) {
                             "fee_zatoshis": tx.fee_zatoshis,
                             "sapling_notes": pool_notes(&tx.sapling_notes),
                             "orchard_notes": pool_notes(&tx.orchard_notes),
+                            "ironwood_notes": pool_notes(&tx.ironwood_notes),
                         })
                     }).collect::<Vec<_>>(),
                 });
