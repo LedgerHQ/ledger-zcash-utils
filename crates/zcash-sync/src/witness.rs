@@ -21,6 +21,43 @@ use crate::client::{chain_tip_with_client, connect, get_orchard_subtree_roots, g
 /// not pin a specific anchor height. Matches the zcashd / zecwallet default.
 const DEFAULT_ANCHOR_DEPTH_BLOCKS: u32 = 10;
 
+/// Anchor height derived from the chain `tip` when no explicit height is
+/// pinned: `tip - anchor_depth_blocks` (default [`DEFAULT_ANCHOR_DEPTH_BLOCKS`]),
+/// clamped to a minimum of height 1.
+fn anchor_height_from_tip(tip: u32, anchor_depth_blocks: Option<u32>) -> u32 {
+    let depth = anchor_depth_blocks.unwrap_or(DEFAULT_ANCHOR_DEPTH_BLOCKS);
+    tip.saturating_sub(depth).max(1)
+}
+
+/// Resolve the anchor height for a flow that does not otherwise contact the
+/// witness orchestrator — the transparent-only Public→Public path, which builds
+/// no Orchard bundle and therefore never calls [`compute_witnesses`] or
+/// [`fetch_orchard_anchor`].
+///
+/// Returns an explicit `anchor_height` verbatim without any network I/O;
+/// otherwise queries the chain tip and resolves `tip - anchor_depth_blocks`
+/// (see [`resolve_from_tip`]). This keeps the transaction's target/expiry height
+/// anchored to the live tip on the transparent path, matching the shielded
+/// flows.
+///
+/// # Errors
+///
+/// Returns an error if resolution needs the tip and the gRPC connection or
+/// `GetLatestBlock` call fails.
+pub async fn resolve_anchor_height(
+    grpc_url: &str,
+    anchor_height: Option<u32>,
+    anchor_depth_blocks: Option<u32>,
+) -> Result<u32> {
+    if let Some(h) = anchor_height {
+        return Ok(h);
+    }
+    let channel = connect(grpc_url).await?;
+    let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
+    let tip = chain_tip_with_client(&mut client).await?;
+    Ok(anchor_height_from_tip(tip, anchor_depth_blocks))
+}
+
 /// A note for which a witness is requested.
 #[derive(Clone, Copy, Debug)]
 pub struct NoteRef {
@@ -68,8 +105,7 @@ pub async fn fetch_orchard_anchor(
         Some(h) => h,
         None => {
             let tip = chain_tip_with_client(&mut client).await?;
-            let depth = anchor_depth_blocks.unwrap_or(DEFAULT_ANCHOR_DEPTH_BLOCKS);
-            tip.saturating_sub(depth).max(1)
+            anchor_height_from_tip(tip, anchor_depth_blocks)
         }
     };
 
@@ -122,10 +158,7 @@ pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
         Some(h) => h,
         None => {
             let tip = chain_tip_with_client(&mut client).await?;
-            let depth = req
-                .anchor_depth_blocks
-                .unwrap_or(DEFAULT_ANCHOR_DEPTH_BLOCKS);
-            tip.saturating_sub(depth).max(1)
+            anchor_height_from_tip(tip, req.anchor_depth_blocks)
         }
     };
 
