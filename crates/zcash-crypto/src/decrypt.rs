@@ -425,7 +425,7 @@ pub fn full_decrypt_tx_with_ufvk(
             let nullifier = if is_outgoing {
                 None
             } else {
-                ufvk.orchard().map(|fvk| f.note().nullifier(fvk).to_bytes())
+                ufvk.orchard().map(|fvk| f.note().0.nullifier(fvk).to_bytes())
             };
 
             // Extract spending fields for incoming/internal notes.
@@ -433,7 +433,7 @@ pub fn full_decrypt_tx_with_ufvk(
             let (rho, rseed, cmx, recipient, action_index) = if is_outgoing {
                 (None, None, None, None, None)
             } else {
-                let note = f.note();
+                let (note, _) = f.note();
 
                 let rho_bytes: [u8; 32] = note.rho().to_bytes();
                 let rseed_bytes: [u8; 32] = *note.rseed().as_bytes();
@@ -454,7 +454,7 @@ pub fn full_decrypt_tx_with_ufvk(
             };
 
             DecryptedOutput {
-                amount: decode_note_value(f.note_value()),
+                amount: f.note().0.value().inner(),
                 memo: decode_memo(f.memo().clone()),
                 transfer_type: decode_transfer_type(f.transfer_type()),
                 nullifier,
@@ -1142,6 +1142,39 @@ mod tests {
             BranchId::for_height(&Network::TestNetwork, BlockHeight::from(4_052_000_u32)),
             BranchId::Nu6_2,
             "height 4_052_000 must resolve to Nu6_2 on testnet"
+        );
+    }
+
+    // ── BranchId::for_height — NU6.3 activation assertions ──────────────────
+
+    #[test]
+    fn test_branch_id_nu6_3_mainnet_at_activation() {
+        // NU6.3 activates on mainnet at block 3,428,143.
+        assert_eq!(
+            BranchId::for_height(&Network::MainNetwork, BlockHeight::from(3_428_143_u32)),
+            BranchId::Nu6_3,
+            "height 3_428_143 must resolve to Nu6_3 on mainnet"
+        );
+    }
+
+    #[test]
+    fn test_branch_id_nu6_2_mainnet_one_below_nu6_3_activation() {
+        // One block before NU6.3 activation must still be Nu6_2.
+        assert_eq!(
+            BranchId::for_height(&Network::MainNetwork, BlockHeight::from(3_428_142_u32)),
+            BranchId::Nu6_2,
+            "height 3_428_142 must resolve to Nu6_2 on mainnet"
+        );
+    }
+
+    #[test]
+    fn test_branch_id_nu6_3_testnet_at_activation() {
+        // NU6.3 activates on testnet at block 4,134,000. Testnet and mainnet
+        // activation heights differ; this must never be wired as mainnet.
+        assert_eq!(
+            BranchId::for_height(&Network::TestNetwork, BlockHeight::from(4_134_000_u32)),
+            BranchId::Nu6_3,
+            "height 4_134_000 must resolve to Nu6_3 on testnet"
         );
     }
 

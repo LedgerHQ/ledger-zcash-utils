@@ -290,7 +290,10 @@ fn convert_orchard_bundle(
 
     Ok(Some(ParsedOrchardBundle {
         actions,
-        flags: bundle.flags().to_byte(),
+        flags: bundle
+            .flags()
+            .to_byte(orchard::bundle::BundleVersion::orchard_v2())
+            .ok_or("orchard bundle flags not representable for the Orchard v2 bundle version")?,
         value_balance,
         anchor: bundle.anchor().to_bytes(),
     }))
