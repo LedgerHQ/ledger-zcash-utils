@@ -49,6 +49,11 @@ pub struct WitnessInputs {
 pub struct WitnessOutput {
     /// Anchor (tree root) as the 32-byte little-endian Pallas encoding.
     pub anchor: [u8; 32],
+    /// Block height the anchor (and every witness) was computed against — the
+    /// resolved value of `inputs.anchor_height`. Callers use this to derive the
+    /// transaction's target/expiry height consistently with the anchor, rather
+    /// than re-deriving a height that may diverge from it.
+    pub anchor_height: u32,
     /// One `MerklePath` per input note, in the same order as `inputs.notes`.
     pub witnesses: Vec<incrementalmerkletree::MerklePath<MerkleHashOrchard, ORCHARD_DEPTH>>,
 }
@@ -169,7 +174,11 @@ pub fn build_witnesses(inputs: &WitnessInputs) -> Result<WitnessOutput, Error> {
         witnesses.push(path);
     }
 
-    Ok(WitnessOutput { anchor, witnesses })
+    Ok(WitnessOutput {
+        anchor,
+        anchor_height: inputs.anchor_height,
+        witnesses,
+    })
 }
 
 /// Decode hex-decoded `TreeState.orchard_tree` bytes into an incremental Frontier.

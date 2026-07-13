@@ -22,7 +22,9 @@ use zcash_crypto::{
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 
-use crate::witness::{compute_witnesses, fetch_orchard_anchor, NoteRef, WitnessRequest};
+use crate::witness::{
+    compute_witnesses, fetch_orchard_anchor, resolve_anchor_height, NoteRef, WitnessRequest,
+};
 
 /// JS-facing spend descriptor — hex strings come directly from `ShieldedNote`.
 #[derive(Clone, Debug)]
@@ -237,7 +239,13 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     let transparent_change_address_index = transparent_change.as_ref().map(|(_, _, i)| *i);
 
     // ── 4. Anchor routing ─────────────────────────────────────────────────────
-    let (anchor, spends) = if has_orchard_spends {
+    // Each branch resolves the anchor height the transaction is built against.
+    // For the shielded flows this is the height the witness orchestrator already
+    // resolved (an explicit `anchor_height`, or `tip − depth`); the
+    // transparent-only flow resolves it independently since it builds no Orchard
+    // bundle. Step 7 derives `target_height` from this so the expiry/branch-id
+    // stays consistent with the anchor the paths were computed against.
+    let (anchor, spends, resolved_anchor_height) = if has_orchard_spends {
         // Private→* : compute full witnesses for each spend note.
         let notes: Vec<NoteRef> = req
             .spends
@@ -280,14 +288,17 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
             })
             .collect::<Result<_>>()?;
 
-        (witness_out.anchor, spends)
+        (witness_out.anchor, spends, witness_out.anchor_height)
     } else if has_orchard_outputs {
         // Public→Private: fetch anchor only (no spend witnesses).
         let witness_out = fetch_orchard_anchor(&req.grpc_url, req.anchor_height, None).await?;
-        (witness_out.anchor, vec![])
+        (witness_out.anchor, vec![], witness_out.anchor_height)
     } else {
-        // Public→Public: no Orchard bundle; anchor is unused.
-        ([0u8; 32], vec![])
+        // Public→Public: no Orchard bundle; the anchor is unused, but the target
+        // height still must track the live tip (or an explicit anchor), so
+        // resolve it here rather than defaulting to a fixed low height.
+        let resolved = resolve_anchor_height(&req.grpc_url, req.anchor_height, None).await?;
+        ([0u8; 32], vec![], resolved)
     };
 
     // ── 5. Decode transparent inputs ─────────────────────────────────────────
@@ -363,8 +374,11 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
     // ── 7. target_height = anchor_height + DEFAULT_TX_EXPIRY_DELTA ───────────
-    let anchor_height: u32 = req.anchor_height.unwrap_or(0).max(1);
-    let target_height = anchor_height
+    // Use the anchor height resolved in step 4 (an explicit `anchor_height`, or
+    // `tip − depth`), NOT a fixed fallback. Deriving the target from a stale
+    // default (e.g. 1 → target 41) would put it below the NU5 activation height
+    // and the builder — which always emits v5 — would reject every send.
+    let target_height = resolved_anchor_height
         .checked_add(DEFAULT_TX_EXPIRY_DELTA)
         .ok_or_else(|| anyhow!("target_height overflow"))?;
 
@@ -632,6 +646,62 @@ mod tests {
         assert!(
             err.to_string().contains("UFVK"),
             "expected UFVK error, got: {err}"
+        );
+    }
+
+    /// Regression (target-height bug): Public→Public with `anchor_height: None`
+    /// must resolve the anchor height from the live chain tip rather than
+    /// silently defaulting to a fixed low height (which produced target_height
+    /// 41, below NU5, failing every send). With a valid UFVK and a transparent
+    /// output the request gets past the guards and change derivation, then hits
+    /// the tip query in the anchor-routing step and fails on the refused gRPC
+    /// port — proving the transparent-only path now queries the tip when no
+    /// explicit anchor is supplied.
+    #[tokio::test]
+    async fn public_to_public_resolves_tip_when_anchor_height_omitted() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        // Real mainnet UFVK (has a transparent component, so change derivation
+        // does not fast-fail).
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+
+        // Refused port: bind then drop to guarantee ECONNREFUSED.
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let req = CraftRequest {
+            grpc_url: format!("https://127.0.0.1:{}", addr.port()),
+            ufvk: keys.ufvk.clone(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_transparent_output()],
+            anchor_height: None, // must trigger a tip query on the transparent path
+        };
+
+        let err = craft_transaction(req).await.unwrap_err();
+        // Must reach the tip query (and fail there), not an earlier guard, and
+        // never the old silent default.
+        assert!(
+            !err.to_string().contains("no inputs"),
+            "should pass the input guard, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("UFVK"),
+            "UFVK must parse cleanly, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "expected tip-query connect failure, got: {err}"
         );
     }
 
