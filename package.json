@@ -1,6 +1,6 @@
 {
   "name": "@ledgerhq/zcash-utils",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Native Zcash key derivation and shielded sync — Node.js (NAPI)",
   "main": "index.js",
   "types": "index.d.ts",

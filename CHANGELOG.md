@@ -1,5 +1,21 @@
 # @ledgerhq/zcash-utils
 
+## 1.0.1
+
+### Patch Changes
+
+- Recompute target height
+
+# @ledgerhq/zcash-utils
+
+## 1.0.0
+
+### Major Changes
+
+- NAPI function for parsePCZT
+
+# @ledgerhq/zcash-utils
+
 ## 0.1.2
 
 ### Patch Changes
