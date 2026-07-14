@@ -337,16 +337,18 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
             .iter()
             .any(|o| matches!(o.destination, Destination::Orchard(_)));
 
-    // Conditionally build the Orchard anchor only when needed.
-    let orchard_anchor = if has_orchard {
-        Some(
-            orchard::Anchor::from_bytes(anchor)
-                .into_option()
-                .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?,
-        )
+    // Every PCZT this builder emits is serialized as PCZT v1 (the device signing
+    // contract), and the v1 encoding requires the Orchard bundle to carry an
+    // anchor even when it has no actions. For Orchard flows this is the supplied
+    // note-commitment tree anchor; transparent-only flows have no Orchard actions,
+    // so the canonical empty-tree anchor is used (no action ever references it).
+    let orchard_anchor = Some(if has_orchard {
+        orchard::Anchor::from_bytes(anchor)
+            .into_option()
+            .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?
     } else {
-        None
-    };
+        orchard::Anchor::empty_tree()
+    });
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor,
@@ -555,14 +557,14 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         pczt
     };
 
-    let pczt_bytes = if has_orchard {
-        pczt::v1::Pczt::try_from(pczt)
-            .map_err(|e| Error::Craft(format!("PCZT v1 encoding: {e:?}")))?
-            .serialize()
-    } else {
-        pczt.serialize()
-            .map_err(|e| Error::Craft(format!("PCZT serialize: {e:?}")))?
-    };
+    // Serialize as PCZT v1 for every flow, matching the device signing contract:
+    // app-zcash rejects any header version other than v1. v1 encoding succeeds for
+    // every PCZT this path produces (V5 transaction, canonical empty Ironwood
+    // bundle, Orchard notes at NoteVersion::V2), including transparent-only ones.
+    // The v2 (redaction) format is reserved for the Ironwood/NU6.3 work.
+    let pczt_bytes = pczt::v1::Pczt::try_from(pczt)
+        .map_err(|e| Error::Craft(format!("PCZT v1 encoding: {e:?}")))?
+        .serialize();
 
     Ok(BuildOutput {
         pczt_bytes,
@@ -1844,6 +1846,11 @@ mod tests {
 
         let out = build_transaction(inputs).expect("public→public must succeed");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert_eq!(
+            &out.pczt_bytes[4..8],
+            &1u32.to_le_bytes(),
+            "transparent-only PCZT must serialize as v1; the device signer rejects any other header version"
+        );
         assert_eq!(
             out.n_actions_orchard, 0,
             "Public→Public must have no Orchard actions"
