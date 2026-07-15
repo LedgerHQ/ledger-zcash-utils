@@ -90,9 +90,10 @@
 use std::sync::OnceLock;
 
 use orchard::{
-    circuit::ProvingKey,
+    builder::BundleType as OrchardBundleType,
+    circuit::{OrchardCircuitVersion, ProvingKey},
     keys::{FullViewingKey as OrchardFvk, OutgoingViewingKey},
-    note::{Note, RandomSeed, Rho},
+    note::{Note, NoteVersion, RandomSeed, Rho},
     pczt::Zip32Derivation,
     value::NoteValue,
     Address as OrchardAddress,
@@ -274,7 +275,7 @@ pub struct BuildOutput {
 /// subsequent accesses reuse the same allocation.
 pub(crate) fn proving_key() -> &'static ProvingKey {
     static PROVING_KEY: OnceLock<ProvingKey> = OnceLock::new();
-    PROVING_KEY.get_or_init(ProvingKey::build)
+    PROVING_KEY.get_or_init(|| ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
 }
 
 /// Build, prove, and serialize a PCZT for an Orchard or transparent send.
@@ -336,19 +337,23 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
             .iter()
             .any(|o| matches!(o.destination, Destination::Orchard(_)));
 
-    // Conditionally build the Orchard anchor only when needed.
-    let orchard_anchor = if has_orchard {
-        Some(
-            orchard::Anchor::from_bytes(anchor)
-                .into_option()
-                .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?,
-        )
+    // Every PCZT this builder emits is serialized as PCZT v1 (the device signing
+    // contract), and the v1 encoding requires the Orchard bundle to carry an
+    // anchor even when it has no actions. For Orchard flows this is the supplied
+    // note-commitment tree anchor; transparent-only flows have no Orchard actions,
+    // so the canonical empty-tree anchor is used (no action ever references it).
+    let orchard_anchor = Some(if has_orchard {
+        orchard::Anchor::from_bytes(anchor)
+            .into_option()
+            .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?
     } else {
-        None
-    };
+        orchard::Anchor::empty_tree()
+    });
     let build_config = BuildConfig::Standard {
         sapling_anchor: None,
         orchard_anchor,
+        ironwood_anchor: None,
+        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
     };
 
     // ── 1. Builder + Orchard spends + transparent inputs + non-change outputs ──
@@ -552,7 +557,14 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         pczt
     };
 
-    let pczt_bytes = pczt.serialize();
+    // Serialize as PCZT v1 for every flow, matching the device signing contract:
+    // app-zcash rejects any header version other than v1. v1 encoding succeeds for
+    // every PCZT this path produces (V5 transaction, canonical empty Ironwood
+    // bundle, Orchard notes at NoteVersion::V2), including transparent-only ones.
+    // The v2 (redaction) format is reserved for the Ironwood/NU6.3 work.
+    let pczt_bytes = pczt::v1::Pczt::try_from(pczt)
+        .map_err(|e| Error::Craft(format!("PCZT v1 encoding: {e:?}")))?
+        .serialize();
 
     Ok(BuildOutput {
         pczt_bytes,
@@ -739,7 +751,7 @@ fn stamp_transparent_derivations(
 }
 
 fn add_spend(
-    builder: &mut Builder<'_, Network, ()>,
+    builder: &mut Builder<Network, ()>,
     fvk: &OrchardFvk,
     spend: &OrchardSpendInput,
 ) -> Result<(), Error> {
@@ -752,9 +764,15 @@ fn add_spend(
     let rseed = RandomSeed::from_bytes(spend.rseed, &rho)
         .into_option()
         .ok_or_else(|| Error::Craft("invalid Orchard rseed for the given rho".into()))?;
-    let note = Note::from_parts(recipient, NoteValue::from_raw(spend.value), rho, rseed)
-        .into_option()
-        .ok_or_else(|| Error::Craft("Note::from_parts produced a non-canonical note".into()))?;
+    let note = Note::from_parts(
+        recipient,
+        NoteValue::from_raw(spend.value),
+        rho,
+        rseed,
+        NoteVersion::V2,
+    )
+    .into_option()
+    .ok_or_else(|| Error::Craft("Note::from_parts produced a non-canonical note".into()))?;
     let merkle_path: orchard::tree::MerklePath = spend.merkle_path.clone().into();
     builder
         .add_orchard_spend::<Zip317FeeError>(fvk.clone(), note, merkle_path)
@@ -776,7 +794,7 @@ fn add_spend(
 /// CompactSize varint before calling it (the inner `script::Code` type is private
 /// in `zcash_transparent` and cannot be named from outside the crate).
 fn add_transparent_input(
-    builder: &mut Builder<'_, Network, ()>,
+    builder: &mut Builder<Network, ()>,
     tin: &TransparentInput,
 ) -> Result<(), Error> {
     use zcash_transparent::{address::Script, bundle::TxOut};
@@ -818,7 +836,7 @@ fn add_transparent_input(
 }
 
 fn add_output(
-    builder: &mut Builder<'_, Network, ()>,
+    builder: &mut Builder<Network, ()>,
     ovk: Option<&OutgoingViewingKey>,
     out: &OutputRequest,
 ) -> Result<(), Error> {
@@ -989,7 +1007,7 @@ mod tests {
             Destination::Transparent(_) => zip317_fee(1, 0, 0, 1),
         };
         let spend_value = out_value + fee;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
+        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let cmx = ExtractedNoteCommitment::from(note.commitment());
@@ -1083,7 +1101,7 @@ mod tests {
             .into_option()
             .unwrap();
         let dummy_recipient = fvk.address_at(0u32, Scope::External);
-        let dummy_note = Note::from_parts(dummy_recipient, NoteValue::from_raw(1), rho, rseed)
+        let dummy_note = Note::from_parts(dummy_recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let (_anchor, path) = synthetic_anchor_and_path(MerkleHashOrchard::from_cmx(
@@ -1164,7 +1182,7 @@ mod tests {
             .into_option()
             .unwrap();
         let recipient = fvk.address_at(0u32, Scope::External);
-        let note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed)
+        let note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
@@ -1597,7 +1615,7 @@ mod tests {
             .zip(rseeds.iter())
             .map(|(&v, &r)| {
                 let rseed = RandomSeed::from_bytes(r, &rho).into_option().unwrap();
-                Note::from_parts(recipient, NoteValue::from_raw(v), rho, rseed)
+                Note::from_parts(recipient, NoteValue::from_raw(v), rho, rseed, NoteVersion::V2)
                     .into_option()
                     .unwrap()
             })
@@ -1669,7 +1687,7 @@ mod tests {
 
         // Single spend of 20_000.
         let spend_value = 20_000u64;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
+        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
@@ -1737,7 +1755,7 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value = 10_000u64;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed)
+        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
@@ -1828,6 +1846,11 @@ mod tests {
 
         let out = build_transaction(inputs).expect("public→public must succeed");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert_eq!(
+            &out.pczt_bytes[4..8],
+            &1u32.to_le_bytes(),
+            "transparent-only PCZT must serialize as v1; the device signer rejects any other header version"
+        );
         assert_eq!(
             out.n_actions_orchard, 0,
             "Public→Public must have no Orchard actions"
@@ -2119,7 +2142,7 @@ mod tests {
         let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
             .into_option()
             .unwrap();
-        let anchor_note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed)
+        let anchor_note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
             .into_option()
             .unwrap();
         let leaf =
