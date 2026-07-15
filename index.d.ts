@@ -54,7 +54,14 @@ export interface ShieldedNote {
   transferType: string
   /** Memo text decoded from the note. */
   memo: string
-  /** Orchard nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
+  /**
+   * `"sapling"`, `"orchard"`, or `"ironwood"` — the shielded pool this note
+   * belongs to. Additive field: existing consumers that ignore it are
+   * unaffected; new consumers use it to distinguish Orchard from Ironwood
+   * notes now that both appear in this shared `ShieldedNote` shape.
+   */
+  pool: string
+  /** Orchard/Ironwood nullifier (64-char hex = 32 bytes). Used for spent detection and PCZT. */
   nullifier?: string
   /** rho value (64-char hex = 32 bytes). Required with rseed for Note::from_parts. */
   rho?: string
@@ -91,6 +98,12 @@ export interface ShieldedTransaction {
   saplingNotes: Array<ShieldedNote>
   /** Decrypted Orchard notes belonging to this account. */
   orchardNotes: Array<ShieldedNote>
+  /**
+   * Decrypted Ironwood (NU6.3) notes belonging to this account. Additive
+   * field, parallel to `orchard_notes` — existing consumers that only read
+   * `orchardNotes`/`saplingNotes` are unaffected.
+   */
+  ironwoodNotes: Array<ShieldedNote>
 }
 /** Scan statistics returned once the stream is exhausted. */
 export interface SyncStats {
