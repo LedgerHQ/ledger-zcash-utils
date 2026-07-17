@@ -1,5 +1,13 @@
 # @ledgerhq/zcash-utils
 
+## 1.0.2
+
+### Patch Changes
+
+- Fix find block height low boundary block number
+
+# @ledgerhq/zcash-utils
+
 ## 1.0.1
 
 ### Patch Changes
