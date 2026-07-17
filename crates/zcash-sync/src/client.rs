@@ -113,7 +113,8 @@ pub async fn find_block_height(grpc_url: String, timestamp: u32) -> Result<u32> 
         return Ok(0);
     }
 
-    let mut low: u32 = 1;
+    const ORCHARD_ACTIVATION_MAINNET: u32 = 1_687_104;
+    let mut low: u32 = ORCHARD_ACTIVATION_MAINNET;
     let mut high: u32 = tip;
 
     // Fetch boundary timestamps (2 RPCs).
