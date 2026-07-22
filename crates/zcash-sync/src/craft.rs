@@ -15,15 +15,17 @@ use orchard::keys::Scope;
 use zcash_address::unified::{Encoding, Ufvk};
 use zcash_crypto::{
     craft::{
-        build_transaction, BuildInputs, BuildOutput, Destination, OrchardSpendInput, OutputRequest,
-        TransparentInput, DEFAULT_TX_EXPIRY_DELTA,
+        build_ironwood_transaction, build_transaction, BuildInputs, BuildOutput, Destination,
+        IronwoodBuildInputs, IronwoodDestination, IronwoodOutputRequest, IronwoodSpendInput,
+        OrchardSpendInput, OutputRequest, TransparentInput, DEFAULT_TX_EXPIRY_DELTA,
     },
     network::parse_network,
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 
 use crate::witness::{
-    compute_witnesses, fetch_orchard_anchor, resolve_anchor_height, NoteRef, WitnessRequest,
+    compute_ironwood_witnesses, compute_witnesses, fetch_ironwood_anchor, fetch_orchard_anchor,
+    resolve_anchor_height, NoteRef, WitnessRequest,
 };
 
 /// JS-facing spend descriptor — hex strings come directly from `ShieldedNote`.
@@ -445,6 +447,402 @@ fn hex_to_array<const N: usize>(s: &str, field: &str) -> Result<[u8; N]> {
         .try_into()
         .map_err(|got: Vec<u8>| anyhow!("{field}: expected {N} bytes, got {}", got.len()))?;
     Ok(arr)
+}
+
+// ── Ironwood (NU6.3) — V6 orchestrator ──────────────────────────────────────
+//
+// Wraps `zcash_crypto::craft::build_ironwood_transaction` with the same
+// gRPC-side concerns as `craft_transaction` above: anchor/witness resolution
+// (via the Ironwood siblings `compute_ironwood_witnesses` /
+// `fetch_ironwood_anchor`), UFVK parsing, and destination-address decoding.
+// Additive and decoupled from `craft_transaction` — no shared code path is
+// modified.
+//
+// Supports the two Ironwood send-flow shapes `build_ironwood_transaction`
+// itself supports (an Ironwood bundle is mandatory; there is no
+// transparent-only flow here — see that function's module docs):
+//   - Ironwood → Ironwood (spends + Ironwood outputs)
+//   - Ironwood → Public    (spends + transparent outputs)
+//   - Public   → Ironwood  (transparent inputs + Ironwood output; anchor-only)
+
+/// JS-facing Ironwood spend descriptor. Identical shape to [`SpendInputDto`];
+/// kept distinct so the Orchard V5 DTOs above are never touched by this
+/// addition.
+#[derive(Clone, Debug)]
+pub struct IronwoodSpendInputDto {
+    /// 86-char hex (43 bytes: 11-byte d + 32-byte pk_d).
+    pub recipient_hex: String,
+    pub value_zat: u64,
+    /// 64-char hex (32 bytes).
+    pub rho_hex: String,
+    /// 64-char hex.
+    pub rseed_hex: String,
+    /// 64-char hex.
+    pub cmx_hex: String,
+    /// Leaf index in the Ironwood commitment tree.
+    pub position: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct IronwoodOutputRequestDto {
+    /// Recipient address. Accepts t-addr (P2PKH/P2SH) and u-addr (Orchard
+    /// receiver — the same receiver bytes select the Ironwood pool here; see
+    /// `decode_ironwood_destination`). Sapling z-addresses and TEX (ZIP-320)
+    /// addresses are rejected.
+    pub address: String,
+    pub value_zat: u64,
+    /// Optional UTF-8 memo. Encoded into `MemoBytes` for Ironwood outputs;
+    /// ignored for transparent outputs.
+    pub memo: Option<String>,
+}
+
+pub struct IronwoodCraftRequest {
+    pub grpc_url: String,
+    pub ufvk: String,
+    /// `"mainnet"` / `"testnet"`. `None` ⇒ testnet (matches sync default).
+    pub network: Option<String>,
+    /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
+    /// obtained from the device. Stamped onto each real spend so the device can
+    /// confirm the PCZT belongs to its seed.
+    pub seed_fingerprint_hex: String,
+    /// ZIP-32 account index the UFVK was derived at.
+    pub account_index: u32,
+    /// Caller-owned fee in zatoshis (FR-4). Selected upstream by ledger-live
+    /// and forwarded to the builder, which validates it against ZIP-317 Rev 1
+    /// and derives the (always-Ironwood) change output from it.
+    pub fee_zat: u64,
+    pub spends: Vec<IronwoodSpendInputDto>,
+    /// Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows.
+    pub transparent_inputs: Vec<TransparentInputDto>,
+    pub outputs: Vec<IronwoodOutputRequestDto>,
+    /// Explicit anchor height; `None` ⇒ tip − 10 (defaults via the witness
+    /// orchestrator).
+    pub anchor_height: Option<u32>,
+}
+
+/// Compute Ironwood witnesses, decode addresses, then call the pure builder.
+pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<BuildOutput> {
+    let has_ironwood_spends = !req.spends.is_empty();
+    let has_transparent_inputs = !req.transparent_inputs.is_empty();
+
+    if !has_ironwood_spends && !has_transparent_inputs {
+        return Err(anyhow!(
+            "craft: no inputs — both ironwood spends and transparent inputs are empty"
+        ));
+    }
+    if req.outputs.is_empty() {
+        return Err(anyhow!("craft: outputs list is empty"));
+    }
+
+    let network = parse_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
+
+    // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
+    let (_net, ufvk_str) =
+        Ufvk::decode(&req.ufvk).map_err(|e| anyhow!("UFVK decode failed: {e:?}"))?;
+    let ufvk =
+        UnifiedFullViewingKey::parse(&ufvk_str).map_err(|e| anyhow!("UFVK parse failed: {e:?}"))?;
+
+    // Decode destination addresses once, up front — both drives the
+    // Ironwood-bundle-presence check below and is reused when assembling the
+    // builder's `IronwoodOutputRequest`s in step 5.
+    let outputs: Vec<IronwoodOutputRequest> = req
+        .outputs
+        .iter()
+        .map(|o| {
+            let destination = decode_ironwood_destination(&network, &o.address)?;
+            Ok(IronwoodOutputRequest {
+                destination,
+                value: o.value_zat,
+                memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    let has_ironwood_outputs = outputs
+        .iter()
+        .any(|o| matches!(o.destination, IronwoodDestination::Ironwood(_)));
+    let has_ironwood_bundle = has_ironwood_spends || has_ironwood_outputs;
+    if !has_ironwood_bundle {
+        return Err(anyhow!(
+            "craft: no Ironwood bundle — ironwood spends and ironwood outputs are both empty; \
+             use craft_transaction for a transparent-only send"
+        ));
+    }
+
+    // ── 2. Extract the Orchard-family FVK + change address ──────────────────
+    // An Ironwood bundle is mandatory here (checked above), and Ironwood spends
+    // an the Ironwood pool the same viewing key as Orchard — so, unlike
+    // `craft_transaction`, this key is always required (no transparent-only
+    // branch exists in `build_ironwood_transaction`). `ovk` makes any Ironwood
+    // output recoverable by us regardless of change routing, so it stays
+    // unconditional; only `change_address` (the Ironwood-pool change) is
+    // routing-dependent — see step 3.
+    let fvk = ufvk
+        .orchard()
+        .ok_or_else(|| {
+            anyhow!(
+                "UFVK does not contain an Orchard component (required for Ironwood spends and \
+                 outputs — the same key spends and receives both pools)"
+            )
+        })?
+        .clone();
+    let ovk = Some(fvk.to_ovk(Scope::External));
+
+    // Change returns to the pool that funds it (mirrors `craft_transaction`'s
+    // transparent-change fix, applied to the Ironwood pool): with Ironwood
+    // spends present the surplus comes from the spent Ironwood notes, so
+    // change stays shielded (Ironwood-pool change address); with no Ironwood
+    // spends (Public→Ironwood) the surplus comes from the transparent inputs,
+    // so change is taken transparent instead — only the sent amount is
+    // shielded.
+    let change_address = if has_ironwood_spends {
+        Some(fvk.address_at(0u32, Scope::Internal))
+    } else {
+        None
+    };
+
+    // ── 3. Transparent change address (Public→Ironwood) ──────────────────────
+    // For the no-Ironwood-spends flow we derive the internal change address
+    // from the UFVK's transparent component when available, otherwise accept
+    // None (exact-balance transactions need no change address). When the UFVK
+    // has no transparent receiver we can only proceed if the transaction
+    // produces no change; if it would, fail fast here with an actionable error
+    // rather than letting the deeper, generic builder error surface later.
+    // Derive the internal change address *and* the metadata the device needs
+    // to recognize it as change: the change pubkey (33 bytes) and its
+    // non-hardened address index. These flow into the change output's
+    // `bip32_derivation`. Mirrors `craft_transaction`'s step 3 exactly.
+    let transparent_change: Option<(
+        zcash_transparent::address::TransparentAddress,
+        [u8; 33],
+        u32,
+    )> = if !has_ironwood_spends {
+        let derived = ufvk.transparent().and_then(|tpk| {
+            use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
+            let ivk = tpk.derive_internal_ivk().ok()?;
+            let (addr, index) = ivk.default_address();
+            let pubkey = tpk
+                .derive_address_pubkey(TransparentKeyScope::INTERNAL, index)
+                .ok()?
+                .serialize();
+            Some((addr, pubkey, index.index()))
+        });
+        if derived.is_none() {
+            let total_in = req
+                .transparent_inputs
+                .iter()
+                .try_fold(0u64, |acc, t| acc.checked_add(t.value_zat))
+                .ok_or_else(|| anyhow!("transparent input value overflow"))?;
+            let total_out = req
+                .outputs
+                .iter()
+                .try_fold(0u64, |acc, o| acc.checked_add(o.value_zat))
+                .ok_or_else(|| anyhow!("output value overflow"))?;
+            let outflow = total_out
+                .checked_add(req.fee_zat)
+                .ok_or_else(|| anyhow!("total_out + fee overflow"))?;
+            if total_in > outflow {
+                return Err(anyhow!(
+                    "transparent change of {} zatoshis is required but the UFVK has no \
+                     transparent receiver to derive an internal change address from; \
+                     use a UFVK with a transparent component or send an exact-balance \
+                     amount (transparent inputs == outputs + fee)",
+                    total_in - outflow
+                ));
+            }
+        }
+        derived
+    } else {
+        None
+    };
+    let transparent_change_address = transparent_change.as_ref().map(|(addr, _, _)| *addr);
+    let transparent_change_pubkey = transparent_change.as_ref().map(|(_, pk, _)| *pk);
+    let transparent_change_address_index = transparent_change.as_ref().map(|(_, _, i)| *i);
+
+    // ── 4. Anchor routing ─────────────────────────────────────────────────────
+    let (anchor, spends, resolved_anchor_height) = if has_ironwood_spends {
+        // Ironwood→* : compute full witnesses for each spend note.
+        let notes: Vec<NoteRef> = req
+            .spends
+            .iter()
+            .map(|s| {
+                Ok(NoteRef {
+                    position: s.position,
+                    cmx: hex_to_array::<32>(&s.cmx_hex, "cmx")?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let witness_out = compute_ironwood_witnesses(WitnessRequest {
+            grpc_url: req.grpc_url.clone(),
+            anchor_height: req.anchor_height,
+            anchor_depth_blocks: None,
+            notes,
+        })
+        .await?;
+
+        if witness_out.witnesses.len() != req.spends.len() {
+            return Err(anyhow!(
+                "internal: witness count {} != spends count {}",
+                witness_out.witnesses.len(),
+                req.spends.len()
+            ));
+        }
+
+        let spends: Vec<IronwoodSpendInput> = req
+            .spends
+            .iter()
+            .zip(witness_out.witnesses.iter().cloned())
+            .map(|(dto, mp)| {
+                Ok(IronwoodSpendInput {
+                    recipient: hex_to_array::<43>(&dto.recipient_hex, "recipient")?,
+                    value: dto.value_zat,
+                    rho: hex_to_array::<32>(&dto.rho_hex, "rho")?,
+                    rseed: hex_to_array::<32>(&dto.rseed_hex, "rseed")?,
+                    merkle_path: mp,
+                })
+            })
+            .collect::<Result<_>>()?;
+
+        (witness_out.anchor, spends, witness_out.anchor_height)
+    } else {
+        // Public→Ironwood: fetch anchor only (no spend witnesses).
+        let witness_out = fetch_ironwood_anchor(&req.grpc_url, req.anchor_height, None).await?;
+        (witness_out.anchor, vec![], witness_out.anchor_height)
+    };
+
+    // ── 5. Decode + verify transparent inputs ────────────────────────────────
+    let transparent_inputs = decode_transparent_inputs(&ufvk, &req.transparent_inputs)?;
+
+    // Destinations were decoded once in step 1 and reused here as `outputs`.
+
+    // ── 6. target_height = anchor_height + DEFAULT_TX_EXPIRY_DELTA ───────────
+    let target_height = resolved_anchor_height
+        .checked_add(DEFAULT_TX_EXPIRY_DELTA)
+        .ok_or_else(|| anyhow!("target_height overflow"))?;
+
+    // ── 7. Build ──────────────────────────────────────────────────────────────
+    build_ironwood_transaction(IronwoodBuildInputs {
+        network,
+        target_height,
+        ironwood_fvk: Some(fvk),
+        ovk,
+        change_address,
+        transparent_change_address,
+        transparent_change_pubkey,
+        transparent_change_address_index,
+        anchor,
+        seed_fingerprint,
+        account_index: req.account_index,
+        fee: req.fee_zat,
+        spends,
+        transparent_inputs,
+        outputs,
+    })
+    .map_err(|e| anyhow!("build_ironwood_transaction: {e}"))
+}
+
+/// Decode a destination address string into an [`IronwoodDestination`].
+///
+/// Accepts transparent (P2PKH/P2SH) addresses and unified addresses with an
+/// Orchard receiver — the same receiver bytes as [`decode_destination`] uses
+/// for the Orchard pool: there is no separate "Ironwood" unified-address
+/// receiver kind (ZIP 316), the pool is selected by which builder method is
+/// called with the decoded address, not by its encoding. Sapling z-addresses
+/// and ZIP-320 TEX addresses are rejected.
+fn decode_ironwood_destination(
+    network: &zcash_protocol::consensus::Network,
+    address: &str,
+) -> Result<IronwoodDestination> {
+    let addr = Address::decode(network, address)
+        .ok_or_else(|| anyhow!("invalid destination address: {address}"))?;
+    match addr {
+        Address::Transparent(ta) => Ok(IronwoodDestination::Transparent(ta)),
+        Address::Unified(ua) => {
+            if let Some(oa) = ua.orchard() {
+                Ok(IronwoodDestination::Ironwood(*oa))
+            } else if let Some(ta) = ua.transparent() {
+                Ok(IronwoodDestination::Transparent(*ta))
+            } else {
+                Err(anyhow!(
+                    "unified address has no Orchard or Transparent receiver: {address}"
+                ))
+            }
+        }
+        Address::Sapling(_) => Err(anyhow!("Sapling destination not supported")),
+        Address::Tex(_) => Err(anyhow!("ZIP-320 TEX address not supported")),
+    }
+}
+
+/// Decode and verify each transparent input's signing-key derivation against
+/// the UFVK, producing the builder's `TransparentInput` records. Identical
+/// logic to the inline block `craft_transaction` uses (step 5 there); factored
+/// out fresh as a new function — rather than refactoring `craft_transaction`
+/// itself — so the existing V5 path is never touched by this addition.
+fn decode_transparent_inputs(
+    ufvk: &UnifiedFullViewingKey,
+    dtos: &[TransparentInputDto],
+) -> Result<Vec<TransparentInput>> {
+    use zcash_transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
+
+    let account_pubkey = ufvk.transparent();
+    dtos.iter()
+        .map(|dto| {
+            let txid = hex_to_array::<32>(&dto.txid_hex, "txid")?;
+            let pubkey = hex_to_array::<33>(&dto.pubkey_hex, "pubkey")?;
+            let script_pubkey = hex::decode(&dto.script_pubkey_hex)
+                .map_err(|e| anyhow!("script_pubkey hex: {e}"))?;
+
+            let scope = match dto.derivation_scope {
+                0 => TransparentKeyScope::EXTERNAL,
+                1 => TransparentKeyScope::INTERNAL,
+                other => {
+                    return Err(anyhow!(
+                        "transparent input derivation_scope must be 0 (external) or 1 (internal), \
+                         got {other}"
+                    ))
+                }
+            };
+            let apk = account_pubkey.ok_or_else(|| {
+                anyhow!(
+                    "transparent inputs were supplied but the UFVK has no transparent component \
+                     to derive (and verify) their signing keys from"
+                )
+            })?;
+            let index = NonHardenedChildIndex::from_index(dto.address_index).ok_or_else(|| {
+                anyhow!(
+                    "transparent input address_index {} is not a valid non-hardened index",
+                    dto.address_index
+                )
+            })?;
+            let derived_pubkey = apk.derive_address_pubkey(scope, index).map_err(|e| {
+                anyhow!(
+                    "failed to derive transparent input pubkey at scope {} index {}: {e}",
+                    dto.derivation_scope,
+                    dto.address_index
+                )
+            })?;
+            if derived_pubkey.serialize() != pubkey {
+                return Err(anyhow!(
+                    "transparent input pubkey does not match the key derived from the UFVK at \
+                     scope {} index {}; the supplied (derivation_scope, address_index) does not \
+                     identify this UTXO's key",
+                    dto.derivation_scope,
+                    dto.address_index
+                ));
+            }
+
+            Ok(TransparentInput {
+                txid,
+                vout: dto.vout,
+                script_pubkey,
+                value: dto.value_zat,
+                pubkey,
+                derivation_scope: dto.derivation_scope,
+                derivation_address_index: dto.address_index,
+            })
+        })
+        .collect::<Result<_>>()
 }
 
 #[cfg(test)]
@@ -873,6 +1271,269 @@ mod tests {
         assert!(
             !msg.contains("transparent change"),
             "exact-balance tx must not trip the change guard, got: {msg}"
+        );
+    }
+
+    // ── Ironwood (NU6.3) — craft_ironwood_transaction ─────────────────────────
+
+    fn dummy_ironwood_spend() -> IronwoodSpendInputDto {
+        IronwoodSpendInputDto {
+            recipient_hex: "00".repeat(43),
+            value_zat: 100_000,
+            rho_hex: "00".repeat(32),
+            rseed_hex: "ab".repeat(32),
+            cmx_hex: "00".repeat(32),
+            position: 0,
+        }
+    }
+
+    fn dummy_ironwood_output() -> IronwoodOutputRequestDto {
+        IronwoodOutputRequestDto {
+            address: "u1somewhere".into(),
+            value_zat: 10_000,
+            memo: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ironwood_empty_spends_and_transparent_inputs_returns_error() {
+        let req = IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: "uview1bogus".into(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![],
+            outputs: vec![dummy_ironwood_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(err.to_string().contains("no inputs"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn ironwood_empty_outputs_returns_error() {
+        let req = IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: "uview1bogus".into(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![dummy_ironwood_spend()],
+            transparent_inputs: vec![],
+            outputs: vec![],
+            anchor_height: Some(1),
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("outputs list is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ironwood_malformed_ufvk_returns_error() {
+        let req = IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: "this is not a UFVK".into(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![dummy_ironwood_spend()],
+            transparent_inputs: vec![],
+            outputs: vec![dummy_ironwood_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(err.to_string().contains("UFVK decode failed"), "got: {err}");
+    }
+
+    /// A request with transparent inputs only and no Ironwood spends is a
+    /// legitimate Public→Ironwood shape (the Ironwood output alone makes the
+    /// bundle non-empty) — it must NOT fail with "no inputs".
+    #[tokio::test]
+    async fn ironwood_transparent_only_input_passes_input_guard() {
+        let req = IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: "uview1bogus".into(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_ironwood_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            !err.to_string().contains("no inputs"),
+            "should pass the input guard, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("UFVK"),
+            "expected UFVK error, got: {err}"
+        );
+    }
+
+    /// Transparent inputs + a transparent-only output (no Ironwood spends, no
+    /// Ironwood output) is not a valid Ironwood send — must be rejected with
+    /// the dedicated "no Ironwood bundle" error before any network I/O, rather
+    /// than silently falling through to a Public→Public build.
+    #[tokio::test]
+    async fn ironwood_no_bundle_transparent_only_returns_error() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+
+        let req = IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: keys.ufvk,
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![IronwoodOutputRequestDto {
+                address: "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs".into(),
+                value_zat: 10_000,
+                memo: None,
+            }],
+            anchor_height: Some(1),
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("no Ironwood bundle"),
+            "got: {err}"
+        );
+    }
+
+    /// Ironwood→* routing: a real Ironwood spend must route through
+    /// `compute_ironwood_witnesses`, not the Orchard witness path — reaching
+    /// the gRPC witness fetch (and failing there, on a refused port) rather
+    /// than an earlier guard.
+    #[tokio::test]
+    async fn ironwood_spend_routes_through_witness_fetch() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        // A real (Orchard-family) destination address matching the UFVK — the
+        // output must decode successfully so the request reaches the witness
+        // fetch, not fail earlier on address decoding.
+        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
+        let (ua, _) = ufvk
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+        let ironwood_addr = ua.encode(&Network::MainNetwork);
+
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let req = IronwoodCraftRequest {
+            grpc_url: format!("https://127.0.0.1:{}", addr.port()),
+            ufvk: keys.ufvk.clone(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![dummy_ironwood_spend()],
+            transparent_inputs: vec![],
+            outputs: vec![IronwoodOutputRequestDto {
+                address: ironwood_addr,
+                value_zat: 10_000,
+                memo: None,
+            }],
+            anchor_height: Some(1),
+        };
+
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            !err.to_string().contains("no inputs"),
+            "should pass the input guard, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("UFVK"),
+            "UFVK must parse cleanly, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "expected witness-fetch connect failure, got: {err}"
+        );
+    }
+
+    /// Public→Ironwood routing: transparent inputs + an Ironwood (unified
+    /// address) output and no Ironwood spends must route through
+    /// `fetch_ironwood_anchor` (anchor-only), not `compute_ironwood_witnesses`.
+    #[tokio::test]
+    async fn public_to_ironwood_routes_through_anchor_only_fetch() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
+        let (ua, _) = ufvk
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+        let ironwood_addr = ua.encode(&Network::MainNetwork);
+
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+
+        let req = IronwoodCraftRequest {
+            grpc_url: format!("https://127.0.0.1:{}", addr.port()),
+            ufvk: keys.ufvk.clone(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 15_000,
+            spends: vec![], // no Ironwood spends → anchor-only
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![IronwoodOutputRequestDto {
+                address: ironwood_addr,
+                value_zat: 10_000,
+                memo: None,
+            }],
+            anchor_height: Some(1),
+        };
+
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            !err.to_string().contains("no inputs"),
+            "should pass the input guard, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("UFVK"),
+            "UFVK must parse cleanly, got: {err}"
+        );
+        assert!(
+            !err.to_string().contains("invalid destination address"),
+            "Ironwood destination must decode, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "expected anchor-fetch connect failure, got: {err}"
         );
     }
 }

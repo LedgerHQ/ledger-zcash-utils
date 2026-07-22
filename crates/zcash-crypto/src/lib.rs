@@ -10,7 +10,8 @@
 //! - [`network`]: Zcash network name parsing utilities
 //! - [`error`]: Unified error type for all operations in this crate
 //! - [`tree`]: On-demand Orchard ShardTree assembly and Merkle witness extraction
-//! - [`craft`]: Build, prove, and serialize a PCZT for the Orchard send flows
+//! - [`craft`]: Build, prove, and serialize a PCZT for the Orchard V5 send
+//!   flows and the Ironwood (NU6.3) V6 bundle path
 //! - [`finalize`]: Inject device signatures into a PCZT and extract the final signed V5 transaction
 //! - [`parse`]: Parse canonical PCZT bytes into a structured, device-signer-ready form
 
