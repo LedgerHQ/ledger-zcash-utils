@@ -343,6 +343,11 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // note-commitment tree anchor; transparent-only flows have no Orchard actions,
     // so the canonical empty-tree anchor is used (no action ever references it).
     let orchard_anchor = Some(if has_orchard {
+        if anchor == [0u8; 32] {
+            return Err(Error::Craft(
+                "Orchard anchor must be non-zero (zero is not a valid commitment-tree root)".into(),
+            ));
+        }
         orchard::Anchor::from_bytes(anchor)
             .into_option()
             .ok_or_else(|| Error::Craft("invalid Orchard anchor encoding".into()))?
@@ -1138,6 +1143,60 @@ mod tests {
         assert!(
             matches!(&err, Error::Craft(s) if s.contains("invalid Orchard anchor encoding")),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_anchor_with_orchard_bundle_returns_craft_error() {
+        // A syntactically-valid (all-zero) byte string decodes fine via
+        // `orchard::Anchor::from_bytes`, but the all-zero value is not a valid
+        // commitment-tree root, so a bundle-carrying flow must reject it up front
+        // with a distinct error (not the generic "invalid encoding" one).
+        let fvk = make_fvk();
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let note = Note::from_parts(recipient, NoteValue::from_raw(20_000), rho, rseed, NoteVersion::V2)
+            .into_option()
+            .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (_anchor, path) = synthetic_anchor_and_path(leaf);
+        let inputs = BuildInputs {
+            network: Network::MainNetwork,
+            target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: None,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32], // zero anchor is invalid when a bundle is present
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee: 10_000,
+            spends: vec![OrchardSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: 20_000,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path: path,
+            }],
+            transparent_inputs: vec![],
+            outputs: vec![OutputRequest {
+                destination: Destination::Orchard(recipient),
+                value: 10_000,
+                memo: None,
+            }],
+        };
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s)
+                if s.contains("Orchard anchor must be non-zero")
+                    && !s.contains("invalid Orchard anchor encoding")),
+            "zero anchor must be rejected with the dedicated non-zero error, got: {err}"
         );
     }
 
