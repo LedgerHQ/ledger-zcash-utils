@@ -416,9 +416,13 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     }
     let change = total_in - outflow;
 
-    // Route surplus change to the appropriate pool:
-    // - Orchard bundle present → Orchard change output (existing behaviour).
-    // - Transparent-only (Public→Public) → transparent change output.
+    // Route surplus change to the pool that funds it:
+    // - Orchard spends present → Orchard change output (z→z, z→t: the surplus
+    //   comes from the spent Orchard notes, so change stays shielded).
+    // - No Orchard spends → transparent change output (t→t and t→z: the surplus
+    //   comes from the transparent inputs). For t→z this keeps the change
+    //   transparent instead of migrating the whole balance into the shielded
+    //   pool — only the sent amount is shielded.
     //
     // When a transparent change output is added we record its index in the
     // transparent bundle plus the metadata needed to stamp its `bip32_derivation`
@@ -428,7 +432,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // its index equals the number of transparent outputs added before it.
     let mut transparent_change_stamp: Option<(usize, [u8; 33], u32)> = None;
     if change > 0 {
-        if has_orchard {
+        if n_spends > 0 {
             let change_addr = change_address.ok_or_else(|| {
                 Error::Craft(
                     "change_address required for Orchard change but none supplied".into(),
@@ -2250,6 +2254,84 @@ mod tests {
         assert_eq!(
             out.n_transparent_outputs, 0,
             "exact balance leaves no transparent change"
+        );
+        assert_eq!(out.fee, fee);
+    }
+
+    #[test]
+    fn public_to_private_takes_transparent_change() {
+        // A transparent→shielded send with surplus takes its change on the
+        // TRANSPARENT side (the pool that funds it), not Orchard: only the sent
+        // amount is shielded, the change stays transparent. Regression guard for
+        // the routing rule "Orchard change iff there are Orchard spends".
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        // Valid Orchard anchor (only value-0 dummy spends reference it).
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let anchor_note =
+            Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
+                .into_option()
+                .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(
+            anchor_note.commitment(),
+        ));
+        let (anchor, _path) = synthetic_anchor_and_path(leaf);
+
+        let change_pubkey = {
+            use secp256k1::{Secp256k1, SecretKey};
+            let secp = Secp256k1::new();
+            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+        };
+        let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
+
+        // 1 transparent input, 1 Orchard output, 1 transparent change output.
+        // orchard_actions = max(MIN=2, 1) = 2; transparent = max(1, 1) = 1 → 15_000.
+        let fee = zip317_fee(0, 1, 1, 1);
+        let out_value = 10_000u64;
+        let change_value = 50_000u64;
+        let total_in = out_value + change_value + fee;
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu5_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            // Orchard change address is supplied but must NOT be used here: with
+            // no Orchard spends the change is taken transparent.
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: Some(t_change),
+            transparent_change_pubkey: Some(change_pubkey),
+            transparent_change_address_index: Some(7),
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Orchard(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("t→z with change must succeed");
+        assert_eq!(out.n_transparent_inputs, 1);
+        // The change is taken on the transparent side, NOT Orchard. The old
+        // behaviour routed it to Orchard, which would leave this at 0.
+        assert_eq!(
+            out.n_transparent_outputs, 1,
+            "t→z change must stay transparent"
+        );
+        assert!(
+            out.n_actions_orchard >= 1,
+            "the sent amount is still shielded (Orchard output present)"
         );
         assert_eq!(out.fee, fee);
     }
