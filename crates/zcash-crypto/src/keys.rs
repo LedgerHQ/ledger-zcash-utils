@@ -8,7 +8,7 @@ use bitcoin::{
 use orchard::keys::{FullViewingKey as OrchardFvk, Scope as OrchardScope};
 use sapling_crypto::zip32::DiversifiableFullViewingKey as SaplingDfvk;
 use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
-use zcash_keys::keys::UnifiedSpendingKey;
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
 use zcash_protocol::consensus::Network as ZcashConsensusNetwork;
 use zip32::{AccountId, Scope};
 
@@ -39,6 +39,11 @@ pub struct DerivedKeys {
     /// Bech32m Unified Full Viewing Key (HRP `"uview1"` / `"uviewtest1"`).
     /// Bundles transparent + Orchard FVKs, and Sapling by default, per ZIP-316.
     pub ufvk: String,
+    /// Default unified receiving address (Bech32m, HRP `"u1"` / `"utest1"`),
+    /// per ZIP-316. Includes every receiver available in the UFVK (Orchard is
+    /// always present; Sapling/transparent are included when their pool keys
+    /// are). Watch-only: derived from the UFVK, no spending key involved.
+    pub unified_address: String,
     /// BIP-32 transparent extended public key (Base58Check).
     pub xpub: String,
     /// BIP-32 path used for xpub derivation.
@@ -165,6 +170,14 @@ pub fn derive_keys_with_options(
     let sapling = ufvk_obj.sapling().map(extract_sapling);
     let orchard = ufvk_obj.orchard().map(extract_orchard);
 
+    // --- Default unified address (ZIP-316 §"Deriving a Unified Address") ---
+    // `AllAvailableKeys` includes every receiver the UFVK can produce (Orchard
+    // is always present here — see `UnifiedSpendingKey::from_seed` above).
+    let (unified_addr, _diversifier_index) = ufvk_obj
+        .default_address(UnifiedAddressRequest::AllAvailableKeys)
+        .map_err(|e| Error::Derivation(format!("failed to derive default unified address: {e:?}")))?;
+    let unified_address = unified_addr.encode(&zcash_net);
+
     // --- Transparent xpub via BIP-32 ---
     let resolved_path = match xpub_path {
         Some(p) => p.to_string(),
@@ -180,6 +193,7 @@ pub fn derive_keys_with_options(
 
     Ok(DerivedKeys {
         ufvk,
+        unified_address,
         xpub,
         xpub_path: resolved_path,
         sapling,
@@ -383,5 +397,57 @@ mod tests {
     fn test_options_default_includes_sapling() {
         let opts = DeriveOptions::default();
         assert!(opts.include_sapling_in_ufvk);
+    }
+
+    // ── unified_address ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mainnet_unified_address_prefix() {
+        let keys = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        assert!(keys.unified_address.starts_with("u1"), "got: {}", keys.unified_address);
+    }
+
+    #[test]
+    fn test_testnet_unified_address_prefix() {
+        let keys = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Testnet, None).unwrap();
+        assert!(keys.unified_address.starts_with("utest1"), "got: {}", keys.unified_address);
+    }
+
+    #[test]
+    fn test_unified_address_deterministic() {
+        let ka = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let kb = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        assert_eq!(ka.unified_address, kb.unified_address);
+    }
+
+    #[test]
+    fn test_unified_address_differs_across_accounts() {
+        let k0 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let k1 = derive_keys(KNOWN_MNEMONIC, 1, ZcashNetwork::Mainnet, None).unwrap();
+        assert_ne!(k0.unified_address, k1.unified_address);
+    }
+
+    #[test]
+    fn test_unified_address_present_regardless_of_sapling_in_ufvk() {
+        // The default address always includes every available receiver
+        // (Orchard at minimum), independent of `include_sapling_in_ufvk`
+        // which only controls what's bundled into the UFVK string itself.
+        let with_sapling = derive_keys_with_options(
+            KNOWN_MNEMONIC,
+            0,
+            ZcashNetwork::Mainnet,
+            None,
+            DeriveOptions { include_sapling_in_ufvk: true },
+        )
+        .unwrap();
+        let without_sapling = derive_keys_with_options(
+            KNOWN_MNEMONIC,
+            0,
+            ZcashNetwork::Mainnet,
+            None,
+            DeriveOptions { include_sapling_in_ufvk: false },
+        )
+        .unwrap();
+        assert_eq!(with_sapling.unified_address, without_sapling.unified_address);
     }
 }

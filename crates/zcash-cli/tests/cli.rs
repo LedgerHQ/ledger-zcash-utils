@@ -60,6 +60,7 @@ fn derive_known_mnemonic_human() {
         .assert()
         .success()
         .stdout(contains("ufvk"))
+        .stdout(contains("address   : u1"))
         .stdout(contains("xpub"))
         .stdout(contains("sapling"))
         .stdout(contains("orchard"));
@@ -80,9 +81,27 @@ fn derive_known_mnemonic_json() {
         .assert()
         .success()
         .stdout(contains("\"ufvk\""))
+        .stdout(contains("\"unified_address\""))
         .stdout(contains("\"xpub\""))
         .stdout(contains("\"sapling\""))
         .stdout(contains("\"orchard\""));
+}
+
+#[test]
+fn derive_testnet_unified_address_has_testnet_prefix() {
+    cmd()
+        .args([
+            "derive",
+            "--mnemonic",
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            "--network",
+            "testnet",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("\"unified_address\": \"utest1"));
 }
 
 #[test]
