@@ -251,6 +251,92 @@ export interface BuildTransactionResult {
  * single `spawn_blocking` call — the proving cost is borne inline.
  */
 export declare function buildTransaction(params: BuildTransactionParams): Promise<BuildTransactionResult>
+/**
+ * One Ironwood note to spend. Identical shape to [`OrchardSpendInputJs`];
+ * kept as a distinct type for clarity on the JS side.
+ */
+export interface IronwoodSpendInputJs {
+  /** 86-char hex (43 bytes: 11-byte diversifier + 32-byte pk_d). */
+  recipient: string
+  /** Decimal u64 (string to avoid f64 precision loss). */
+  valueZat: string
+  /** 64-char hex (32 bytes). */
+  rho: string
+  /** 64-char hex. */
+  rseed: string
+  /** 64-char hex. */
+  cmx: string
+  /** Decimal u64 leaf position in the Ironwood commitment tree. */
+  position: string
+}
+export interface IronwoodOutputRequestJs {
+  /**
+   * Destination address: t-addr (P2PKH/P2SH) or u-addr (Orchard receiver —
+   * the same receiver selects the Ironwood pool here). Sapling z-addresses
+   * and TEX (ZIP-320) addresses are rejected.
+   */
+  address: string
+  valueZat: string
+  memo?: string
+}
+export interface BuildIronwoodTransactionParams {
+  grpcUrl: string
+  ufvk: string
+  network?: string
+  /**
+   * 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
+   * read from the device. Stamped onto each real spend so the device can
+   * confirm the PCZT belongs to its seed before signing.
+   */
+  seedFingerprint: string
+  /** ZIP-32 account index the UFVK was derived at. */
+  accountIndex: number
+  /**
+   * Caller-owned fee in zatoshis (decimal string to avoid f64 precision
+   * loss). Per FR-4 the fee is selected by ledger-live; this
+   * crate validates it against ZIP-317 Rev 1 and derives the (always
+   * Ironwood) change from it rather than computing a fee itself.
+   */
+  feeZat: string
+  spends: Array<IronwoodSpendInputJs>
+  /** Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows. */
+  transparentInputs: Array<TransparentInputJs>
+  outputs: Array<IronwoodOutputRequestJs>
+  anchorHeight?: number
+}
+export interface BuildIronwoodTransactionResult {
+  /**
+   * Hex-encoded canonical PCZT bytes (`PCZT` magic + u32 LE version +
+   * postcard payload), serialized in the **v2** wire format and redacted
+   * (required for any V6 / Ironwood-bearing PCZT — see
+   * `zcash_crypto::craft::build_ironwood_transaction`).
+   */
+  pcztHex: string
+  /** Decimal fee in zatoshis. */
+  feeZat: string
+  /** Block height the Merkle paths were computed against. */
+  anchorHeight: number
+  /** Ironwood action count after dummy padding. */
+  nActionsIronwood: number
+  /** Transparent input count. */
+  nTransparentInputs: number
+  /** Transparent output count. */
+  nTransparentOutputs: number
+}
+/**
+ * Build, prove, and serialize a redacted V6 PCZT for an Ironwood send.
+ *
+ * Rust-only crafting is dry-run pending the NU6.3 wallet-side crates
+ * stabilizing (`pczt`, `zcash_client_backend` are release candidates); this
+ * NAPI wrapper is exposed now so the JS side can be wired up in parallel and
+ * re-pinned when those crates stabilize (see `docs/architecture.md`).
+ *
+ * Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
+ * happens here for the Ironwood bundle (~2-5 s first call against the
+ * `PostNu6_3` circuit, ~hundreds of ms thereafter via the process-global
+ * proving-key cache).
+ */
+export declare function buildIronwoodTransaction(params: BuildIronwoodTransactionParams): Promise<BuildIronwoodTransactionResult>
 /** Parameters for finalizing a PCZT with device-provided signatures. */
 export interface FinalizeTransactionParams {
   /** Hex-encoded canonical PCZT bytes from `buildTransaction`. */

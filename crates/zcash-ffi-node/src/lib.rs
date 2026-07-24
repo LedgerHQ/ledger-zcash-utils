@@ -444,6 +444,172 @@ fn parse_u64(s: &str, field: &str) -> napi::Result<u64> {
         .map_err(|e| napi::Error::from_reason(format!("invalid {field}: {e}")))
 }
 
+// ─── V6 transaction builder (Ironwood / NU6.3 bundle) ────────────────────────
+//
+// Mirrors the V5 builder above exactly (same DTO shape, error handling, and
+// naming conventions); additive and decoupled from it — `build_transaction`
+// and its JS-facing types are never touched by this addition.
+
+/// One Ironwood note to spend. Identical shape to [`OrchardSpendInputJs`];
+/// kept as a distinct type for clarity on the JS side.
+#[napi(object)]
+pub struct IronwoodSpendInputJs {
+    /// 86-char hex (43 bytes: 11-byte diversifier + 32-byte pk_d).
+    pub recipient: String,
+    /// Decimal u64 (string to avoid f64 precision loss).
+    pub value_zat: String,
+    /// 64-char hex (32 bytes).
+    pub rho: String,
+    /// 64-char hex.
+    pub rseed: String,
+    /// 64-char hex.
+    pub cmx: String,
+    /// Decimal u64 leaf position in the Ironwood commitment tree.
+    pub position: String,
+}
+
+#[napi(object)]
+pub struct IronwoodOutputRequestJs {
+    /// Destination address: t-addr (P2PKH/P2SH) or u-addr (Orchard receiver —
+    /// the same receiver selects the Ironwood pool here). Sapling z-addresses
+    /// and TEX (ZIP-320) addresses are rejected.
+    pub address: String,
+    pub value_zat: String,
+    pub memo: Option<String>,
+}
+
+#[napi(object)]
+pub struct BuildIronwoodTransactionParams {
+    pub grpc_url: String,
+    pub ufvk: String,
+    pub network: Option<String>,
+    /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
+    /// read from the device. Stamped onto each real spend so the device can
+    /// confirm the PCZT belongs to its seed before signing.
+    pub seed_fingerprint: String,
+    /// ZIP-32 account index the UFVK was derived at.
+    pub account_index: u32,
+    /// Caller-owned fee in zatoshis (decimal string to avoid f64 precision
+    /// loss). Per FR-4 the fee is selected by ledger-live; this
+    /// crate validates it against ZIP-317 Rev 1 and derives the (always
+    /// Ironwood) change from it rather than computing a fee itself.
+    pub fee_zat: String,
+    pub spends: Vec<IronwoodSpendInputJs>,
+    /// Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows.
+    pub transparent_inputs: Vec<TransparentInputJs>,
+    pub outputs: Vec<IronwoodOutputRequestJs>,
+    pub anchor_height: Option<u32>,
+}
+
+#[napi(object)]
+pub struct BuildIronwoodTransactionResult {
+    /// Hex-encoded canonical PCZT bytes (`PCZT` magic + u32 LE version +
+    /// postcard payload), serialized in the **v2** wire format and redacted
+    /// (required for any V6 / Ironwood-bearing PCZT — see
+    /// `zcash_crypto::craft::build_ironwood_transaction`).
+    pub pczt_hex: String,
+    /// Decimal fee in zatoshis.
+    pub fee_zat: String,
+    /// Block height the Merkle paths were computed against.
+    pub anchor_height: u32,
+    /// Ironwood action count after dummy padding.
+    pub n_actions_ironwood: u32,
+    /// Transparent input count.
+    pub n_transparent_inputs: u32,
+    /// Transparent output count.
+    pub n_transparent_outputs: u32,
+}
+
+fn convert_ironwood_transparent_inputs(
+    inputs: Vec<TransparentInputJs>,
+) -> napi::Result<Vec<zcash_sync::craft::TransparentInputDto>> {
+    inputs
+        .into_iter()
+        .map(|t| {
+            Ok(zcash_sync::craft::TransparentInputDto {
+                txid_hex: t.txid,
+                vout: t.vout,
+                script_pubkey_hex: t.script_pubkey,
+                value_zat: parse_u64(&t.value_zat, "value_zat")?,
+                pubkey_hex: t.pubkey,
+                derivation_scope: t.derivation_scope,
+                address_index: t.address_index,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()
+}
+
+/// Build, prove, and serialize a redacted V6 PCZT for an Ironwood send.
+///
+/// Rust-only crafting is dry-run pending the NU6.3 wallet-side crates
+/// stabilizing (`pczt`, `zcash_client_backend` are release candidates); this
+/// NAPI wrapper is exposed now so the JS side can be wired up in parallel and
+/// re-pinned when those crates stabilize (see `docs/architecture.md`).
+///
+/// Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
+/// happens here for the Ironwood bundle (~2-5 s first call against the
+/// `PostNu6_3` circuit, ~hundreds of ms thereafter via the process-global
+/// proving-key cache).
+#[napi]
+pub async fn build_ironwood_transaction(
+    params: BuildIronwoodTransactionParams,
+) -> napi::Result<BuildIronwoodTransactionResult> {
+    let spends = params
+        .spends
+        .into_iter()
+        .map(|s| {
+            Ok(zcash_sync::craft::IronwoodSpendInputDto {
+                recipient_hex: s.recipient,
+                value_zat: parse_u64(&s.value_zat, "value_zat")?,
+                rho_hex: s.rho,
+                rseed_hex: s.rseed,
+                cmx_hex: s.cmx,
+                position: parse_u64(&s.position, "position")?,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+
+    let transparent_inputs = convert_ironwood_transparent_inputs(params.transparent_inputs)?;
+
+    let outputs = params
+        .outputs
+        .into_iter()
+        .map(|o| {
+            Ok(zcash_sync::craft::IronwoodOutputRequestDto {
+                address: o.address,
+                value_zat: parse_u64(&o.value_zat, "value_zat")?,
+                memo: o.memo,
+            })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+
+    let req = zcash_sync::craft::IronwoodCraftRequest {
+        grpc_url: params.grpc_url,
+        ufvk: params.ufvk,
+        network: params.network,
+        seed_fingerprint_hex: params.seed_fingerprint,
+        account_index: params.account_index,
+        fee_zat: parse_u64(&params.fee_zat, "fee_zat")?,
+        anchor_height: params.anchor_height,
+        spends,
+        transparent_inputs,
+        outputs,
+    };
+
+    let out = zcash_sync::craft::craft_ironwood_transaction(req)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    Ok(BuildIronwoodTransactionResult {
+        pczt_hex: hex::encode(&out.pczt_bytes),
+        fee_zat: out.fee.to_string(),
+        anchor_height: out.anchor_height,
+        n_actions_ironwood: out.n_actions_ironwood,
+        n_transparent_inputs: out.n_transparent_inputs,
+        n_transparent_outputs: out.n_transparent_outputs,
+    })
+}
+
 // ─── Finalize + broadcast ─────────────────────────────────────────────────────
 
 /// Parameters for finalizing a PCZT with device-provided signatures.

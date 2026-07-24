@@ -92,6 +92,19 @@ Its per-spend inputs (`rho`/`rseed`/`cmx`/`position`/`nullifier`) and per-UTXO
 pubkeys are produced by a prior `sync` run, not hand-entered. The builder is
 therefore reachable only through `zcash-ffi-node`, its sole consumer.
 
+**Exception: the V6/Ironwood PCZT builder (`craft`, `build_ironwood_transaction`).**
+Not exposed via the CLI, for the same reason as the V5 builder above: it is
+device-coupled (a `seed_fingerprint` read from the Ledger device, a PCZT whose
+sole purpose is to be APDU-streamed to and signed by that device), so a CLI
+invocation would only yield an unsignable artifact. Its per-spend inputs are
+produced by a prior Ironwood-aware `sync` run, not hand-entered. Unlike the V5
+builder, this path *is* exposed through `zcash-ffi-node`
+(`buildIronwoodTransaction`) despite the wallet-side crates it depends on
+(`zcash_client_backend`, `pczt`) still being release candidates for NU6.3 —
+that pin is re-confirmed and bumped to the stable releases before the mainnet
+build cut (see the crate's `Cargo.toml` RC-pin comments), not a reason to
+withhold the binding itself.
+
 **Exception: transaction finalization (`finalize`, `finalize_transaction`).**
 Finalization is device-coupled for the same reason as `craft`: it consumes the
 device-produced Orchard `spendAuthSig`s and transparent input signatures, which
