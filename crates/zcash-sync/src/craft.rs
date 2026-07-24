@@ -166,13 +166,20 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         (None, None, None)
     };
 
-    // ── 3. Transparent change address (Public→Public) ─────────────────────────
-    // For the transparent-only flow we derive the internal change address from
-    // the UFVK's transparent component when available, otherwise accept None
-    // (exact-balance transactions need no change address). When the UFVK has no
-    // transparent receiver we can only proceed if the transaction produces no
-    // change; if it would, fail fast here with an actionable error rather than
-    // letting the deeper, generic builder error surface later.
+    // ── 3. Transparent change address (transparent-funded flows) ─────────────
+    // Change returns to the pool that funds it: with no Orchard spends the
+    // surplus comes from the transparent inputs, so change is transparent. This
+    // covers both Public→Public AND transparent→shielded (t→z) — for t→z only
+    // the sent amount is shielded, the change stays transparent instead of
+    // migrating the whole balance into the shielded pool. Flows that spend from
+    // Orchard (z→z, z→t) take change in Orchard (handled above).
+    //
+    // We derive the internal change address from the UFVK's transparent
+    // component when available, otherwise accept None (exact-balance
+    // transactions need no change address). When the UFVK has no transparent
+    // receiver we can only proceed if the transaction produces no change; if it
+    // would, fail fast here with an actionable error rather than letting the
+    // deeper, generic builder error surface later.
     // Derive the internal change address *and* the metadata the device needs to
     // recognize it as change: the change pubkey (33 bytes) and its non-hardened
     // address index. These flow into the change output's `bip32_derivation`.
@@ -180,7 +187,7 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         zcash_transparent::address::TransparentAddress,
         [u8; 33],
         u32,
-    )> = if !has_orchard_bundle {
+    )> = if !has_orchard_spends {
         let derived = ufvk.transparent().and_then(|tpk| {
             use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
             let ivk = tpk.derive_internal_ivk().ok()?;
