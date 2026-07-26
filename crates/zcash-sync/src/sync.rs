@@ -158,6 +158,13 @@ pub struct ShieldedTransaction {
     /// Transaction fee in zatoshis, computed via `TransactionData::fee_paid`.
     /// Zero for transactions with transparent inputs (prevout values unavailable from compact blocks).
     pub fee_zatoshis: i64,
+    /// Sum of the transparent outputs, in zatoshis. Zero without a transparent bundle.
+    /// Carries the value of a shielded→transparent send, which leaves no decrypted
+    /// output behind to account for it.
+    pub transparent_out_zatoshis: i64,
+    /// Whether the transaction spends transparent inputs, in which case those
+    /// inputs — rather than the shielded pools — may be paying the transparent outputs.
+    pub has_transparent_inputs: bool,
     /// Decrypted Sapling notes belonging to this account.
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
@@ -1158,6 +1165,8 @@ async fn fetch_and_decrypt_tx(
         block_hash: block_hash.to_string(),
         block_time,
         fee_zatoshis: decrypted.fee_zatoshis,
+        transparent_out_zatoshis: decrypted.transparent_out_zatoshis,
+        has_transparent_inputs: decrypted.has_transparent_inputs,
         sapling_notes,
         orchard_notes,
         ironwood_notes,
@@ -1466,6 +1475,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
             ironwood_notes: vec![],
@@ -1518,6 +1529,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
             ironwood_notes: vec![],
@@ -1571,6 +1584,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&our_nf_hex)],
             ironwood_notes: vec![],
@@ -1629,6 +1644,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier(&nf_hex)],
             ironwood_notes: vec![],
@@ -2059,6 +2076,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier("aa")],
             ironwood_notes: vec![],
@@ -2079,6 +2098,8 @@ mod tests {
             block_hash: String::new(),
             block_time: 0,
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![make_note_with_nullifier("aa")],
             ironwood_notes: vec![make_note_with_nullifier("bb")],

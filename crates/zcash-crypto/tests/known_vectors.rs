@@ -22,7 +22,9 @@ const TESTNET_UFVK: &str = "uviewtest1eacc7lytmvgp0sshwjjv4qsg9fnewq00s6zye8hqwn
 const TX1_HEX: &str = include_str!("fixtures/tx_d592576d_h3047167.hex");
 const TX1_HEIGHT: u32 = 3_047_167;
 
-/// TX2 — Orchard internal (change) note, no memo. Height 3,055,407.
+/// TX2 — shielded→transparent send: spends TX1's note, pays 1,110,000 zat to a
+/// transparent address, returns 122,504 zat as an Orchard internal (change)
+/// note, no memo. Height 3,055,407.
 /// txid: 22e5f6de0750db0d3e5e0f003339b4d435f7f7e5f3820f898e6ecda411ab0d6a
 const TX2_HEX: &str = include_str!("fixtures/tx_22e5f6de_h3055407.hex");
 const TX2_HEIGHT: u32 = 3_055_407;
@@ -294,7 +296,11 @@ fn wrong_ufvk_yields_empty_outputs_but_no_error() {
     }
 }
 
-// ── Sapling notes must not carry spending fields ─────────────────────────────
+// ── Sapling notes carry a payee but no spending fields ──────────────────
+//
+// Ledger never spends Sapling, so the fields needed to reconstruct a note stay
+// empty. The recipient is not one of them: it names who the note pays, which is
+// how a Sapling payment's destination is displayed.─────
 
 #[test]
 fn txs1_sapling_note_has_no_spending_fields() {
@@ -302,8 +308,8 @@ fn txs1_sapling_note_has_no_spending_fields() {
     let note = &tx.sapling_outputs[0];
     assert!(note.rseed.is_none(), "Sapling note must not have rseed");
     assert!(note.cmx.is_none(), "Sapling note must not have cmx");
-    assert!(note.recipient.is_none(), "Sapling note must not have recipient");
     assert!(note.action_index.is_none(), "Sapling note must not have action_index");
+    assert!(note.recipient.is_some(), "Sapling note must name the address it pays");
 }
 
 #[test]
@@ -312,8 +318,8 @@ fn txs2_outgoing_sapling_note_has_no_spending_fields() {
     let note = note_with_type(&tx.sapling_outputs, "outgoing");
     assert!(note.rseed.is_none(), "outgoing Sapling note must not have rseed");
     assert!(note.cmx.is_none(), "outgoing Sapling note must not have cmx");
-    assert!(note.recipient.is_none(), "outgoing Sapling note must not have recipient");
     assert!(note.action_index.is_none(), "outgoing Sapling note must not have action_index");
+    assert!(note.recipient.is_some(), "an outgoing note must name the payee it was sent to");
 }
 
 // ── Testnet Sapling: TX_S1 — pure incoming ───────────────────────────────────
@@ -424,4 +430,51 @@ fn txs4_memo_with_trailing_newline_decoded_correctly() {
     // decode_memo stops at the first 0x00 null byte, so the newline is preserved.
     let tx = decrypt_testnet(TX_S4_HEX, TX_S4_HEIGHT);
     assert_eq!(tx.sapling_outputs[0].memo, "sending some money from an emulator\n");
+}
+
+// ── Transparent bundle facts ─────────────────────────────────────────────────
+
+/// TX2 pays 1,110,000 zat to a transparent address. The transparent bundle is
+/// the only record of that value: no decrypted output carries it, since the
+/// sole note is the `internal` change. Without this figure the transaction is
+/// indistinguishable from a self-transfer.
+#[test]
+fn tx2_transparent_output_carries_the_deshielded_value() {
+    let tx = decrypt_mainnet(TX2_HEX, TX2_HEIGHT);
+    assert_eq!(tx.transparent_out_zatoshis, 1_110_000);
+}
+
+/// The note TX2 spends is accounted for entirely by the transparent output, the
+/// fee and the change — confirming `transparent_out_zatoshis` is the missing
+/// term of the balance, not an approximation of it.
+#[test]
+fn tx2_transparent_output_plus_fee_plus_change_equals_tx1_note() {
+    let spent = decrypt_mainnet(TX1_HEX, TX1_HEIGHT).orchard_outputs[0].amount as i64;
+    let tx = decrypt_mainnet(TX2_HEX, TX2_HEIGHT);
+    let change = note_with_type(&tx.orchard_outputs, "internal").amount as i64;
+    assert_eq!(tx.transparent_out_zatoshis + tx.fee_zatoshis + change, spent);
+}
+
+/// A deshielding send draws on the shielded pool, so it has no transparent
+/// inputs — which is what makes its transparent output attributable to that
+/// pool rather than to transparent funds merely passing through.
+#[test]
+fn tx2_has_no_transparent_inputs() {
+    assert!(!decrypt_mainnet(TX2_HEX, TX2_HEIGHT).has_transparent_inputs);
+}
+
+/// A fully-shielded transaction has no transparent bundle at all.
+#[test]
+fn tx1_reports_no_transparent_bundle() {
+    let tx = decrypt_mainnet(TX1_HEX, TX1_HEIGHT);
+    assert_eq!(tx.transparent_out_zatoshis, 0);
+    assert!(!tx.has_transparent_inputs);
+}
+
+/// TX_S3 shields transparent funds, so it reports transparent inputs. The
+/// distinction matters: once transparent inputs are present, a transparent
+/// output can no longer be attributed to the shielded pool.
+#[test]
+fn txs3_shielding_reports_transparent_inputs() {
+    assert!(decrypt_testnet(TX_S3_HEX, TX_S3_HEIGHT).has_transparent_inputs);
 }
