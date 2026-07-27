@@ -2,8 +2,9 @@
 
 ## Overview
 
-`zcash-crypto::keys` derives all Zcash viewing keys for a given account from
-a BIP-39 mnemonic. No spending key material is returned.
+`zcash-crypto::keys` derives all Zcash viewing keys — and the default
+receiving address — for a given account from a BIP-39 mnemonic. No spending
+key material is returned.
 
 ## Derivation pipeline
 
@@ -18,7 +19,8 @@ BIP-39 mnemonic (12 or 24 words)
         │         └─► to_unified_full_viewing_key()
         │                 ├─► ufvk_obj.encode(network) → UFVK (Bech32m)
         │                 ├─► ufvk_obj.sapling() → SaplingDFVK → fvk / ivk / ovk (hex)
-        │                 └─► ufvk_obj.orchard() → OrchardFVK → fvk / ivk / ovk (hex)
+        │                 ├─► ufvk_obj.orchard() → OrchardFVK → fvk / ivk / ovk (hex)
+        │                 └─► ufvk_obj.default_address(AllAvailableKeys) → unified address (Bech32m)
         │
         └─── BIP-32 path ──────────────────────────────────────────────────────►
               Xpriv::new_master(network, seed)
@@ -31,6 +33,7 @@ BIP-39 mnemonic (12 or 24 words)
 | Key | Format | Size | Reveals |
 |-----|--------|------|---------|
 | UFVK | Bech32m (`uview1` / `uviewtest1`) | ~300 chars | all transactions (in + out) |
+| Unified address | Bech32m (`u1` / `utest1`) | ~120 chars | nothing (public receiving address) |
 | xpub | Base58Check (`xpub` / `tpub`) | 111 chars | transparent addresses |
 | Sapling FVK | hex | 256 hex chars (128 bytes) | all Sapling txs |
 | Sapling IVK | hex | 64 hex chars (32 bytes) | incoming Sapling only |
@@ -38,6 +41,15 @@ BIP-39 mnemonic (12 or 24 words)
 | Orchard FVK | hex | 192 hex chars (96 bytes) | all Orchard txs |
 | Orchard IVK | hex | 128 hex chars (64 bytes) | incoming Orchard only |
 | Orchard OVK | hex | 64 hex chars (32 bytes) | outgoing Orchard only |
+
+## Default unified address
+
+The default address (ZIP-316, `UnifiedAddress::default_address`) is derived
+from `ufvk_obj` with `UnifiedAddressRequest::AllAvailableKeys` — it includes
+every receiver the UFVK can produce, Orchard always among them. It is
+independent of `DeriveOptions.include_sapling_in_ufvk`, which only controls
+what's bundled into the encoded UFVK *string*, not the in-memory viewing key
+object the address is derived from.
 
 ## UFVK composition (ZIP-316)
 
@@ -52,8 +64,9 @@ have migrated fully to Orchard).
 mnemonic : "abandon abandon ... about" (standard BIP-39 test vector)
 account  : 0
 network  : mainnet
-→ ufvk   : uview1...
-→ xpub   : xpub...
+→ ufvk    : uview1...
+→ address : u1...
+→ xpub    : xpub...
 → xpub_path : m/44'/133'/0'
 ```
 
