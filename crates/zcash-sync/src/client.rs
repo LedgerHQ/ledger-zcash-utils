@@ -1,12 +1,16 @@
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use std::time::Duration;
 use tonic::transport::Channel;
 use zcash_client_backend::proto::service::{
     compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange, ChainSpec,
     GetSubtreeRootsArg, RawTransaction, SendResponse, ShieldedProtocol, SubtreeRoot, TreeState,
+    TxFilter,
 };
+use zcash_crypto::fee::{transaction_fee, PrevoutValues};
+use zcash_crypto::payee::outgoing_payees;
 use zcash_primitives::transaction::{Transaction, TxVersion};
-use zcash_protocol::consensus::BranchId;
+use zcash_protocol::consensus::{BranchId, Network};
 
 /// Timeout for establishing the TCP+TLS connection.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -291,6 +295,126 @@ pub async fn broadcast_transaction(grpc_url: String, tx_bytes: Vec<u8>) -> Resul
     interpret_send_response(resp)?;
 
     Ok(txid)
+}
+
+/// A transaction whose fee is to be computed, with the value of each
+/// transparent output it spends.
+///
+/// The values do not come from the transaction itself — only its callers know
+/// them — so they must be supplied. Each is keyed by `(txid, output index)`,
+/// the txid in big-endian display order.
+pub struct DetailsRequest {
+    pub txid: String,
+    pub height: u32,
+    pub prevouts: PrevoutValues,
+}
+
+/// What a transaction's raw bytes reveal that a transparent-only view cannot.
+///
+/// `fee` is `None` when the fee could not be established — a prevout value was
+/// missing, the endpoint did not return the transaction, or it could not be
+/// parsed. An unknown fee is reported as such rather than approximated.
+///
+/// `payees` holds the addresses of the shielded outputs the account created,
+/// which no explorer can see. Empty when no viewing key was supplied, when the
+/// transaction is not ours, or when it pays no shielded address.
+pub struct DetailsResult {
+    pub txid: String,
+    pub fee: Option<u64>,
+    pub payees: Vec<String>,
+}
+
+/// Fetch transactions by txid and read from each what only the raw bytes hold:
+/// the fee it actually paid, and where its shielded outputs went.
+///
+/// Both answers need the whole transaction, so one fetch serves both. The fee
+/// spans every pool, and a transaction moving value into or out of a shielded
+/// pool cannot have its fee derived from the transparent bundle alone; the
+/// payees live inside encrypted outputs that only `ufvk` can open.
+///
+/// All requests share one channel, with [`DETAILS_PIPELINE_DEPTH`] fetches in
+/// flight at a time — an account's whole history may be resolved in one call,
+/// and issuing it serially would make that a per-transaction round trip. A
+/// failure on one transaction leaves its details unknown and does not abort the
+/// others.
+///
+/// Results come back in request order.
+///
+/// # Errors
+///
+/// Returns an error only if the channel cannot be established.
+pub async fn transaction_details(
+    grpc_url: String,
+    requests: Vec<DetailsRequest>,
+    network: Network,
+    ufvk: Option<String>,
+) -> Result<Vec<DetailsResult>> {
+    let channel = connect(&grpc_url).await?;
+    let client = CompactTxStreamerClient::new(channel);
+    let ufvk = ufvk.as_deref();
+
+    let mut results: Vec<(usize, DetailsResult)> = futures::stream::iter(
+        requests.into_iter().enumerate().map(|(position, request)| {
+            // Cloning a tonic client clones the channel handle, not the
+            // connection: all clones multiplex over the same HTTP/2 stream.
+            let mut client = client.clone();
+            async move {
+                let (fee, payees) = fetch_and_read(&mut client, &request, network, ufvk)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("WARN: details unavailable for {}: {}", request.txid, e);
+                        (None, Vec::new())
+                    });
+                (position, DetailsResult { txid: request.txid, fee, payees })
+            }
+        }),
+    )
+    .buffer_unordered(DETAILS_PIPELINE_DEPTH)
+    .collect::<Vec<_>>()
+    .await;
+
+    results.sort_by_key(|(position, _)| *position);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+/// Concurrent `GetTransaction` fetches while resolving transactions. Matches
+/// the depth the block scanner uses for the same endpoint.
+const DETAILS_PIPELINE_DEPTH: usize = 8;
+
+async fn fetch_and_read(
+    client: &mut CompactTxStreamerClient<Channel>,
+    request: &DetailsRequest,
+    network: Network,
+    ufvk: Option<&str>,
+) -> Result<(Option<u64>, Vec<String>)> {
+    // TxFilter.hash expects internal (little-endian) byte order.
+    let mut txid_bytes = hex::decode(&request.txid)
+        .map_err(|e| anyhow!("invalid txid {}: {}", request.txid, e))?;
+    txid_bytes.reverse();
+
+    let mut req = tonic::Request::new(TxFilter {
+        block: None,
+        index: 0,
+        hash: txid_bytes,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+    let raw_tx = client
+        .get_transaction(req)
+        .await
+        .map_err(|e| anyhow!("GetTransaction failed: {}", e))?
+        .into_inner();
+
+    let tx_hex = hex::encode(&raw_tx.data);
+    let fee = transaction_fee(&tx_hex, request.height, network, &request.prevouts)?;
+
+    // A transaction we cannot decrypt is not an error: most of an account's
+    // history is transparent, and none of it names a shielded payee.
+    let payees = match ufvk {
+        Some(ufvk) => outgoing_payees(&tx_hex, ufvk, request.height, network).unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    Ok((fee, payees))
 }
 
 /// Map a `SendResponse` to success/failure. `error_code == 0` ⇒ accepted;

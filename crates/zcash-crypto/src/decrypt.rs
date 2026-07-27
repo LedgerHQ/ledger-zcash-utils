@@ -136,9 +136,11 @@ pub struct DecryptedOutput {
     /// `Some` for Orchard incoming/internal; `None` otherwise.
     pub cmx: Option<[u8; 32]>,
 
-    /// Recipient address bytes (43 bytes: 11-byte diversifier `d` + 32-byte `pk_d`).
-    /// Required to reconstruct the note for spending.
-    /// `Some` for Orchard incoming/internal; `None` otherwise.
+    /// Address the note pays, as raw bytes (43: 11-byte diversifier `d` +
+    /// 32-byte `pk_d`). Our own address for an incoming or internal note, where
+    /// it also serves to reconstruct the note for spending; the payee's address
+    /// for an outgoing one, recovered through our outgoing viewing key.
+    /// `Some` for every Orchard-family note; `None` for Sapling.
     pub recipient: Option<[u8; 43]>,
 
     /// 0-based action index within the Orchard bundle of the containing transaction.
@@ -159,6 +161,20 @@ pub struct DecryptedTx {
     /// Transaction fee in zatoshis (= valueBalanceSapling + valueBalanceOrchard + valueBalanceIronwood).
     /// Always ≥ 0 for valid fully-shielded transactions.
     pub fee_zatoshis: i64,
+    /// Sum of the transparent outputs, in zatoshis. Zero when the transaction
+    /// has no transparent bundle.
+    ///
+    /// A shielded→transparent send produces no decrypted output the wallet can
+    /// attribute to a counterparty — the value leaves through this bundle and
+    /// only the change note comes back, marked `internal`. Callers need this
+    /// figure to tell such a send apart from a self-transfer.
+    pub transparent_out_zatoshis: i64,
+    /// Whether the transaction spends transparent inputs.
+    ///
+    /// When it does, `transparent_out_zatoshis` may be paid by those inputs
+    /// rather than out of the shielded pools, and the two cannot be told apart
+    /// from the bundle alone.
+    pub has_transparent_inputs: bool,
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -475,7 +491,10 @@ pub fn full_decrypt_tx_with_ufvk(
             rho: None,
             rseed: None,
             cmx: None,
-            recipient: None,
+            // Not a spending field here — Ledger never spends Sapling — but it
+            // names the payee of a note we sent, which a restored history needs
+            // to show where a Sapling payment went.
+            recipient: Some(f.note().recipient().to_bytes()),
             action_index: None,
         })
         .collect();
@@ -496,6 +515,11 @@ pub fn full_decrypt_tx_with_ufvk(
         .map(|f| map_orchard_family_output(f, ufvk))
         .collect();
 
+    let (transparent_out_zatoshis, has_transparent_inputs) = tx
+        .transparent_bundle()
+        .map(|b| (b.vout.iter().map(|o| o.value().into_u64() as i64).sum(), !b.vin.is_empty()))
+        .unwrap_or((0, false));
+
     // Use TransactionData::fee_paid for an accurate protocol-level fee calculation.
     // For fully-shielded transactions this gives the exact fee. For transactions
     // with transparent inputs we don't have prevout values from compact blocks,
@@ -508,7 +532,14 @@ pub fn full_decrypt_tx_with_ufvk(
         .map(|z| z.into_u64() as i64)
         .unwrap_or(0);
 
-    Ok(DecryptedTx { sapling_outputs, orchard_outputs, ironwood_outputs, fee_zatoshis })
+    Ok(DecryptedTx {
+        sapling_outputs,
+        orchard_outputs,
+        ironwood_outputs,
+        fee_zatoshis,
+        transparent_out_zatoshis,
+        has_transparent_inputs,
+    })
 }
 
 /// Maps one upstream Orchard-family decrypted output (Orchard OR Ironwood — both
@@ -543,10 +574,17 @@ fn map_orchard_family_output(
         ufvk.orchard().map(|fvk| note.nullifier(fvk).to_bytes())
     };
 
+    // A note's recipient is whoever it pays, which is worth knowing in both
+    // directions: our own address for a note paying us, and the payee's address
+    // for one we sent. The latter is only recoverable because the transaction
+    // was built with our outgoing viewing key, and it is the only on-chain trace
+    // of where a shielded payment went.
+    let recipient = Some(note.recipient().to_raw_address_bytes());
+
     // Extract spending fields for incoming/internal notes.
     // All fields are populated together: all or none.
-    let (rho, rseed, cmx, recipient, action_index) = if is_outgoing {
-        (None, None, None, None, None)
+    let (rho, rseed, cmx, action_index) = if is_outgoing {
+        (None, None, None, None)
     } else {
         let rho_bytes: [u8; 32] = note.rho().to_bytes();
         let rseed_bytes: [u8; 32] = *note.rseed().as_bytes();
@@ -556,14 +594,11 @@ fn map_orchard_family_output(
             OrchardExtractedNoteCommitment::from(nc).to_bytes()
         };
 
-        // to_raw_address_bytes() returns [u8; 43]: 11-byte diversifier + 32-byte pk_d.
-        let recipient_bytes: [u8; 43] = note.recipient().to_raw_address_bytes();
-
         // index() returns the 0-based action index within the containing bundle.
         // Cast to u32 is safe: action counts per transaction are always < 2^32.
         let idx: u32 = f.index() as u32;
 
-        (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(recipient_bytes), Some(idx))
+        (Some(rho_bytes), Some(rseed_bytes), Some(cmx_bytes), Some(idx))
     };
 
     DecryptedOutput {
@@ -1123,54 +1158,9 @@ mod tests {
 
     // ── DecryptedOutput new fields — unit tests ───────────────────────────────
 
-    /// A `DecryptedOutput` with `transfer_type = "outgoing"` must have all
-    /// spending fields set to `None`.  This mirrors what `full_decrypt_tx` does
-    /// for outgoing Orchard notes.
-    #[test]
-    fn test_decrypt_output_new_fields_are_none_for_outgoing() {
-        let output = DecryptedOutput {
-            amount: 1_000,
-            memo: String::new(),
-            transfer_type: "outgoing".to_string(),
-            nullifier: None,
-            rho: None,
-            rseed: None,
-            cmx: None,
-            recipient: None,
-            action_index: None,
-            pool: ShieldedPool::Orchard,
-        };
-        assert_eq!(output.transfer_type, "outgoing");
-        assert!(output.rseed.is_none(), "outgoing: rseed must be None");
-        assert!(output.cmx.is_none(), "outgoing: cmx must be None");
-        assert!(output.recipient.is_none(), "outgoing: recipient must be None");
-        assert!(output.action_index.is_none(), "outgoing: action_index must be None");
-    }
-
-    /// Sapling outputs are always constructed with all spending fields set to
-    /// `None` (Sapling uses a different spending mechanism; we never populate
-    /// these for Sapling).
-    #[test]
-    fn test_decrypt_output_sapling_has_no_spending_fields() {
-        // Simulate the Sapling mapping path by constructing DecryptedOutput
-        // exactly as the sapling_outputs iterator does.
-        let output = DecryptedOutput {
-            amount: 5_000_000,
-            memo: "sapling memo".to_string(),
-            transfer_type: "incoming".to_string(),
-            nullifier: None,
-            rho: None,
-            rseed: None,
-            cmx: None,
-            recipient: None,
-            action_index: None,
-            pool: ShieldedPool::Sapling,
-        };
-        assert!(output.rseed.is_none(), "Sapling: rseed must be None");
-        assert!(output.cmx.is_none(), "Sapling: cmx must be None");
-        assert!(output.recipient.is_none(), "Sapling: recipient must be None");
-        assert!(output.action_index.is_none(), "Sapling: action_index must be None");
-    }
+    // Which fields each kind of note carries is asserted against real
+    // transactions in tests/known_vectors.rs and tests/outgoing_payee.rs;
+    // asserting it on a hand-built struct here would only restate the literal.
 
     /// Verify that incoming/internal `DecryptedOutput` values can carry spending
     /// fields with the correct byte lengths.  This test checks the structural
@@ -1448,6 +1438,8 @@ mod tests {
             orchard_outputs: vec![],
             ironwood_outputs: vec![ironwood_note],
             fee_zatoshis: 0,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
         };
         assert!(tx.orchard_outputs.is_empty());
         assert_eq!(tx.ironwood_outputs.len(), 1);
