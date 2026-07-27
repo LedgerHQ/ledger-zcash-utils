@@ -18,6 +18,8 @@
 pub mod craft;
 pub mod decrypt;
 pub mod error;
+pub mod fee;
+pub mod payee;
 pub mod finalize;
 pub mod keys;
 pub mod network;

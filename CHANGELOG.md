@@ -1,5 +1,14 @@
 # @ledgerhq/zcash-utils
 
+## 1.0.4
+
+### Minor Changes
+
+- Report the fee a transaction actually paid and the addresses its shielded outputs paid, through the new `transactionDetails` function
+- Report the transparent bundle of a scanned transaction, via `transparentOut` and `hasTransparentInputs` on `ShieldedTransaction`
+
+# @ledgerhq/zcash-utils
+
 ## 1.0.3
 
 ### Patch Changes

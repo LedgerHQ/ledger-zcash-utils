@@ -92,6 +92,15 @@ pub struct ShieldedTransaction {
     pub block_time: u32,
     /// Transaction fee in zatoshis (shielded bundles only).
     pub fee: f64,
+    /// Sum of the transparent outputs, in zatoshis. Zero without a transparent bundle.
+    ///
+    /// A shielded→transparent send leaves no decrypted output to account for the
+    /// value it moved — only an `internal` change note, or none at all. This is
+    /// what tells such a send apart from a self-transfer.
+    pub transparent_out: f64,
+    /// Whether the transaction spends transparent inputs, in which case those
+    /// inputs — rather than the shielded pools — may be paying `transparentOut`.
+    pub has_transparent_inputs: bool,
     /// Decrypted Sapling notes belonging to this account.
     pub sapling_notes: Vec<ShieldedNote>,
     /// Decrypted Orchard notes belonging to this account.
@@ -729,6 +738,101 @@ pub async fn broadcast_transaction(grpc_url: String, tx_hex: String) -> napi::Re
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
+// ─── Transaction fees ─────────────────────────────────────────────────────────
+
+/// A transparent output being spent, and its value.
+#[napi(object)]
+pub struct TransparentPrevout {
+    /// 64-char hex txid of the transaction that created the output, in
+    /// big-endian display order.
+    pub txid: String,
+    pub index: u32,
+    /// Value in zatoshis, as a decimal string (avoids f64 precision loss).
+    pub value: String,
+}
+
+/// A transaction to be resolved.
+#[napi(object)]
+pub struct TransactionDetailsRequest {
+    /// 64-char hex txid, big-endian display order.
+    pub txid: String,
+    /// Height of the block containing the transaction — determines the
+    /// consensus branch the transaction is parsed against.
+    pub height: u32,
+    /// Value of every transparent output the transaction spends. Omitting any
+    /// of them makes the fee unknown; a fully-shielded transaction needs none.
+    pub prevouts: Vec<TransparentPrevout>,
+}
+
+/// What a transaction's raw bytes reveal that an explorer cannot see.
+#[napi(object)]
+pub struct TransactionDetailsResult {
+    pub txid: String,
+    /// Fee in zatoshis as a decimal string, or `null` when it could not be
+    /// established (missing prevout value, or the transaction could not be
+    /// fetched or parsed).
+    pub fee: Option<String>,
+    /// Addresses of the shielded outputs the account created, in bundle order.
+    /// Empty without a viewing key, or when the transaction pays no shielded
+    /// address of someone else's.
+    pub payees: Vec<String>,
+}
+
+/// Read from each transaction what only its raw bytes hold: the fee it paid,
+/// and where its shielded outputs went. Transactions are fetched by txid.
+///
+/// A transaction's fee spans every pool: value entering the shielded pools is
+/// not a fee, and value leaving them is not an output the transparent bundle
+/// can account for. Deriving the fee from transparent inputs and outputs alone
+/// is therefore wrong for any transaction that crosses that boundary.
+///
+/// The payees of shielded outputs are encrypted, and recoverable only by the
+/// account that created them — pass `ufvk` to recover them, omit it to skip.
+///
+/// Both answers come from the same fetched transaction. One that cannot be
+/// fetched, parsed, or fully priced yields a `null` fee and no payees, rather
+/// than an approximation.
+#[napi]
+pub async fn transaction_details(
+    grpc_url: String,
+    requests: Vec<TransactionDetailsRequest>,
+    network: Option<String>,
+    ufvk: Option<String>,
+) -> napi::Result<Vec<TransactionDetailsResult>> {
+    let network = zcash_crypto::network::parse_network(network.as_deref())
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let requests = requests
+        .into_iter()
+        .map(|r| {
+            let prevouts = r
+                .prevouts
+                .into_iter()
+                .map(|p| {
+                    let value = p.value.parse::<u64>().map_err(|e| {
+                        napi::Error::from_reason(format!("prevout value {}: {e}", p.value))
+                    })?;
+                    Ok(((p.txid, p.index), value))
+                })
+                .collect::<napi::Result<_>>()?;
+            Ok(zcash_sync::client::DetailsRequest { txid: r.txid, height: r.height, prevouts })
+        })
+        .collect::<napi::Result<Vec<_>>>()?;
+
+    let results = zcash_sync::client::transaction_details(grpc_url, requests, network, ufvk)
+        .await
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    Ok(results
+        .into_iter()
+        .map(|r| TransactionDetailsResult {
+            txid: r.txid,
+            fee: r.fee.map(|f| f.to_string()),
+            payees: r.payees,
+        })
+        .collect())
+}
+
 // ─── Parse PCZT (canonical bytes → structured device-signer input) ────────────
 
 /// PCZT header (`common::Global`) fields.
@@ -956,6 +1060,8 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
         block_hash: tx.block_hash,
         block_time: tx.block_time,
         fee: tx.fee_zatoshis as f64,
+        transparent_out: tx.transparent_out_zatoshis as f64,
+        has_transparent_inputs: tx.has_transparent_inputs,
         // Sapling notes: spending fields are always None (Orchard-only).
         // We hardcode None here rather than forwarding from the Rust struct
         // to make the Orchard-only intent explicit.
@@ -1036,6 +1142,8 @@ mod tests {
             block_hash: "cafecafe".to_string(),
             block_time: 1_700_000_000,
             fee_zatoshis: 10_000,
+            transparent_out_zatoshis: 0,
+            has_transparent_inputs: false,
             sapling_notes: vec![],
             orchard_notes: vec![],
             ironwood_notes: vec![],

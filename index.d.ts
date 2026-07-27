@@ -94,6 +94,19 @@ export interface ShieldedTransaction {
   blockTime: number
   /** Transaction fee in zatoshis (shielded bundles only). */
   fee: number
+  /**
+   * Sum of the transparent outputs, in zatoshis. Zero without a transparent bundle.
+   *
+   * A shielded→transparent send leaves no decrypted output to account for the
+   * value it moved — only an `internal` change note, or none at all. This is
+   * what tells such a send apart from a self-transfer.
+   */
+  transparentOut: number
+  /**
+   * Whether the transaction spends transparent inputs, in which case those
+   * inputs — rather than the shielded pools — may be paying `transparentOut`.
+   */
+  hasTransparentInputs: boolean
   /** Decrypted Sapling notes belonging to this account. */
   saplingNotes: Array<ShieldedNote>
   /** Decrypted Orchard notes belonging to this account. */
@@ -379,6 +392,65 @@ export declare function finalizeTransaction(params: FinalizeTransactionParams): 
  * `errorMessage`) or on a gRPC transport failure.
  */
 export declare function broadcastTransaction(grpcUrl: string, txHex: string): Promise<string>
+/** A transparent output being spent, and its value. */
+export interface TransparentPrevout {
+  /**
+   * 64-char hex txid of the transaction that created the output, in
+   * big-endian display order.
+   */
+  txid: string
+  index: number
+  /** Value in zatoshis, as a decimal string (avoids f64 precision loss). */
+  value: string
+}
+/** A transaction to be resolved. */
+export interface TransactionDetailsRequest {
+  /** 64-char hex txid, big-endian display order. */
+  txid: string
+  /**
+   * Height of the block containing the transaction — determines the
+   * consensus branch the transaction is parsed against.
+   */
+  height: number
+  /**
+   * Value of every transparent output the transaction spends. Omitting any
+   * of them makes the fee unknown; a fully-shielded transaction needs none.
+   */
+  prevouts: Array<TransparentPrevout>
+}
+/** What a transaction's raw bytes reveal that an explorer cannot see. */
+export interface TransactionDetailsResult {
+  txid: string
+  /**
+   * Fee in zatoshis as a decimal string, or `null` when it could not be
+   * established (missing prevout value, or the transaction could not be
+   * fetched or parsed).
+   */
+  fee?: string
+  /**
+   * Addresses of the shielded outputs the account created, in bundle order.
+   * Empty without a viewing key, or when the transaction pays no shielded
+   * address of someone else's.
+   */
+  payees: Array<string>
+}
+/**
+ * Read from each transaction what only its raw bytes hold: the fee it paid,
+ * and where its shielded outputs went. Transactions are fetched by txid.
+ *
+ * A transaction's fee spans every pool: value entering the shielded pools is
+ * not a fee, and value leaving them is not an output the transparent bundle
+ * can account for. Deriving the fee from transparent inputs and outputs alone
+ * is therefore wrong for any transaction that crosses that boundary.
+ *
+ * The payees of shielded outputs are encrypted, and recoverable only by the
+ * account that created them — pass `ufvk` to recover them, omit it to skip.
+ *
+ * Both answers come from the same fetched transaction. One that cannot be
+ * fetched, parsed, or fully priced yields a `null` fee and no payees, rather
+ * than an approximation.
+ */
+export declare function transactionDetails(grpcUrl: string, requests: Array<TransactionDetailsRequest>, network?: string | undefined | null, ufvk?: string | undefined | null): Promise<Array<TransactionDetailsResult>>
 /** PCZT header (`common::Global`) fields. */
 export interface PcztGlobal {
   /** Transaction version (V5 = 5). */
