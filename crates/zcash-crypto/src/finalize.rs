@@ -37,7 +37,9 @@ use pczt::{
     },
     Pczt,
 };
+use zcash_protocol::consensus::BranchId;
 
+use crate::circuit::orchard_circuit_version_for;
 use crate::error::Error;
 
 /// Inputs to [`finalize_transaction`].
@@ -70,6 +72,32 @@ fn verifying_key() -> &'static VerifyingKey {
     VK.get_or_init(|| VerifyingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
 }
 
+/// Same cache for the NU6.3 circuit generation.
+fn post_nu6_3_verifying_key() -> &'static VerifyingKey {
+    static VK: OnceLock<VerifyingKey> = OnceLock::new();
+    VK.get_or_init(|| VerifyingKey::build(OrchardCircuitVersion::PostNu6_3))
+}
+
+/// The verifying key matching the circuit generation of the PCZT's consensus
+/// branch — the mirror of `craft::orchard_proving_key_for`, sharing its derivation
+/// via [`orchard_circuit_version_for`]. A bundle proven under `orchard_v3` (NU6.3
+/// onward) only verifies with the `PostNu6_3` key, so the branch recorded in the
+/// PCZT decides which key extraction must use.
+///
+/// An unrecognised branch id falls back to the pre-NU6.3 key; extraction then
+/// fails on the proof rather than here, which is the same outcome as passing a
+/// mismatched key and keeps this selection infallible.
+fn verifying_key_for(consensus_branch_id: u32) -> &'static VerifyingKey {
+    let circuit_version = BranchId::try_from(consensus_branch_id)
+        .ok()
+        .map(orchard_circuit_version_for);
+
+    match circuit_version {
+        Some(OrchardCircuitVersion::PostNu6_3) => post_nu6_3_verifying_key(),
+        _ => verifying_key(),
+    }
+}
+
 /// Inject device signatures into a proven PCZT and extract the final V5 transaction.
 ///
 /// # Errors
@@ -80,6 +108,10 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     // 1. Parse PCZT.
     let pczt = Pczt::parse(&inputs.pczt_bytes)
         .map_err(|e| Error::Finalize(format!("PCZT parse failed: {e:?}")))?;
+
+    // Read before the PCZT moves through the roles below: the branch decides which
+    // Orchard circuit generation the proof was made for.
+    let consensus_branch_id = *pczt.global().consensus_branch_id();
 
     // 2. Real (unsigned) Orchard action indices, in order.
     //    The IoFinalizer self-signs dummy actions at build time via each action's
@@ -167,7 +199,7 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     //    verifies the Halo 2 proof. The VerifyingKey OnceLock means only the
     //    first call pays the multi-second build cost.
     let tx = TransactionExtractor::new(pczt)
-        .with_orchard(verifying_key())
+        .with_orchard(verifying_key_for(consensus_branch_id))
         .extract()
         .map_err(|e| Error::Finalize(format!("TransactionExtractor: {e:?}")))?;
 
@@ -930,6 +962,36 @@ mod tests {
             second_elapsed.as_secs() < 1,
             "second finalize took {second_elapsed:?}; expected < 1 s with cached VK"
         );
+    }
+
+    /// Extraction must verify a bundle against the key generation it was proven
+    /// with, and the branch recorded in the PCZT is the only thing that says which.
+    /// Compared by pointer because each generation has its own cache and the key
+    /// itself exposes no generation.
+    ///
+    /// Slow (~80 s): it is the only test that builds the NU6.3 verifying key, so it
+    /// also covers `VerifyingKey::build(PostNu6_3)` against the pinned orchard
+    /// version. Kept un-ignored — an ignored test would guard neither in CI.
+    #[test]
+    fn verifying_key_follows_the_pczt_consensus_branch() {
+        assert!(
+            std::ptr::eq(
+                verifying_key_for(BranchId::Nu6_3.into()),
+                post_nu6_3_verifying_key()
+            ),
+            "NU6.3 bundles are orchard_v3 and need the PostNu6_3 key"
+        );
+
+        for branch in [BranchId::Nu5, BranchId::Nu6_2] {
+            assert!(
+                std::ptr::eq(verifying_key_for(branch.into()), verifying_key()),
+                "{branch:?} predates orchard_v3"
+            );
+        }
+
+        // Not a branch id at all: selection stays infallible and defers the failure
+        // to proof verification.
+        assert!(std::ptr::eq(verifying_key_for(0xdead_beef), verifying_key()));
     }
 
     // ── parse_transparent_der tests ───────────────────────────────────────────

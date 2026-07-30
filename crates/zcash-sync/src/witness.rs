@@ -11,8 +11,8 @@ use zcash_client_backend::proto::{
     service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange},
 };
 use zcash_crypto::tree::{
-    build_witnesses, frontier_leaf_count, ShardLeaves, WitnessInputs, WitnessOutput,
-    ORCHARD_SHARD_HEIGHT,
+    build_witnesses, frontier_anchor, frontier_leaf_count, ShardLeaves, WitnessInputs,
+    WitnessOutput, ORCHARD_SHARD_HEIGHT,
 };
 
 use crate::client::{
@@ -122,9 +122,9 @@ pub struct WitnessRequest {
 ///
 /// Used for transparent-source flows (Public→Private) whose Orchard bundle has
 /// outputs but no real spends — an anchor is still required for the dummy spends
-/// the builder injects. Reuses the tree-state + frontier path from
-/// `compute_witnesses`, then calls `zcash_crypto::tree::build_witnesses` with an
-/// empty notes list, which returns `WitnessOutput { anchor, witnesses: [] }`.
+/// the builder injects. Only `GetTreeState` is needed: the anchor is the root of
+/// that frontier (see `zcash_crypto::tree::frontier_anchor`), and with no note to
+/// witness there is no path to resolve and so no shard data to fetch.
 ///
 /// # Errors
 ///
@@ -139,7 +139,7 @@ pub async fn fetch_orchard_anchor(
 
 /// Ironwood (NU6.3) sibling of [`fetch_orchard_anchor`]: fetches the Ironwood
 /// anchor (frontier root) at `anchor_height` without computing any per-note
-/// witnesses, reusing the exact same ShardTree assembly.
+/// witnesses, reading the same `TreeState` message's `ironwood_tree` field.
 ///
 /// # Errors
 ///
@@ -176,29 +176,17 @@ async fn fetch_anchor_for_pool(
     let frontier_bytes = hex::decode(pool.tree_state_hex(&tree_state))
         .map_err(|e| anyhow!("TreeState frontier hex decode failed: {}", e))?;
 
-    let subtree_roots = get_subtree_roots(&mut client, pool, 0).await?;
-    let cap_roots: Vec<(u32, [u8; 32])> = subtree_roots
-        .iter()
-        .enumerate()
-        .map(|(i, sr)| {
-            let bytes: [u8; 32] = sr
-                .root_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow!("GetSubtreeRoots returned a root that is not 32 bytes"))?;
-            Ok((i as u32, bytes))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // The frontier alone determines the root, so no shard data is fetched here.
+    // That also keeps this path working against a server that does not serve the
+    // pool's `GetSubtreeRoots` yet, which is the case for Ironwood on Zaino.
+    let anchor = frontier_anchor(&frontier_bytes)
+        .map_err(|e| anyhow!("frontier_anchor (anchor-only): {}", e))?;
 
-    // Build with empty notes: returns WitnessOutput { anchor, witnesses: [] }.
-    let inputs = WitnessInputs {
-        cap_roots,
-        frontier_bytes,
+    Ok(WitnessOutput {
+        anchor,
         anchor_height: resolved_height,
-        shard_leaves: vec![],
-        notes: vec![],
-    };
-    build_witnesses(&inputs).map_err(|e| anyhow!("build_witnesses (anchor-only): {}", e))
+        witnesses: vec![],
+    })
 }
 
 /// Compute Merkle witnesses for every requested note against a single anchor.

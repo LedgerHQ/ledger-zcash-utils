@@ -213,6 +213,23 @@ pub fn frontier_leaf_count(bytes: &[u8]) -> Result<u64, Error> {
     Ok(frontier.value().map_or(0, |nf| u64::from(nf.position()) + 1))
 }
 
+/// Anchor (commitment-tree root) of an encoded `TreeState` frontier.
+///
+/// A frontier carries the rightmost leaf plus the root of every subtree to its
+/// left, which is exactly what the root computation consumes — so the anchor
+/// needs no shard data. `known_good_test_vector` pins this against real testnet
+/// data: the frontier root equals the anchor that [`build_witnesses`] assembles
+/// from cap roots for the same height.
+///
+/// Callers that only need an anchor (a shielded bundle with outputs but no real
+/// spends) should use this rather than an empty-notes [`build_witnesses`] call,
+/// which would additionally require every completed shard root.
+///
+/// Returns the empty-tree root for the genesis (empty) frontier.
+pub fn frontier_anchor(bytes: &[u8]) -> Result<[u8; 32], Error> {
+    Ok(decode_orchard_frontier(bytes)?.root().to_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -819,11 +836,9 @@ mod tests {
         // 2. Independent cross-check: the canonical commitment-tree root (decoded
         //    from the GetTreeState frontier via a separate code path) equals the
         //    ShardTree-assembled anchor. This is what makes the vector "known-good"
-        //    rather than self-referential.
-        let frontier_root = super::decode_orchard_frontier(&frontier_bytes)
-            .unwrap()
-            .root()
-            .to_bytes();
+        //    rather than self-referential — and it is what licenses the anchor-only
+        //    flows to call `frontier_anchor` instead of fetching every shard root.
+        let frontier_root = super::frontier_anchor(&frontier_bytes).unwrap();
         assert_eq!(frontier_root, anchor, "canonical frontier root disagrees with assembled anchor");
 
         // 3. Exactly one witness, at the requested position.

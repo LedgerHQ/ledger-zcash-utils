@@ -15,6 +15,7 @@
 //! - [`finalize`]: Inject device signatures into a PCZT and extract the final signed V5 transaction
 //! - [`parse`]: Parse canonical PCZT bytes into a structured, device-signer-ready form
 
+mod circuit;
 pub mod craft;
 pub mod decrypt;
 pub mod error;

@@ -109,9 +109,10 @@ use rand::rngs::OsRng;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder},
     fees::zip317::{FeeError as Zip317FeeError, FeeRule},
+    TxVersion,
 };
 use zcash_protocol::{
-    consensus::{BlockHeight, Network, NetworkConstants, NetworkUpgrade, Parameters},
+    consensus::{BlockHeight, BranchId, Network, NetworkConstants, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::Zatoshis,
 };
@@ -120,6 +121,7 @@ use zcash_transparent::{
 };
 use zip32::ChildIndex;
 
+use crate::circuit::orchard_circuit_version_for;
 use crate::error::Error;
 
 /// Default expiry delta in blocks. Matches `DEFAULT_TX_EXPIRY_DELTA` in
@@ -285,6 +287,19 @@ pub(crate) fn proving_key() -> &'static ProvingKey {
     PROVING_KEY.get_or_init(|| ProvingKey::build(OrchardCircuitVersion::FixedPostNu6_2))
 }
 
+/// The Orchard proving key matching the circuit generation in force where this
+/// transaction will be mined (see [`orchard_circuit_version_for`]).
+///
+/// Proving a `orchard_v3` bundle with the NU6.2 key fails as `InvalidInstances`.
+/// The NU6.3 generation is the same key the Ironwood path uses, which is why a V6
+/// transaction can prove both of its bundles with it.
+fn orchard_proving_key_for(network: &Network, target: BlockHeight) -> &'static ProvingKey {
+    match orchard_circuit_version_for(BranchId::for_height(network, target)) {
+        OrchardCircuitVersion::PostNu6_3 => ironwood_proving_key(),
+        _ => proving_key(),
+    }
+}
+
 /// Build, prove, and serialize a PCZT for an Orchard or transparent send.
 ///
 /// # Errors
@@ -319,8 +334,8 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
 
     let target = BlockHeight::from(target_height);
     if !network.is_nu_active(NetworkUpgrade::Nu5, target) {
-        // This builder always emits a v5 transaction (`BuildConfig::Standard`),
-        // and the v5 format is gated on NU5 regardless of which pools are used —
+        // This builder always emits a v5 transaction (it pins `TxVersion::V5`
+        // below), and the v5 format is gated on NU5 regardless of which pools are used —
         // so this also applies to transparent-only (Public→Public) transactions
         // that contain no Orchard bundle.
         return Err(Error::Craft(format!(
@@ -370,6 +385,16 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
 
     // ── 1. Builder + Orchard spends + transparent inputs + non-change outputs ──
     let mut builder = Builder::new(network, target, build_config);
+
+    // `Builder::new` derives the transaction version from the consensus branch at
+    // `target`, which is V6 from NU6.3 onward. This path builds no Ironwood bundle
+    // and serializes as PCZT v1, which cannot encode a V6 — so pin V5 explicitly
+    // instead of inheriting the branch default. V5 remains valid in the NU6.3
+    // branch, so transparent-only and Orchard flows keep building after the
+    // upgrade; Ironwood sends go through `build_ironwood_transaction`.
+    builder
+        .propose_version::<Zip317FeeError>(TxVersion::V5)
+        .map_err(|e| Error::Craft(format!("propose_version(V5): {e:?}")))?;
 
     let mut total_in: u64 = 0;
     if !spends.is_empty() {
@@ -445,12 +470,16 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
                     "change_address required for Orchard change but none supplied".into(),
                 )
             })?;
-            let change_req = OutputRequest {
-                destination: Destination::Orchard(change_addr),
-                value: change,
-                memo: None,
-            };
-            add_output(&mut builder, ovk.as_ref(), &change_req)?;
+            let change_fvk = orchard_fvk.as_ref().ok_or_else(|| {
+                Error::Craft("orchard_fvk is required to add Orchard change".into())
+            })?;
+            add_orchard_change(
+                &mut builder,
+                change_fvk,
+                ovk.as_ref(),
+                change_addr,
+                change,
+            )?;
             n_orchard_outputs += 1;
         } else {
             let addr = transparent_change_address.ok_or_else(|| {
@@ -546,7 +575,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     let prover = Prover::new(pczt);
     let pczt = if prover.requires_orchard_proof() {
         prover
-            .create_orchard_proof(proving_key())
+            .create_orchard_proof(orchard_proving_key_for(&network, target))
             .map_err(|e| Error::Craft(format!("PCZT Prover (orchard): {e:?}")))?
             .finish()
     } else {
@@ -873,6 +902,37 @@ fn add_output(
                 .map_err(|e| Error::Craft(format!("add_transparent_output: {e:?}")))?;
         }
     }
+    Ok(())
+}
+
+/// Adds the Orchard change output through the builder's change API rather than
+/// `add_output`.
+///
+/// From NU6.3 the Orchard bundle disables cross-address transfers: ordinary outputs
+/// are refused (`CrossAddressDisabled`) and retained value must arrive as
+/// wallet-controlled change, which the builder pairs with a fabricated zero-valued
+/// spend at the change address. Withdrawals out of the pool (z→t) leave through the
+/// bundle's value balance and are unaffected. In the permissive epochs this call
+/// behaves like `add_output` plus an ownership check on `fvk`, so no epoch branch is
+/// needed here.
+fn add_orchard_change(
+    builder: &mut Builder<Network, ()>,
+    fvk: &OrchardFvk,
+    ovk: Option<&OutgoingViewingKey>,
+    recipient: OrchardAddress,
+    value_zat: u64,
+) -> Result<(), Error> {
+    let value = Zatoshis::from_u64(value_zat)
+        .map_err(|e| Error::Craft(format!("change value out of range: {e}")))?;
+    builder
+        .add_orchard_change_output::<Zip317FeeError>(
+            fvk.clone(),
+            ovk.cloned(),
+            recipient,
+            value,
+            MemoBytes::empty(),
+        )
+        .map_err(|e| Error::Craft(format!("add_orchard_change_output: {e:?}")))?;
     Ok(())
 }
 
@@ -2529,9 +2589,9 @@ mod tests {
 
     /// Public→Public: one transparent input + two transparent outputs (recipient + change).
     /// Must produce a PCZT with a transparent bundle and NO Orchard bundle.
-    #[test]
-    fn public_to_public_produces_transparent_only_pczt() {
-        let network = Network::MainNetwork;
+    /// Public→Public inputs: one transparent input funding one transparent
+    /// recipient output plus transparent change (two transparent outputs).
+    fn make_public_to_public_inputs(network: Network, target_height: u32) -> BuildInputs {
         let fvk = make_fvk();
         let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
         let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
@@ -2541,9 +2601,9 @@ mod tests {
         let change_value = 5_000u64;
         let total_in = out_value + change_value + fee;
 
-        let inputs = BuildInputs {
+        BuildInputs {
             network,
-            target_height: nu5_activation_height(network) + 1,
+            target_height,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2561,7 +2621,14 @@ mod tests {
                 value: out_value,
                 memo: None,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn public_to_public_produces_transparent_only_pczt() {
+        let network = Network::MainNetwork;
+        let inputs = make_public_to_public_inputs(network, nu5_activation_height(network) + 1);
+        let fee = inputs.fee;
 
         let out = build_transaction(inputs).expect("public→public must succeed");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
@@ -2577,6 +2644,119 @@ mod tests {
         assert_eq!(out.n_transparent_inputs, 1);
         assert_eq!(out.n_transparent_outputs, 2, "recipient + change");
         assert_eq!(out.fee, fee);
+    }
+
+    /// Regression: past NU6.3 the builder's branch-derived default version is V6,
+    /// which the PCZT v1 encoding refuses. A transparent-only send has no Ironwood
+    /// bundle and no other entry point (`build_ironwood_transaction` rejects it),
+    /// so this path must keep pinning V5 — still valid in the NU6.3 branch.
+    #[test]
+    fn public_to_public_still_builds_as_v5_past_nu6_3() {
+        let network = Network::MainNetwork;
+        let inputs = make_public_to_public_inputs(network, nu6_3_activation_height(network) + 1);
+
+        let out = build_transaction(inputs).expect("public→public must succeed past NU6.3");
+        assert_eq!(
+            &out.pczt_bytes[4..8],
+            &1u32.to_le_bytes(),
+            "must still serialize as PCZT v1 past NU6.3"
+        );
+        assert_eq!(
+            out.n_actions_ironwood, 0,
+            "this path builds no Ironwood bundle"
+        );
+    }
+
+    /// Regression: past NU6.3 the Orchard bundle disables cross-address transfers,
+    /// so the change must be added through the builder's change API. A z→t send —
+    /// value leaving the pool through the bundle's value balance, with the remainder
+    /// returning as change — must therefore still build.
+    #[test]
+    fn shielded_to_transparent_keeps_its_change_past_nu6_3() {
+        let network = Network::MainNetwork;
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+
+        let out_value = 10_000u64;
+        // 1 spend + 1 orchard change output + 1 transparent output.
+        let fee = zip317_fee(1, 1, 0, 1);
+        let change = 7_000u64;
+        let spend_value = out_value + fee + change;
+
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (anchor, path) = synthetic_anchor_and_path(leaf);
+
+        let inputs = BuildInputs {
+            network,
+            target_height: nu6_3_activation_height(network) + 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![OrchardSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: spend_value,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path: path,
+            }],
+            transparent_inputs: vec![],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_addr),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect("z→t with change must succeed past NU6.3");
+        assert_eq!(
+            &out.pczt_bytes[4..8],
+            &1u32.to_le_bytes(),
+            "must still serialize as PCZT v1 past NU6.3"
+        );
+        assert_eq!(
+            out.n_transparent_outputs, 1,
+            "the recipient only — the change stays shielded"
+        );
+    }
+
+    /// Same regression for the Orchard flows: an Orchard spend is not expressible
+    /// through the Ironwood builder, so it too must keep building as V5 past NU6.3.
+    /// Its bundle is `orchard_v3` in that epoch, so it also pins the proving-key
+    /// generation.
+    #[test]
+    fn orchard_spend_still_builds_as_v5_past_nu6_3() {
+        let network = Network::MainNetwork;
+        let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let mut inputs =
+            make_single_spend_inputs(network, Destination::Transparent(t_addr), 10_000);
+        inputs.target_height = nu6_3_activation_height(network) + 1;
+
+        let out = build_transaction(inputs).expect("orchard spend must succeed past NU6.3");
+        assert_eq!(
+            &out.pczt_bytes[4..8],
+            &1u32.to_le_bytes(),
+            "must still serialize as PCZT v1 past NU6.3"
+        );
+        assert_eq!(out.n_actions_orchard, 2, "one real spend + one dummy action");
     }
 
     // ── parse::parse_pczt round-trips ─────────────────────────────────────────
