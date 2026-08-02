@@ -815,7 +815,11 @@ pub async fn transaction_details(
                     Ok(((p.txid, p.index), value))
                 })
                 .collect::<napi::Result<_>>()?;
-            Ok(zcash_sync::client::DetailsRequest { txid: r.txid, height: r.height, prevouts })
+            Ok(zcash_sync::client::DetailsRequest {
+                txid: r.txid,
+                height: r.height,
+                prevouts,
+            })
         })
         .collect::<napi::Result<Vec<_>>>()?;
 
@@ -963,6 +967,20 @@ pub fn parse_pczt(pczt_hex: String) -> napi::Result<PcztTransaction> {
     let parsed = zcash_crypto::parse::parse_pczt(&bytes)
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     Ok(parsed_pczt_to_napi(parsed))
+}
+
+/// Derive the Orchard-only unified address from an encoded UFVK string.
+///
+/// Replicates exactly what the device derives: Orchard FVK, external scope,
+/// diversifier index 0, single Orchard receiver. Use this for the Receive
+/// modal — the result passes on-device verification.
+///
+/// Do not confuse with `deriveKeys().multiReceiverUnifiedAddress`, which bundles
+/// all available receivers and does NOT match the device address.
+#[napi]
+pub fn orchard_address_from_ufvk(ufvk: String) -> napi::Result<String> {
+    zcash_crypto::keys::orchard_address_from_ufvk(&ufvk)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 fn bytes_to_napi(bytes: impl Into<Vec<u8>>) -> Uint8Array {
@@ -1819,7 +1837,11 @@ mod tests {
             vec![0x0bu8; 580],
             "enc_ciphertext"
         );
-        assert_eq!(a.out_ciphertext.to_vec(), vec![0x0cu8; 80], "out_ciphertext");
+        assert_eq!(
+            a.out_ciphertext.to_vec(),
+            vec![0x0cu8; 80],
+            "out_ciphertext"
+        );
         assert_eq!(a.recipient.to_vec(), vec![0x0du8; 43], "recipient");
         assert_eq!(a.value, "222222", "value");
         assert_eq!(a.rseed.to_vec(), vec![0x0eu8; 32], "rseed");

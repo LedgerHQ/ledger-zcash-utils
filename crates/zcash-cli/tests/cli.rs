@@ -81,7 +81,7 @@ fn derive_known_mnemonic_json() {
         .assert()
         .success()
         .stdout(contains("\"ufvk\""))
-        .stdout(contains("\"unified_address\""))
+        .stdout(contains("\"multi_receiver_unified_address\""))
         .stdout(contains("\"xpub\""))
         .stdout(contains("\"sapling\""))
         .stdout(contains("\"orchard\""));
@@ -101,7 +101,7 @@ fn derive_testnet_unified_address_has_testnet_prefix() {
         ])
         .assert()
         .success()
-        .stdout(contains("\"unified_address\": \"utest1"));
+        .stdout(contains("\"multi_receiver_unified_address\": \"utest1"));
 }
 
 #[test]

@@ -67,6 +67,15 @@ pub enum Error {
     /// field required by the device signer missing from the (unsigned) PCZT.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// The input string is not a valid bech32m-encoded UFVK.
+    /// No key material in the message — only the reason from the decoder.
+    #[error("invalid UFVK: {reason}")]
+    InvalidUfvk { reason: String },
+
+    /// The UFVK is valid but contains no Orchard component.
+    #[error("UFVK contains no Orchard component")]
+    NoOrchardReceiver,
 }
 
 impl Error {

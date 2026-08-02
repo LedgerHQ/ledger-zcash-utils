@@ -8,10 +8,13 @@ use bitcoin::{
 use orchard::keys::{FullViewingKey as OrchardFvk, Scope as OrchardScope};
 use sapling_crypto::zip32::DiversifiableFullViewingKey as SaplingDfvk;
 use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
-use zcash_keys::keys::{UnifiedAddressRequest, UnifiedSpendingKey};
+use zcash_keys::{
+    address::UnifiedAddress,
+    keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
+};
 use zcash_protocol::consensus::Network as ZcashConsensusNetwork;
+use zcash_protocol::consensus::NetworkType;
 use zip32::{AccountId, Scope};
-
 /// Which Zcash network to target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZcashNetwork {
@@ -39,11 +42,13 @@ pub struct DerivedKeys {
     /// Bech32m Unified Full Viewing Key (HRP `"uview1"` / `"uviewtest1"`).
     /// Bundles transparent + Orchard FVKs, and Sapling by default, per ZIP-316.
     pub ufvk: String,
-    /// Default unified receiving address (Bech32m, HRP `"u1"` / `"utest1"`),
-    /// per ZIP-316. Includes every receiver available in the UFVK (Orchard is
-    /// always present; Sapling/transparent are included when their pool keys
-    /// are). Watch-only: derived from the UFVK, no spending key involved.
-    pub unified_address: String,
+    /// Multi-receiver unified address (Bech32m, HRP `"u1"` / `"utest1"`),
+    /// per ZIP-316. Bundles every receiver the UFVK can produce (Orchard always
+    /// present; Sapling/transparent included when available). Derived from a
+    /// mnemonic via AllAvailableKeys — longer than the device address (~120 chars)
+    /// and NOT suitable for on-device verification (use `orchard_address_from_ufvk`
+    /// for the Receive modal).
+    pub multi_receiver_unified_address: String,
     /// BIP-32 transparent extended public key (Base58Check).
     pub xpub: String,
     /// BIP-32 path used for xpub derivation.
@@ -69,6 +74,46 @@ impl Default for DeriveOptions {
     }
 }
 
+/// Derive the Orchard-only unified address from an encoded UFVK string.
+///
+/// Replicates exactly what the device does: Orchard FVK, Scope::External,
+/// diversifier index 0, single Orchard receiver. Use this for the Receive
+/// modal — it produces a device-verifiable address.
+///
+/// Do not confuse with [`DerivedKeys::multi_receiver_unified_address`], which
+/// starts from a mnemonic and bundles all available receivers. That address
+/// does not match what the device derives and will fail on-device verification.
+///
+/// # Errors
+/// - [`Error::InvalidUfvk`] — the string is not valid bech32m-encoded UFVK.
+/// - [`Error::NoOrchardReceiver`] — valid UFVK but no Orchard component inside.
+pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error> {
+    // Fixed messages: upstream Display impls are not guaranteed to omit the input
+    // string, and echoing a UFVK into logs or error payloads is a privacy leak.
+    let (network_type, container) = Ufvk::decode(ufvk_str).map_err(|_| Error::InvalidUfvk {
+        reason: "bech32m decoding failed".into(),
+    })?;
+
+    let ufvk = UnifiedFullViewingKey::parse(&container).map_err(|_| Error::InvalidUfvk {
+        reason: "FVK parsing failed".into(),
+    })?;
+
+    let orchard_fvk = ufvk.orchard().ok_or(Error::NoOrchardReceiver)?;
+
+    let address = orchard_fvk.address_at(0u32, Scope::External);
+
+    // from_receivers returns None only when every argument is None.
+    // address is a concrete orchard::Address from address_at(), so Some here is guaranteed.
+    let ua = UnifiedAddress::from_receivers(Some(address), None, None)
+        .expect("from_receivers is None only when all receivers are None; Orchard is always Some");
+
+    let consensus_network = match network_type {
+        NetworkType::Main => ZcashConsensusNetwork::MainNetwork,
+        NetworkType::Test | NetworkType::Regtest => ZcashConsensusNetwork::TestNetwork,
+    };
+
+    Ok(ua.encode(&consensus_network))
+}
 fn extract_sapling(dfvk: &SaplingDfvk) -> PoolViewingKeys {
     // FVK: 128 bytes (ak || nk || ovk || dk)
     let fvk = hex::encode(dfvk.to_bytes());
@@ -175,8 +220,10 @@ pub fn derive_keys_with_options(
     // is always present here — see `UnifiedSpendingKey::from_seed` above).
     let (unified_addr, _diversifier_index) = ufvk_obj
         .default_address(UnifiedAddressRequest::AllAvailableKeys)
-        .map_err(|e| Error::Derivation(format!("failed to derive default unified address: {e:?}")))?;
-    let unified_address = unified_addr.encode(&zcash_net);
+        .map_err(|e| {
+            Error::Derivation(format!("failed to derive default unified address: {e:?}"))
+        })?;
+    let multi_receiver_unified_address = unified_addr.encode(&zcash_net);
 
     // --- Transparent xpub via BIP-32 ---
     let resolved_path = match xpub_path {
@@ -193,7 +240,7 @@ pub fn derive_keys_with_options(
 
     Ok(DerivedKeys {
         ufvk,
-        unified_address,
+        multi_receiver_unified_address,
         xpub,
         xpub_path: resolved_path,
         sapling,
@@ -255,7 +302,11 @@ mod tests {
             .as_ref()
             .expect("orchard keys should be present");
         // Sapling: fvk=128B, ivk=32B, ovk=32B
-        assert_eq!(sapling.fvk.len(), 256, "sapling fvk should be 128 bytes hex");
+        assert_eq!(
+            sapling.fvk.len(),
+            256,
+            "sapling fvk should be 128 bytes hex"
+        );
         assert_eq!(sapling.ivk.len(), 64, "sapling ivk should be 32 bytes hex");
         assert_eq!(sapling.ovk.len(), 64, "sapling ovk should be 32 bytes hex");
         // Orchard: fvk=96B, ivk=64B, ovk=32B
@@ -353,15 +404,22 @@ mod tests {
         let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
         let items = ufvk.items();
 
-        assert!(items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
-            "UFVK must contain Orchard even when Sapling is excluded");
-        assert!(!items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
-            "UFVK must NOT contain Sapling when include_sapling_in_ufvk = false");
+        assert!(
+            items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
+            "UFVK must contain Orchard even when Sapling is excluded"
+        );
+        assert!(
+            !items.iter().any(|item| matches!(item, Fvk::Sapling(_))),
+            "UFVK must NOT contain Sapling when include_sapling_in_ufvk = false"
+        );
 
         // P2PKH is only present when the transparent-inputs feature is enabled.
         let has_p2pkh = items.iter().any(|item| matches!(item, Fvk::P2pkh(_)));
-        assert_eq!(has_p2pkh, cfg!(feature = "transparent-inputs"),
-            "P2PKH presence must match the transparent-inputs feature flag");
+        assert_eq!(
+            has_p2pkh,
+            cfg!(feature = "transparent-inputs"),
+            "P2PKH presence must match the transparent-inputs feature flag"
+        );
 
         assert!(
             keys.sapling.is_some(),
@@ -399,36 +457,50 @@ mod tests {
         assert!(opts.include_sapling_in_ufvk);
     }
 
-    // ── unified_address ──────────────────────────────────────────────────────
+    // ── multi_receiver_unified_address ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_mainnet_unified_address_prefix() {
+    fn test_mainnet_multi_receiver_unified_address_prefix() {
         let keys = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        assert!(keys.unified_address.starts_with("u1"), "got: {}", keys.unified_address);
+        assert!(
+            keys.multi_receiver_unified_address.starts_with("u1"),
+            "got: {}",
+            keys.multi_receiver_unified_address
+        );
     }
 
     #[test]
-    fn test_testnet_unified_address_prefix() {
+    fn test_testnet_multi_receiver_unified_address_prefix() {
         let keys = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Testnet, None).unwrap();
-        assert!(keys.unified_address.starts_with("utest1"), "got: {}", keys.unified_address);
+        assert!(
+            keys.multi_receiver_unified_address.starts_with("utest1"),
+            "got: {}",
+            keys.multi_receiver_unified_address
+        );
     }
 
     #[test]
-    fn test_unified_address_deterministic() {
+    fn test_multi_receiver_unified_address_deterministic() {
         let ka = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
         let kb = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        assert_eq!(ka.unified_address, kb.unified_address);
+        assert_eq!(
+            ka.multi_receiver_unified_address,
+            kb.multi_receiver_unified_address
+        );
     }
 
     #[test]
-    fn test_unified_address_differs_across_accounts() {
+    fn test_multi_receiver_unified_address_differs_across_accounts() {
         let k0 = derive_keys(KNOWN_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
         let k1 = derive_keys(KNOWN_MNEMONIC, 1, ZcashNetwork::Mainnet, None).unwrap();
-        assert_ne!(k0.unified_address, k1.unified_address);
+        assert_ne!(
+            k0.multi_receiver_unified_address,
+            k1.multi_receiver_unified_address
+        );
     }
 
     #[test]
-    fn test_unified_address_present_regardless_of_sapling_in_ufvk() {
+    fn test_multi_receiver_unified_address_present_regardless_of_sapling_in_ufvk() {
         // The default address always includes every available receiver
         // (Orchard at minimum), independent of `include_sapling_in_ufvk`
         // which only controls what's bundled into the UFVK string itself.
@@ -437,7 +509,9 @@ mod tests {
             0,
             ZcashNetwork::Mainnet,
             None,
-            DeriveOptions { include_sapling_in_ufvk: true },
+            DeriveOptions {
+                include_sapling_in_ufvk: true,
+            },
         )
         .unwrap();
         let without_sapling = derive_keys_with_options(
@@ -445,9 +519,14 @@ mod tests {
             0,
             ZcashNetwork::Mainnet,
             None,
-            DeriveOptions { include_sapling_in_ufvk: false },
+            DeriveOptions {
+                include_sapling_in_ufvk: false,
+            },
         )
         .unwrap();
-        assert_eq!(with_sapling.unified_address, without_sapling.unified_address);
+        assert_eq!(
+            with_sapling.multi_receiver_unified_address,
+            without_sapling.multi_receiver_unified_address
+        );
     }
 }
