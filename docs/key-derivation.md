@@ -120,7 +120,8 @@ pub fn derive_keys_with_options(
 
 // Derive the Orchard-only unified address from a persisted UFVK string.
 // Returns the same address the Ledger device shows on the Receive screen.
-// Errors: InvalidUfvk (bad encoding) or NoOrchardReceiver (no Orchard component).
+// Errors: InvalidUfvk (bad encoding), NoOrchardReceiver (no Orchard component),
+//         or UnsupportedNetwork (regtest UFVKs are rejected).
 pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error>;
 ```
 

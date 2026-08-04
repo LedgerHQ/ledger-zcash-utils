@@ -1,7 +1,7 @@
 use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
-use zcash_protocol::consensus::NetworkType;
 use zcash_crypto::error::Error;
 use zcash_crypto::keys::{derive_keys, orchard_address_from_ufvk, ZcashNetwork};
+use zcash_protocol::consensus::NetworkType;
 
 // ── Conformance vectors from app-zcash tests/standalone/test_pubkey_cmd.py ────
 // These are the ground truth — derived from m/32'/133'/<account>' + m/44'/133'/<account>'.
@@ -125,7 +125,9 @@ fn regtest_ufvk_returns_unsupported_network_error() {
     let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
     let (_, container) = Ufvk::decode(&keys.ufvk).unwrap();
     let items: Vec<Fvk> = container.items_as_parsed().to_vec();
-    let regtest_ufvk = Ufvk::try_from_items(items).unwrap().encode(&NetworkType::Regtest);
+    let regtest_ufvk = Ufvk::try_from_items(items)
+        .unwrap()
+        .encode(&NetworkType::Regtest);
 
     let err = orchard_address_from_ufvk(&regtest_ufvk).unwrap_err();
     assert!(

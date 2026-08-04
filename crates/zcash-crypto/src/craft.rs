@@ -466,20 +466,12 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     if change > 0 {
         if n_spends > 0 {
             let change_addr = change_address.ok_or_else(|| {
-                Error::Craft(
-                    "change_address required for Orchard change but none supplied".into(),
-                )
+                Error::Craft("change_address required for Orchard change but none supplied".into())
             })?;
             let change_fvk = orchard_fvk.as_ref().ok_or_else(|| {
                 Error::Craft("orchard_fvk is required to add Orchard change".into())
             })?;
-            add_orchard_change(
-                &mut builder,
-                change_fvk,
-                ovk.as_ref(),
-                change_addr,
-                change,
-            )?;
+            add_orchard_change(&mut builder, change_fvk, ovk.as_ref(), change_addr, change)?;
             n_orchard_outputs += 1;
         } else {
             let addr = transparent_change_address.ok_or_else(|| {
@@ -769,9 +761,7 @@ fn stamp_transparent_derivations(
                 address_index,
             )?;
             let derivation = TransparentBip32Derivation::parse(seed_fingerprint, path)
-                .map_err(|e| {
-                    Error::Craft(format!("transparent change bip32 derivation: {e:?}"))
-                })?;
+                .map_err(|e| Error::Craft(format!("transparent change bip32 derivation: {e:?}")))?;
             Some((index, pubkey, derivation))
         }
         None => None,
@@ -1255,9 +1245,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     if change > 0 {
         if n_spends > 0 {
             let change_addr = change_address.ok_or_else(|| {
-                Error::Craft(
-                    "change_address required for Ironwood change but none supplied".into(),
-                )
+                Error::Craft("change_address required for Ironwood change but none supplied".into())
             })?;
             let change_req = IronwoodOutputRequest {
                 destination: IronwoodDestination::Ironwood(change_addr),
@@ -1458,7 +1446,9 @@ fn add_ironwood_spend(
         NoteVersion::V3,
     )
     .into_option()
-    .ok_or_else(|| Error::Craft("Note::from_parts produced a non-canonical Ironwood note".into()))?;
+    .ok_or_else(|| {
+        Error::Craft("Note::from_parts produced a non-canonical Ironwood note".into())
+    })?;
     let merkle_path: orchard::tree::MerklePath = spend.merkle_path.clone().into();
     builder
         .add_ironwood_spend::<Zip317FeeError>(fvk.clone(), note, merkle_path)
@@ -1508,8 +1498,7 @@ fn zip317_fee_ironwood(
         // Same `BundleType::DEFAULT` padding policy as Orchard (MIN_ACTIONS = 2).
         std::cmp::max(ORCHARD_MIN_ACTIONS, requested)
     };
-    let transparent_actions =
-        u64::from(std::cmp::max(n_transparent_inputs, n_transparent_outputs));
+    let transparent_actions = u64::from(std::cmp::max(n_transparent_inputs, n_transparent_outputs));
     MARGINAL_FEE * std::cmp::max(GRACE_ACTIONS, transparent_actions + ironwood_actions)
 }
 
@@ -1732,9 +1721,15 @@ mod tests {
             Destination::Transparent(_) => zip317_fee(1, 0, 0, 1),
         };
         let spend_value = out_value + fee;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let cmx = ExtractedNoteCommitment::from(note.commitment());
         let leaf = MerkleHashOrchard::from_cmx(&cmx);
         let (anchor, path) = synthetic_anchor_and_path(leaf);
@@ -1826,9 +1821,15 @@ mod tests {
             .into_option()
             .unwrap();
         let dummy_recipient = fvk.address_at(0u32, Scope::External);
-        let dummy_note = Note::from_parts(dummy_recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let dummy_note = Note::from_parts(
+            dummy_recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let (_anchor, path) = synthetic_anchor_and_path(MerkleHashOrchard::from_cmx(
             &ExtractedNoteCommitment::from(dummy_note.commitment()),
         ));
@@ -1879,9 +1880,15 @@ mod tests {
             .into_option()
             .unwrap();
         let recipient = fvk.address_at(0u32, Scope::External);
-        let note = Note::from_parts(recipient, NoteValue::from_raw(20_000), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(20_000),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (_anchor, path) = synthetic_anchor_and_path(leaf);
         let inputs = BuildInputs {
@@ -1961,9 +1968,15 @@ mod tests {
             .into_option()
             .unwrap();
         let recipient = fvk.address_at(0u32, Scope::External);
-        let note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let inputs = BuildInputs {
@@ -2394,9 +2407,15 @@ mod tests {
             .zip(rseeds.iter())
             .map(|(&v, &r)| {
                 let rseed = RandomSeed::from_bytes(r, &rho).into_option().unwrap();
-                Note::from_parts(recipient, NoteValue::from_raw(v), rho, rseed, NoteVersion::V2)
-                    .into_option()
-                    .unwrap()
+                Note::from_parts(
+                    recipient,
+                    NoteValue::from_raw(v),
+                    rho,
+                    rseed,
+                    NoteVersion::V2,
+                )
+                .into_option()
+                .unwrap()
             })
             .collect();
         let leaves: Vec<MerkleHashOrchard> = notes
@@ -2466,9 +2485,15 @@ mod tests {
 
         // Single spend of 20_000.
         let spend_value = 20_000u64;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
@@ -2534,9 +2559,15 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value = 10_000u64;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
@@ -2685,7 +2716,9 @@ mod tests {
         let spend_value = out_value + fee + change;
 
         let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
-        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
         let note = Note::from_parts(
             recipient,
             NoteValue::from_raw(spend_value),
@@ -2756,7 +2789,10 @@ mod tests {
             &1u32.to_le_bytes(),
             "must still serialize as PCZT v1 past NU6.3"
         );
-        assert_eq!(out.n_actions_orchard, 2, "one real spend + one dummy action");
+        assert_eq!(
+            out.n_actions_orchard, 2,
+            "one real spend + one dummy action"
+        );
     }
 
     // ── parse::parse_pczt round-trips ─────────────────────────────────────────
@@ -2768,8 +2804,11 @@ mod tests {
     #[test]
     fn parse_pczt_private_to_public_roundtrips() {
         let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
-        let inputs =
-            make_single_spend_inputs(Network::MainNetwork, Destination::Transparent(t_addr), 10_000);
+        let inputs = make_single_spend_inputs(
+            Network::MainNetwork,
+            Destination::Transparent(t_addr),
+            10_000,
+        );
         let out = build_transaction(inputs).expect("private→public must succeed");
 
         let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
@@ -2779,7 +2818,9 @@ mod tests {
         assert_eq!(parsed.global.coin_type, 133);
 
         // Orchard bundle present with fully-populated actions.
-        let bundle = parsed.orchard_bundle.expect("orchard bundle must be present");
+        let bundle = parsed
+            .orchard_bundle
+            .expect("orchard bundle must be present");
         assert!(!bundle.actions.is_empty(), "expected >= 1 orchard action");
         assert_eq!(bundle.anchor.len(), 32);
         for action in &bundle.actions {
@@ -2940,8 +2981,11 @@ mod tests {
                 // `bip32::ChildNumber::index()` strips the hardened bit, so compare
                 // de-hardened indices and hardened flags separately. Expected
                 // external signing path m/44'/133'/0'/0/3.
-                let in_indices: Vec<u32> =
-                    in_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let in_indices: Vec<u32> = in_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.index())
+                    .collect();
                 let in_hardened: Vec<bool> = in_deriv
                     .derivation_path()
                     .iter()
@@ -2965,8 +3009,11 @@ mod tests {
                     .get(&change_pubkey)
                     .expect("change output must carry a derivation keyed by the change pubkey");
                 // Expected internal change path m/44'/133'/0'/1/7.
-                let out_indices: Vec<u32> =
-                    out_deriv.derivation_path().iter().map(|c| c.index()).collect();
+                let out_indices: Vec<u32> = out_deriv
+                    .derivation_path()
+                    .iter()
+                    .map(|c| c.index())
+                    .collect();
                 let out_hardened: Vec<bool> = out_deriv
                     .derivation_path()
                     .iter()
@@ -3041,9 +3088,15 @@ mod tests {
         let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
             .into_option()
             .unwrap();
-        let anchor_note = Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let anchor_note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf =
             MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
         let (anchor, _path) = synthetic_anchor_and_path(leaf);
@@ -3109,13 +3162,17 @@ mod tests {
         let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
             .into_option()
             .unwrap();
-        let anchor_note =
-            Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V2)
-                .into_option()
-                .unwrap();
-        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(
-            anchor_note.commitment(),
-        ));
+        let anchor_note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
+        let leaf =
+            MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
         let (anchor, _path) = synthetic_anchor_and_path(leaf);
 
         let change_pubkey = {
@@ -3196,9 +3253,7 @@ mod tests {
     fn zero_ironwood_anchor_rejected() {
         let mut inputs = make_single_ironwood_spend_inputs(
             Network::MainNetwork,
-            IronwoodDestination::Ironwood(
-                make_fvk().address_at(0u32, Scope::External),
-            ),
+            IronwoodDestination::Ironwood(make_fvk().address_at(0u32, Scope::External)),
             10_000,
         );
         inputs.anchor = [0u8; 32];
@@ -3215,9 +3270,7 @@ mod tests {
     fn invalid_ironwood_anchor_encoding_returns_craft_error() {
         let mut inputs = make_single_ironwood_spend_inputs(
             Network::MainNetwork,
-            IronwoodDestination::Ironwood(
-                make_fvk().address_at(0u32, Scope::External),
-            ),
+            IronwoodDestination::Ironwood(make_fvk().address_at(0u32, Scope::External)),
             10_000,
         );
         inputs.anchor = [0xff; 32];
@@ -3240,8 +3293,14 @@ mod tests {
         let out = build_ironwood_transaction(inputs).expect("ironwood→ironwood must succeed");
         assert!(out.pczt_bytes.len() > 8);
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
-        assert!(out.n_actions_ironwood >= 1, "expected a non-empty Ironwood bundle");
-        assert_eq!(out.n_actions_orchard, 0, "this builder never carries an Orchard bundle");
+        assert!(
+            out.n_actions_ironwood >= 1,
+            "expected a non-empty Ironwood bundle"
+        );
+        assert_eq!(
+            out.n_actions_orchard, 0,
+            "this builder never carries an Orchard bundle"
+        );
         assert!(out.fee >= 10_000);
 
         // The emitted bytes must parse back and carry a non-empty Ironwood bundle.
@@ -3283,9 +3342,15 @@ mod tests {
             .zip(rseeds.iter())
             .map(|(&v, &r)| {
                 let rseed = RandomSeed::from_bytes(r, &rho).into_option().unwrap();
-                Note::from_parts(recipient, NoteValue::from_raw(v), rho, rseed, NoteVersion::V3)
-                    .into_option()
-                    .unwrap()
+                Note::from_parts(
+                    recipient,
+                    NoteValue::from_raw(v),
+                    rho,
+                    rseed,
+                    NoteVersion::V3,
+                )
+                .into_option()
+                .unwrap()
             })
             .collect();
         let leaves: Vec<MerkleHashOrchard> = notes
@@ -3336,8 +3401,8 @@ mod tests {
             }],
         };
 
-        let out =
-            build_ironwood_transaction(inputs).expect("ironwood multi-spend with change must succeed");
+        let out = build_ironwood_transaction(inputs)
+            .expect("ironwood multi-spend with change must succeed");
         assert_eq!(out.fee, fee, "fee must echo the caller-supplied value");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
         // 2 spends + 2 outputs (recipient + change) → exactly 2 ironwood actions.
@@ -3604,7 +3669,10 @@ mod tests {
     fn ironwood_proving_key_is_cached_across_calls() {
         let pk1: *const ProvingKey = ironwood_proving_key();
         let pk2: *const ProvingKey = ironwood_proving_key();
-        assert_eq!(pk1, pk2, "ironwood_proving_key() must return cached pointer");
+        assert_eq!(
+            pk1, pk2,
+            "ironwood_proving_key() must return cached pointer"
+        );
         // The two proving keys (Orchard V5's `FixedPostNu6_2` vs Ironwood's
         // `PostNu6_3`) are distinct allocations, not the same cached key.
         assert_ne!(
@@ -3752,7 +3820,10 @@ mod tests {
         // authorizing-data input to the proof, not rejected or silently ignored).
         let inputs_a = make_ironwood_inputs_with_rseed(0xab);
         let inputs_b = make_ironwood_inputs_with_rseed(0xcd);
-        assert_ne!(inputs_a.anchor, inputs_b.anchor, "test fixture must use distinct anchors");
+        assert_ne!(
+            inputs_a.anchor, inputs_b.anchor,
+            "test fixture must use distinct anchors"
+        );
 
         let out_a = build_ironwood_transaction(inputs_a).expect("build with anchor A must succeed");
         let out_b = build_ironwood_transaction(inputs_b).expect("build with anchor B must succeed");
@@ -3825,7 +3896,10 @@ mod tests {
             // `cv_net` is compacted (recomputed downstream from value + rcv).
             assert!(action.cv_net().is_none(), "cv_net must be redacted");
             // The 0x03 Ironwood note keeps `cmx` on the wire (device contract).
-            assert!(action.output().cmx().is_some(), "cmx must be retained for the Ironwood note");
+            assert!(
+                action.output().cmx().is_some(),
+                "cmx must be retained for the Ironwood note"
+            );
             // nullifier/rk are structurally always present (the Redactor role
             // exposes no way to clear either).
             assert_eq!(action.spend().nullifier().len(), 32);
@@ -3837,10 +3911,12 @@ mod tests {
         // decryption under the wrong domain would silently fail and leave the
         // ciphertext `Encrypted`.
         assert!(
-            bundle
-                .actions()
-                .iter()
-                .any(|a| a.output().enc_ciphertext().clone().into_encrypted().is_none()),
+            bundle.actions().iter().any(|a| a
+                .output()
+                .enc_ciphertext()
+                .clone()
+                .into_encrypted()
+                .is_none()),
             "at least one Ironwood action's enc_ciphertext must be resolved to a memo plaintext"
         );
     }

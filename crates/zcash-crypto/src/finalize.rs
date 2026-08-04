@@ -281,7 +281,9 @@ fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
             Ok(())
         })
         .map_err(|e| {
-            Error::Finalize(format!("PCZT Updater (transparent hash160 preimage): {e:?}"))
+            Error::Finalize(format!(
+                "PCZT Updater (transparent hash160 preimage): {e:?}"
+            ))
         })?;
 
     if let Some(err) = precondition_error {
@@ -481,9 +483,15 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value: u64 = 20_000;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let ovk = Some(fvk.to_ovk(Scope::External));
@@ -600,9 +608,15 @@ mod tests {
             .into_option()
             .unwrap();
         let spend_value: u64 = 20_000;
-        let note = Note::from_parts(recipient, NoteValue::from_raw(spend_value), rho, rseed, NoteVersion::V2)
-            .into_option()
-            .unwrap();
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V2,
+        )
+        .into_option()
+        .unwrap();
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let ovk = Some(fvk.to_ovk(Scope::External));
@@ -679,8 +693,7 @@ mod tests {
         use secp256k1::{Message, Secp256k1};
 
         let pczt = Pczt::parse(pczt_bytes).expect("valid_transparent_der_signature: parse");
-        let signer =
-            PcztSigner::new(pczt).expect("valid_transparent_der_signature: Signer::new");
+        let signer = PcztSigner::new(pczt).expect("valid_transparent_der_signature: Signer::new");
         let sighash = signer
             .transparent_sighash(index)
             .expect("valid_transparent_der_signature: transparent_sighash");
@@ -991,7 +1004,10 @@ mod tests {
 
         // Not a branch id at all: selection stays infallible and defers the failure
         // to proof verification.
-        assert!(std::ptr::eq(verifying_key_for(0xdead_beef), verifying_key()));
+        assert!(std::ptr::eq(
+            verifying_key_for(0xdead_beef),
+            verifying_key()
+        ));
     }
 
     // ── parse_transparent_der tests ───────────────────────────────────────────

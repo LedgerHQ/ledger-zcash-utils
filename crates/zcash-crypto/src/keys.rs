@@ -88,6 +88,7 @@ impl Default for DeriveOptions {
 /// # Errors
 /// - [`Error::InvalidUfvk`] — the string is not valid bech32m-encoded UFVK.
 /// - [`Error::NoOrchardReceiver`] — valid UFVK but no Orchard component inside.
+/// - [`Error::UnsupportedNetwork`] — UFVK encodes a regtest address; only mainnet and testnet are supported.
 pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error> {
     // Fixed messages: upstream Display impls are not guaranteed to omit the input
     // string, and echoing a UFVK into logs or error payloads is a privacy leak.
