@@ -45,7 +45,7 @@ ledger-zcash-cli sync \
     --format json
 ```
 
-`derive` prints the UFVK, the default unified receiving address, the
+`derive` prints the UFVK, the multi-receiver unified address, the
 transparent xpub, and per-pool (Sapling + Orchard) FVK/IVK/OVK. No spending
 key material is ever exposed.
 

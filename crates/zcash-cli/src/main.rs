@@ -36,7 +36,7 @@ struct Cli {
 enum Commands {
     /// Derive all Zcash viewing keys from a BIP-39 mnemonic.
     ///
-    /// Outputs: UFVK, default unified address, xpub, and per-pool
+    /// Outputs: UFVK, multi-receiver unified address, xpub, and per-pool
     /// (Sapling + Orchard) FVK/IVK/OVK. No spending key material is exposed.
     Derive(DeriveArgs),
 

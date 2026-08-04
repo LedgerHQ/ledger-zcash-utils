@@ -1,4 +1,5 @@
 use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
+use zcash_protocol::consensus::NetworkType;
 use zcash_crypto::error::Error;
 use zcash_crypto::keys::{derive_keys, orchard_address_from_ufvk, ZcashNetwork};
 
@@ -115,6 +116,21 @@ fn sapling_only_ufvk_returns_no_orchard_receiver_error() {
     assert!(
         matches!(err, Error::NoOrchardReceiver),
         "expected NoOrchardReceiver, got: {err:?}"
+    );
+}
+
+#[test]
+fn regtest_ufvk_returns_unsupported_network_error() {
+    // Re-encode a valid mainnet UFVK with the regtest HRP to simulate a regtest UFVK.
+    let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+    let (_, container) = Ufvk::decode(&keys.ufvk).unwrap();
+    let items: Vec<Fvk> = container.items_as_parsed().to_vec();
+    let regtest_ufvk = Ufvk::try_from_items(items).unwrap().encode(&NetworkType::Regtest);
+
+    let err = orchard_address_from_ufvk(&regtest_ufvk).unwrap_err();
+    assert!(
+        matches!(err, Error::UnsupportedNetwork { .. }),
+        "expected UnsupportedNetwork, got: {err:?}"
     );
 }
 

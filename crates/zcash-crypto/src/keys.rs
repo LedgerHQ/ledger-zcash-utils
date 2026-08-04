@@ -15,6 +15,7 @@ use zcash_keys::{
 use zcash_protocol::consensus::Network as ZcashConsensusNetwork;
 use zcash_protocol::consensus::NetworkType;
 use zip32::{AccountId, Scope};
+
 /// Which Zcash network to target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZcashNetwork {
@@ -102,18 +103,24 @@ pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error> {
 
     let address = orchard_fvk.address_at(0u32, Scope::External);
 
-    // from_receivers returns None only when every argument is None.
-    // address is a concrete orchard::Address from address_at(), so Some here is guaranteed.
+    // from_receivers returns None when neither Orchard nor Sapling is Some.
+    // Orchard is always Some here (concrete address from address_at()), so this is unreachable.
     let ua = UnifiedAddress::from_receivers(Some(address), None, None)
-        .expect("from_receivers is None only when all receivers are None; Orchard is always Some");
+        .expect("unreachable: Orchard receiver is always Some");
 
     let consensus_network = match network_type {
         NetworkType::Main => ZcashConsensusNetwork::MainNetwork,
-        NetworkType::Test | NetworkType::Regtest => ZcashConsensusNetwork::TestNetwork,
+        NetworkType::Test => ZcashConsensusNetwork::TestNetwork,
+        NetworkType::Regtest => {
+            return Err(Error::UnsupportedNetwork {
+                network: "regtest".into(),
+            })
+        }
     };
 
     Ok(ua.encode(&consensus_network))
 }
+
 fn extract_sapling(dfvk: &SaplingDfvk) -> PoolViewingKeys {
     // FVK: 128 bytes (ak || nk || ovk || dk)
     let fvk = hex::encode(dfvk.to_bytes());
