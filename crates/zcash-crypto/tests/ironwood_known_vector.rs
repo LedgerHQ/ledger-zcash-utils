@@ -206,6 +206,9 @@ fn build_ironwood_transaction_with_real_testnet_anchor_produces_valid_v6_pczt() 
         "must carry a non-empty Ironwood bundle (dummy-padded)"
     );
     assert_eq!(out.n_transparent_inputs, 1);
-    assert_eq!(out.n_transparent_outputs, 0, "exact balance leaves no transparent change");
+    assert_eq!(
+        out.n_transparent_outputs, 0,
+        "exact balance leaves no transparent change"
+    );
     assert_eq!(out.fee, fee);
 }

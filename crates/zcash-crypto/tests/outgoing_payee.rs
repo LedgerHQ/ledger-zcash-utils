@@ -31,15 +31,30 @@ const TX1_HEIGHT: u32 = 3_047_167;
 
 #[test]
 fn recovers_the_payee_of_an_outgoing_sapling_note() {
-    let payees = outgoing_payees(TX_S2_HEX.trim(), TESTNET_UFVK, TX_S2_HEIGHT, Network::TestNetwork)
-        .expect("decryption should succeed on a valid fixture");
+    let payees = outgoing_payees(
+        TX_S2_HEX.trim(),
+        TESTNET_UFVK,
+        TX_S2_HEIGHT,
+        Network::TestNetwork,
+    )
+    .expect("decryption should succeed on a valid fixture");
 
-    assert_eq!(payees.len(), 1, "the transaction has exactly one outgoing note");
+    assert_eq!(
+        payees.len(),
+        1,
+        "the transaction has exactly one outgoing note"
+    );
 
     let payee = &payees[0];
-    assert!(payee.starts_with("ztestsapling1"), "expected a testnet Sapling address, got {payee}");
     assert!(
-        matches!(Address::decode(&Network::TestNetwork, payee), Some(Address::Sapling(_))),
+        payee.starts_with("ztestsapling1"),
+        "expected a testnet Sapling address, got {payee}"
+    );
+    assert!(
+        matches!(
+            Address::decode(&Network::TestNetwork, payee),
+            Some(Address::Sapling(_))
+        ),
         "recovered payee must be a decodable Sapling address"
     );
 }
@@ -48,25 +63,42 @@ fn recovers_the_payee_of_an_outgoing_sapling_note() {
 /// would mean we had recovered change and mistaken it for a destination.
 #[test]
 fn the_recovered_payee_is_not_one_of_our_own_addresses() {
-    let payees = outgoing_payees(TX_S2_HEX.trim(), TESTNET_UFVK, TX_S2_HEIGHT, Network::TestNetwork)
-        .expect("decryption should succeed on a valid fixture");
+    let payees = outgoing_payees(
+        TX_S2_HEX.trim(),
+        TESTNET_UFVK,
+        TX_S2_HEIGHT,
+        Network::TestNetwork,
+    )
+    .expect("decryption should succeed on a valid fixture");
 
     let ufvk = UnifiedFullViewingKey::decode(&Network::TestNetwork, TESTNET_UFVK)
         .expect("fixture viewing key should decode");
-    let sapling = ufvk.sapling().expect("testnet fixture wallet has a Sapling key");
+    let sapling = ufvk
+        .sapling()
+        .expect("testnet fixture wallet has a Sapling key");
 
     let encode = |(_, address)| Address::Sapling(address).encode(&Network::TestNetwork);
-    let ours =
-        [encode(sapling.default_address()), encode(sapling.change_address())];
+    let ours = [
+        encode(sapling.default_address()),
+        encode(sapling.change_address()),
+    ];
 
-    assert!(!ours.contains(&payees[0]), "recovered a change address instead of the payee");
+    assert!(
+        !ours.contains(&payees[0]),
+        "recovered a change address instead of the payee"
+    );
 }
 
 /// Change pays us back, so it is not a destination to report.
 #[test]
 fn an_internal_change_note_is_not_a_payee() {
-    let payees = outgoing_payees(TX3_HEX.trim(), MAINNET_UFVK, TX3_HEIGHT, Network::MainNetwork)
-        .expect("decryption should succeed on a valid fixture");
+    let payees = outgoing_payees(
+        TX3_HEX.trim(),
+        MAINNET_UFVK,
+        TX3_HEIGHT,
+        Network::MainNetwork,
+    )
+    .expect("decryption should succeed on a valid fixture");
 
     assert!(payees.is_empty(), "change is not a payee, got {payees:?}");
 }
@@ -75,18 +107,34 @@ fn an_internal_change_note_is_not_a_payee() {
 /// somewhere we sent funds.
 #[test]
 fn an_incoming_note_is_not_a_payee() {
-    let payees = outgoing_payees(TX1_HEX.trim(), MAINNET_UFVK, TX1_HEIGHT, Network::MainNetwork)
-        .expect("decryption should succeed on a valid fixture");
+    let payees = outgoing_payees(
+        TX1_HEX.trim(),
+        MAINNET_UFVK,
+        TX1_HEIGHT,
+        Network::MainNetwork,
+    )
+    .expect("decryption should succeed on a valid fixture");
 
-    assert!(payees.is_empty(), "an incoming note is not a payee, got {payees:?}");
+    assert!(
+        payees.is_empty(),
+        "an incoming note is not a payee, got {payees:?}"
+    );
 }
 
 /// A transaction we have nothing to do with reveals no payee: without a note of
 /// ours to decrypt, the destination stays private.
 #[test]
 fn a_transaction_of_someone_elses_reveals_no_payee() {
-    let payees = outgoing_payees(TX_S2_HEX.trim(), MAINNET_UFVK, TX_S2_HEIGHT, Network::TestNetwork)
-        .expect("decryption of an undecryptable transaction is not an error");
+    let payees = outgoing_payees(
+        TX_S2_HEX.trim(),
+        MAINNET_UFVK,
+        TX_S2_HEIGHT,
+        Network::TestNetwork,
+    )
+    .expect("decryption of an undecryptable transaction is not an error");
 
-    assert!(payees.is_empty(), "expected no payee for a foreign transaction, got {payees:?}");
+    assert!(
+        payees.is_empty(),
+        "expected no payee for a foreign transaction, got {payees:?}"
+    );
 }

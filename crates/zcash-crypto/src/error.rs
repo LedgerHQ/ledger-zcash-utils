@@ -67,6 +67,19 @@ pub enum Error {
     /// field required by the device signer missing from the (unsigned) PCZT.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// The input string is not a valid bech32m-encoded UFVK.
+    /// No key material in the message — only the reason from the decoder.
+    #[error("invalid UFVK: {reason}")]
+    InvalidUfvk { reason: String },
+
+    /// The UFVK is valid but contains no Orchard component.
+    #[error("UFVK contains no Orchard component")]
+    NoOrchardReceiver,
+
+    /// The UFVK encodes a network that this function does not support (e.g. regtest).
+    #[error("unsupported network in UFVK: {network}")]
+    UnsupportedNetwork { network: String },
 }
 
 impl Error {
@@ -161,6 +174,14 @@ mod tests {
         };
         let s = e.to_string();
         assert!(s.contains("witness root mismatch at position 5"));
+    }
+
+    #[test]
+    fn test_unsupported_network_display() {
+        let e = Error::UnsupportedNetwork {
+            network: "regtest".into(),
+        };
+        assert_eq!(e.to_string(), "unsupported network in UFVK: regtest");
     }
 
     #[test]

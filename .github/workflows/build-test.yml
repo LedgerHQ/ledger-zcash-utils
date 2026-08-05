@@ -35,5 +35,8 @@ jobs:
       - name: Build NAPI addon
         run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 
+      - name: Smoke-test NAPI surface
+        run: pnpm napi-smoke
+
       - name: Run Rust tests
         run: cargo test --workspace

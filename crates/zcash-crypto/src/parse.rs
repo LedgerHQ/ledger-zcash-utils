@@ -187,11 +187,10 @@ fn parse_global(pczt: &Pczt) -> Result<ParsedGlobal, Error> {
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| Error::Parse("global.coin_type missing".into()))? as u32;
 
-    let tx_modifiable = json
-        .get("tx_modifiable")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| Error::Parse("global.tx_modifiable missing".into()))?
-        as u8;
+    let tx_modifiable =
+        json.get("tx_modifiable")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| Error::Parse("global.tx_modifiable missing".into()))? as u8;
 
     let fallback_lock_time = match json.get("fallback_lock_time") {
         None | Some(serde_json::Value::Null) => None,
@@ -299,9 +298,7 @@ fn convert_orchard_bundle(
     }))
 }
 
-fn convert_orchard_action(
-    action: &orchard::pczt::Action,
-) -> Result<ParsedOrchardAction, String> {
+fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchardAction, String> {
     let spend = action.spend();
     let output = action.output();
 
@@ -332,8 +329,7 @@ fn convert_orchard_action(
         .zip32_derivation()
         .as_ref()
         .ok_or("orchard spend missing zip32_derivation")?;
-    let signing_path =
-        format_derivation_path(zip32.derivation_path().iter().map(|c| c.index()));
+    let signing_path = format_derivation_path(zip32.derivation_path().iter().map(|c| c.index()));
     let seed_fingerprint = *zip32.seed_fingerprint();
 
     let note = output.encrypted_note();

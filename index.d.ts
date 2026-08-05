@@ -560,6 +560,17 @@ export interface PcztTransaction {
  */
 export declare function parsePczt(pcztHex: string): PcztTransaction
 /**
+ * Derive the Orchard-only unified address from an encoded UFVK string.
+ *
+ * Replicates exactly what the device derives: Orchard FVK, external scope,
+ * diversifier index 0, single Orchard receiver. Use this for the Receive
+ * modal — the result passes on-device verification.
+ *
+ * Do not confuse with `deriveKeys().multiReceiverUnifiedAddress`, which bundles
+ * all available receivers and does NOT match the device address.
+ */
+export declare function orchardAddressFromUfvk(ufvk: string): string
+/**
  * Async iterator over matched shielded transactions.
  *
  * Usage (TypeScript):

@@ -25,15 +25,69 @@ const TX_Z2T_HEIGHT: u32 = 3_425_858;
 
 fn t2z_prevouts() -> PrevoutValues {
     [
-        (("2a84cff0674167c31cc4a7f04e80e6dd0261cb2892c264f99dbb4703ab9a0dbe".to_string(), 0), 6_191_914),
-        (("d452101fabffdad3bc880c944a7672512740304416e41a90cd1fda1370ec1d42".to_string(), 0), 5_865_000),
-        (("3149b398b245e3ee92cdf8a81e53657d040742fdcce33eb90f57efd2fd90f9a3".to_string(), 0), 185_000),
-        (("56f48be32ca5768dc5e54c43835feffdea9f8459baed4d0b628dbd59eb0aa949".to_string(), 0), 235_000),
-        (("5055a9fff1e02227d7bd92a0a823b52af10a6b0d35fbf713041fd6892a0791a9".to_string(), 0), 100_000),
-        (("681a4c6872a4569e0779a84b4976e09299a6ebad42649b480e6b465c03cc21fb".to_string(), 0), 12_163_913),
-        (("c355f5cad162303b6606593e71e1221bcff2ab20226c21c9a812e09391ded484".to_string(), 0), 6_441_297),
-        (("d8f78db6b809139cd7074c58e0ebd6d655294be310acb8eb3fe3563123b3fc7d".to_string(), 0), 2_875_184),
-        (("5160f03c3d9c4362d25fafdfcaadca978c66af15b02f0c8e061a3177a61c6451".to_string(), 0), 5_303_655),
+        (
+            (
+                "2a84cff0674167c31cc4a7f04e80e6dd0261cb2892c264f99dbb4703ab9a0dbe".to_string(),
+                0,
+            ),
+            6_191_914,
+        ),
+        (
+            (
+                "d452101fabffdad3bc880c944a7672512740304416e41a90cd1fda1370ec1d42".to_string(),
+                0,
+            ),
+            5_865_000,
+        ),
+        (
+            (
+                "3149b398b245e3ee92cdf8a81e53657d040742fdcce33eb90f57efd2fd90f9a3".to_string(),
+                0,
+            ),
+            185_000,
+        ),
+        (
+            (
+                "56f48be32ca5768dc5e54c43835feffdea9f8459baed4d0b628dbd59eb0aa949".to_string(),
+                0,
+            ),
+            235_000,
+        ),
+        (
+            (
+                "5055a9fff1e02227d7bd92a0a823b52af10a6b0d35fbf713041fd6892a0791a9".to_string(),
+                0,
+            ),
+            100_000,
+        ),
+        (
+            (
+                "681a4c6872a4569e0779a84b4976e09299a6ebad42649b480e6b465c03cc21fb".to_string(),
+                0,
+            ),
+            12_163_913,
+        ),
+        (
+            (
+                "c355f5cad162303b6606593e71e1221bcff2ab20226c21c9a812e09391ded484".to_string(),
+                0,
+            ),
+            6_441_297,
+        ),
+        (
+            (
+                "d8f78db6b809139cd7074c58e0ebd6d655294be310acb8eb3fe3563123b3fc7d".to_string(),
+                0,
+            ),
+            2_875_184,
+        ),
+        (
+            (
+                "5160f03c3d9c4362d25fafdfcaadca978c66af15b02f0c8e061a3177a61c6451".to_string(),
+                0,
+            ),
+            5_303_655,
+        ),
     ]
     .into_iter()
     .collect()
@@ -48,7 +102,10 @@ fn fee_of(hex: &str, height: u32, prevouts: &PrevoutValues) -> Option<u64> {
 /// is all the transparent bundle allows — inflates the fee by 10,000,000 zat.
 #[test]
 fn t2z_fee_excludes_the_value_that_entered_the_shielded_pool() {
-    assert_eq!(fee_of(TX_T2Z_HEX, TX_T2Z_HEIGHT, &t2z_prevouts()), Some(55_000));
+    assert_eq!(
+        fee_of(TX_T2Z_HEX, TX_T2Z_HEIGHT, &t2z_prevouts()),
+        Some(55_000)
+    );
 }
 
 /// A deshielding send has no transparent inputs at all, so the transparent
@@ -56,14 +113,20 @@ fn t2z_fee_excludes_the_value_that_entered_the_shielded_pool() {
 /// what makes the fee computable.
 #[test]
 fn z2t_fee_accounts_for_the_value_that_left_the_shielded_pool() {
-    assert_eq!(fee_of(TX_Z2T_HEX, TX_Z2T_HEIGHT, &PrevoutValues::new()), Some(15_000));
+    assert_eq!(
+        fee_of(TX_Z2T_HEX, TX_Z2T_HEIGHT, &PrevoutValues::new()),
+        Some(15_000)
+    );
 }
 
 /// A transaction spending transparent inputs whose values were not supplied has
 /// no computable fee. Reporting one anyway would mean reporting a wrong one.
 #[test]
 fn t2z_fee_is_unknown_without_the_prevout_values() {
-    assert_eq!(fee_of(TX_T2Z_HEX, TX_T2Z_HEIGHT, &PrevoutValues::new()), None);
+    assert_eq!(
+        fee_of(TX_T2Z_HEX, TX_T2Z_HEIGHT, &PrevoutValues::new()),
+        None
+    );
 }
 
 /// One missing prevout is enough to make the total unknowable — a partial sum

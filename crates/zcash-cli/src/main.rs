@@ -36,7 +36,7 @@ struct Cli {
 enum Commands {
     /// Derive all Zcash viewing keys from a BIP-39 mnemonic.
     ///
-    /// Outputs: UFVK, default unified address, xpub, and per-pool
+    /// Outputs: UFVK, multi-receiver unified address, xpub, and per-pool
     /// (Sapling + Orchard) FVK/IVK/OVK. No spending key material is exposed.
     Derive(DeriveArgs),
 
@@ -210,7 +210,7 @@ fn cmd_derive(args: DeriveArgs) {
         Ok(keys) => match args.format {
             Format::Human => {
                 println!("ufvk      : {}", keys.ufvk);
-                println!("address   : {}", keys.unified_address);
+                println!("address   : {}", keys.multi_receiver_unified_address);
                 println!("xpub      : {}", keys.xpub);
                 println!("xpub path : (derived from requested account)");
                 if let Some(s) = &keys.sapling {
@@ -230,7 +230,7 @@ fn cmd_derive(args: DeriveArgs) {
                 };
                 let json = serde_json::json!({
                     "ufvk": keys.ufvk,
-                    "unified_address": keys.unified_address,
+                    "multi_receiver_unified_address": keys.multi_receiver_unified_address,
                     "xpub": keys.xpub,
                     "xpub_path": format!("(derived from account {})", args.account),
                     "sapling": keys.sapling.as_ref().map(pool_json),

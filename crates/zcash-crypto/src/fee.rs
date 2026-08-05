@@ -51,7 +51,11 @@ pub fn transaction_fee(
         .into_data()
         .fee_paid(|outpoint| -> Result<Option<Zatoshis>, BalanceError> {
             let key = (display_txid(outpoint.hash()), outpoint.n());
-            prevouts.get(&key).copied().map(Zatoshis::from_u64).transpose()
+            prevouts
+                .get(&key)
+                .copied()
+                .map(Zatoshis::from_u64)
+                .transpose()
         })
         .map_err(|e| Error::Decrypt(format!("fee computation failed: {:?}", e)))?;
 

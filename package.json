@@ -43,7 +43,8 @@
     "cli:sync": "cargo run -q -p zcash-cli -- sync --help",
     "// ── Node.js validation & benchmarks ───────────────────────────────": "",
     "sync-tx": "tsx examples/sync-tx.node.ts --start-height 1130000 --end-height 1180000",
-    "bench": "tsx examples/bench.ts --start-height 280000 --end-height 285000"
+    "bench": "tsx examples/bench.ts --start-height 280000 --end-height 285000",
+    "napi-smoke": "tsx examples/napi-smoke.ts"
   },
   "devDependencies": {
     "@changesets/cli": "^2.29.8",
