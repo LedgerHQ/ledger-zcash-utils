@@ -90,7 +90,6 @@
 use std::sync::OnceLock;
 
 use orchard::{
-    builder::BundleType as OrchardBundleType,
     circuit::{OrchardCircuitVersion, ProvingKey},
     keys::{FullViewingKey as OrchardFvk, OutgoingViewingKey},
     note::{Note, NoteVersion, RandomSeed, Rho},
@@ -107,7 +106,7 @@ use pczt::{
 };
 use rand::rngs::OsRng;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder},
+    builder::{BuildConfig, BundlePadding, Builder},
     fees::zip317::{FeeError as Zip317FeeError, FeeRule},
     TxVersion,
 };
@@ -380,7 +379,8 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         sapling_anchor: None,
         orchard_anchor,
         ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+        orchard_padding: BundlePadding::DEFAULT,
+        ironwood_padding: BundlePadding::DEFAULT,
     };
 
     // ── 1. Builder + Orchard spends + transparent inputs + non-change outputs ──
@@ -1178,7 +1178,8 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
         // NU6.3 scope).
         orchard_anchor: None,
         ironwood_anchor: Some(ironwood_anchor),
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+        orchard_padding: BundlePadding::DEFAULT,
+        ironwood_padding: BundlePadding::DEFAULT,
     };
 
     // ── 1. Builder + Ironwood spends + transparent inputs + non-change outputs ──
@@ -1542,7 +1543,11 @@ fn apply_v6_redaction(pczt: Pczt) -> Pczt {
         .redact_ironwood_with(|mut r| {
             r.redact_actions(|mut a| {
                 a.clear_cv_net();
-                a.clear_spend_fvk();
+                // The FVK is intentionally retained for Ironwood spends so the
+                // PCZT Signer role can validate the nullifier before injecting
+                // the device-provided `spendAuthSig` via `apply_ironwood_signature`.
+                // This is consistent with the V5 Orchard flow which never strips
+                // the FVK from real spend actions.
                 a.replace_enc_ciphertext_with_decrypted_memo_plaintext(NoteVersion::V3);
             });
         })
@@ -3705,7 +3710,8 @@ mod tests {
             sapling_anchor: None,
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
             ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-            orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
         };
         let mut builder = Builder::new(network, target, build_config);
         // Fund the two 1_000-zat outputs plus the ZIP-317 fee for the resulting

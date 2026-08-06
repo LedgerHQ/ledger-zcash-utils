@@ -624,12 +624,16 @@ pub async fn build_ironwood_transaction(
 /// Parameters for finalizing a PCZT with device-provided signatures.
 #[napi(object)]
 pub struct FinalizeTransactionParams {
-    /// Hex-encoded canonical PCZT bytes from `buildTransaction`.
+    /// Hex-encoded canonical PCZT bytes from `buildTransaction` or
+    /// `buildIronwoodTransaction`.
     pub pczt: String,
     /// One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
-    /// in PCZT-action order over the unsigned actions.
+    /// in PCZT-action order over the unsigned actions. Empty for V6/Ironwood PCZTs.
     pub orchard_signatures: Vec<String>,
-    /// One DER-hex secp256k1 signature per transparent input (empty for pure Orchard).
+    /// One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Ironwood spend,
+    /// in PCZT-action order over the unsigned actions. Empty for V5/Orchard PCZTs.
+    pub ironwood_signatures: Vec<String>,
+    /// One DER-hex secp256k1 signature per transparent input (empty for pure shielded).
     pub transparent_signatures: Vec<String>,
 }
 
@@ -644,11 +648,12 @@ pub struct FinalizeTransactionResult {
     pub txid: String,
 }
 
-/// Inject device signatures into a PCZT and extract the final signed V5 transaction.
+/// Inject device signatures into a PCZT and extract the final signed transaction.
 ///
-/// Accepts the PCZT from `buildTransaction`, one 64-byte RedPallas signature per
-/// real (unsigned) Orchard action, and one DER secp256k1 signature per transparent
-/// input. The Orchard binding signature is computed host-side.
+/// Accepts the PCZT from `buildTransaction` or `buildIronwoodTransaction`, one
+/// 64-byte RedPallas signature per real (unsigned) Orchard or Ironwood action
+/// (supply the appropriate list; the other stays empty), and one DER secp256k1
+/// signature per transparent input. The binding signature is computed host-side.
 ///
 /// CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
 /// to `tokio::task::spawn_blocking` so the async executor is not starved.
@@ -678,6 +683,24 @@ pub async fn finalize_transaction(
         })
         .collect::<napi::Result<_>>()?;
 
+    // Decode each Ironwood signature (128 hex chars → 64 bytes).
+    let ironwood_signatures: Vec<[u8; 64]> = params
+        .ironwood_signatures
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let v = hex::decode(s).map_err(|e| {
+                napi::Error::from_reason(format!("ironwood_signatures[{i}] hex decode: {e}"))
+            })?;
+            v.try_into().map_err(|got: Vec<u8>| {
+                napi::Error::from_reason(format!(
+                    "ironwood_signatures[{i}] must be 64 bytes (got {} bytes)",
+                    got.len()
+                ))
+            })
+        })
+        .collect::<napi::Result<_>>()?;
+
     // Decode each transparent signature (DER hex → bytes).
     let transparent_signatures: Vec<Vec<u8>> = params
         .transparent_signatures
@@ -697,6 +720,7 @@ pub async fn finalize_transaction(
         zcash_crypto::finalize::finalize_transaction(zcash_crypto::finalize::FinalizeInputs {
             pczt_bytes,
             orchard_signatures,
+            ironwood_signatures,
             transparent_signatures,
         })
     })
@@ -1366,6 +1390,7 @@ mod tests {
         let params = FinalizeTransactionParams {
             pczt: "not valid hex @@@@".to_string(),
             orchard_signatures: vec![],
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         };
         let err = finalize_transaction(params).await.unwrap_err();
@@ -1381,6 +1406,7 @@ mod tests {
         let params = FinalizeTransactionParams {
             pczt: hex::encode(b"definitely not a pczt"),
             orchard_signatures: vec![],
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         };
         let err = finalize_transaction(params).await.unwrap_err();

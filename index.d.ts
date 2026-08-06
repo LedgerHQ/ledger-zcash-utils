@@ -352,19 +352,24 @@ export interface BuildIronwoodTransactionResult {
 export declare function buildIronwoodTransaction(params: BuildIronwoodTransactionParams): Promise<BuildIronwoodTransactionResult>
 /** Parameters for finalizing a PCZT with device-provided signatures. */
 export interface FinalizeTransactionParams {
-  /** Hex-encoded canonical PCZT bytes from `buildTransaction`. */
+  /** Hex-encoded canonical PCZT bytes from `buildTransaction` or `buildIronwoodTransaction`. */
   pczt: string
   /**
    * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
-   * in PCZT-action order over the unsigned actions.
+   * in PCZT-action order over the unsigned actions. Empty for V6/Ironwood PCZTs.
    */
   orchardSignatures: Array<string>
-  /** One DER-hex secp256k1 signature per transparent input (empty for pure Orchard). */
+  /**
+   * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Ironwood spend,
+   * in PCZT-action order over the unsigned actions. Empty for V5/Orchard PCZTs.
+   */
+  ironwoodSignatures: Array<string>
+  /** One DER-hex secp256k1 signature per transparent input (empty for pure shielded). */
   transparentSignatures: Array<string>
 }
 /** Result of a successful `finalizeTransaction` call. */
 export interface FinalizeTransactionResult {
-  /** Hex-encoded signed V5 transaction bytes (ready for `broadcastTransaction`). */
+  /** Hex-encoded signed transaction bytes (ready for `broadcastTransaction`). */
   txHex: string
   /**
    * 64-char hex transaction id, big-endian *display* order (matches the sync
@@ -373,11 +378,12 @@ export interface FinalizeTransactionResult {
   txid: string
 }
 /**
- * Inject device signatures into a PCZT and extract the final signed V5 transaction.
+ * Inject device signatures into a PCZT and extract the final signed transaction.
  *
- * Accepts the PCZT from `buildTransaction`, one 64-byte RedPallas signature per
- * real (unsigned) Orchard action, and one DER secp256k1 signature per transparent
- * input. The Orchard binding signature is computed host-side.
+ * Accepts the PCZT from `buildTransaction` or `buildIronwoodTransaction`, one
+ * 64-byte RedPallas signature per real (unsigned) Orchard or Ironwood action
+ * (supply the appropriate list; the other stays empty), and one DER secp256k1
+ * signature per transparent input. The binding signature is computed host-side.
  *
  * CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
  * to `tokio::task::spawn_blocking` so the async executor is not starved.

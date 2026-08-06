@@ -21,8 +21,9 @@
 //!   5. `signer.finish()`.
 //!   6. If there are transparent inputs: `SpendFinalizer::finalize_spends()`.
 //!   7. `TransactionExtractor::new(pczt).with_orchard(verifying_key()).extract()`
-//!      — applies the Orchard binding signature host-side and verifies the proof.
-//!   8. Serialize the V5 `Transaction` (ZIP-225) and compute the txid.
+//!      — applies the Orchard or Ironwood binding signature host-side (per the
+//!      bundle present in the PCZT) and verifies the proof. Produces V5 or V6.
+//!   8. Serialize the transaction (ZIP-225 V5 or ZIP-230 V6) and compute the txid.
 
 use std::sync::OnceLock;
 
@@ -44,20 +45,26 @@ use crate::error::Error;
 
 /// Inputs to [`finalize_transaction`].
 pub struct FinalizeInputs {
-    /// Canonical PCZT bytes from `build_transaction` (`PCZT` magic + version + postcard).
+    /// Canonical PCZT bytes from `build_transaction` or `build_ironwood_transaction`
+    /// (`PCZT` magic + version + postcard).
     pub pczt_bytes: Vec<u8>,
     /// One 64-byte RedPallas `spendAuthSig` per real (device-signed) Orchard spend,
     /// in PCZT-action order over the unsigned actions.
     pub orchard_signatures: Vec<[u8; 64]>,
+    /// One 64-byte RedPallas `spendAuthSig` per real (unsigned) Ironwood spend,
+    /// in PCZT-action order over the unsigned actions.
+    /// Empty for V5/Orchard or transparent-only PCZTs.
+    pub ironwood_signatures: Vec<[u8; 64]>,
     /// One DER-encoded secp256k1 signature per transparent input, in input order.
-    /// Empty for pure-Orchard transactions.
+    /// Empty for pure-shielded transactions.
     pub transparent_signatures: Vec<Vec<u8>>,
 }
 
 /// Output of [`finalize_transaction`].
 #[derive(Debug)]
 pub struct FinalizeOutput {
-    /// The fully-signed transaction serialized per ZIP-225 (V5).
+    /// The fully-signed transaction serialized per ZIP-225 (V5) or ZIP-230 (V6),
+    /// depending on which shielded bundle the input PCZT carries.
     pub tx_bytes: Vec<u8>,
     /// Transaction ID (BLAKE2b-256), 32 bytes, in internal **little-endian**
     /// order (as returned by `Transaction::txid()`). The FFI layer reverses this
@@ -116,9 +123,20 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     // 2. Real (unsigned) Orchard action indices, in order.
     //    The IoFinalizer self-signs dummy actions at build time via each action's
     //    `dummy_sk`, so their `spend_auth_sig` is Some. Real device spends are left
-    //    unsigned (None) and are the ones CUSTOM-04 fills in.
+    //    unsigned (None) and need a device-provided RedPallas signature.
     let unsigned: Vec<usize> = pczt
         .orchard()
+        .actions()
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.spend().spend_auth_sig().is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    // 2c. Real (unsigned) Ironwood action indices, in order.
+    //     Empty for V5/Orchard or transparent-only PCZTs.
+    let unsigned_ironwood: Vec<usize> = pczt
+        .ironwood()
         .actions()
         .iter()
         .enumerate()
@@ -132,6 +150,13 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
             "Orchard signature count {} != unsigned action count {}",
             inputs.orchard_signatures.len(),
             unsigned.len()
+        )));
+    }
+    if inputs.ironwood_signatures.len() != unsigned_ironwood.len() {
+        return Err(Error::Finalize(format!(
+            "Ironwood signature count {} != unsigned action count {}",
+            inputs.ironwood_signatures.len(),
+            unsigned_ironwood.len()
         )));
     }
     let n_transparent = pczt.transparent().inputs().len();
@@ -155,9 +180,8 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
 
     // 3. Inject Orchard spend-auth signatures.
     //    `apply_orchard_signature` verifies each sig against the action's `rk`
-    //    (orchard-0.14.0/src/pczt/signer.rs:43-54) and rejects invalid ones, so
-    //    a mis-ordered or wrong signature fails closed rather than producing an
-    //    invalid transaction.
+    //    and rejects invalid ones, so a mis-ordered or wrong signature fails
+    //    closed rather than producing an invalid transaction.
     let mut signer =
         Signer::new(pczt).map_err(|e| Error::Finalize(format!("Signer::new: {e:?}")))?;
     for (action_idx, sig_bytes) in unsigned.iter().zip(inputs.orchard_signatures.iter()) {
@@ -167,6 +191,22 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
             .map_err(|e| {
                 Error::Finalize(format!(
                     "apply_orchard_signature(action {action_idx}): {e:?}"
+                ))
+            })?;
+    }
+
+    // 3b. Inject Ironwood spend-auth signatures.
+    //     No-op for V5/Orchard or transparent-only PCZTs where `unsigned_ironwood` is empty.
+    for (action_idx, sig_bytes) in unsigned_ironwood
+        .iter()
+        .zip(inputs.ironwood_signatures.iter())
+    {
+        let sig = redpallas::Signature::<redpallas::SpendAuth>::from(*sig_bytes);
+        signer
+            .apply_ironwood_signature(*action_idx, sig)
+            .map_err(|e| {
+                Error::Finalize(format!(
+                    "apply_ironwood_signature(action {action_idx}): {e:?}"
                 ))
             })?;
     }
@@ -716,6 +756,7 @@ mod tests {
         let out = finalize_transaction(FinalizeInputs {
             pczt_bytes,
             orchard_signatures,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .expect("pure_orchard_finalize: finalize must succeed");
@@ -771,6 +812,7 @@ mod tests {
         let out = finalize_transaction(FinalizeInputs {
             pczt_bytes,
             orchard_signatures,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![transparent_sig],
         })
         .expect("mixed finalize must succeed");
@@ -818,6 +860,7 @@ mod tests {
         let result = finalize_transaction(FinalizeInputs {
             pczt_bytes: pczt_bytes.clone(),
             orchard_signatures: valid_sigs,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         });
         assert!(
@@ -841,6 +884,7 @@ mod tests {
         let err = finalize_transaction(FinalizeInputs {
             pczt_bytes: pczt_bytes.clone(),
             orchard_signatures: bad_sigs,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap_err();
@@ -862,6 +906,7 @@ mod tests {
         let out = finalize_transaction(FinalizeInputs {
             pczt_bytes,
             orchard_signatures: sigs,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap();
@@ -884,6 +929,7 @@ mod tests {
         let err = finalize_transaction(FinalizeInputs {
             pczt_bytes,
             orchard_signatures: vec![],
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap_err();
@@ -905,6 +951,7 @@ mod tests {
         let err = finalize_transaction(FinalizeInputs {
             pczt_bytes,
             orchard_signatures: sigs,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![vec![0u8; 1]],
         })
         .unwrap_err();
@@ -923,6 +970,7 @@ mod tests {
         let err = finalize_transaction(FinalizeInputs {
             pczt_bytes: junk,
             orchard_signatures: vec![],
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap_err();
@@ -951,6 +999,7 @@ mod tests {
         finalize_transaction(FinalizeInputs {
             pczt_bytes: pczt_bytes.clone(),
             orchard_signatures: sigs1,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap();
@@ -961,6 +1010,7 @@ mod tests {
         finalize_transaction(FinalizeInputs {
             pczt_bytes: pczt_bytes.clone(),
             orchard_signatures: sigs2,
+            ironwood_signatures: vec![],
             transparent_signatures: vec![],
         })
         .unwrap();
@@ -1174,6 +1224,350 @@ mod tests {
     /// See the capture procedure documented above this function.
     fn golden_fixture() -> Option<(&'static str, &'static [(&'static str, &'static str)])> {
         None
+    }
+
+    // ── Ironwood finalize tests ───────────────────────────────────────────────
+
+    /// Mainnet NU6.3 activation height + 1 — the first height at which V6
+    /// transactions can be built and an Ironwood bundle is valid.
+    fn nu6_3_height() -> u32 {
+        3_428_143 + 1
+    }
+
+    /// Build a proven Ironwood-only PCZT with a single real spend.
+    ///
+    /// Layout: 1 real Ironwood spend (20 000 zat) → 1 Ironwood recipient output
+    /// (10 000 zat). Fee = 10 000 (2 Ironwood logical actions × 5 000).
+    fn build_ironwood_pczt() -> Vec<u8> {
+        use crate::craft::{
+            build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
+            IronwoodOutputRequest, IronwoodSpendInput,
+        };
+
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let ovk = Some(fvk.to_ovk(Scope::External));
+
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let fee: u64 = 10_000;
+        let spend_value: u64 = 20_000;
+        let out_value: u64 = spend_value - fee;
+
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (anchor, path) = synthetic_anchor_and_path(leaf);
+
+        let inputs = IronwoodBuildInputs {
+            network: zcash_protocol::consensus::Network::MainNetwork,
+            target_height: nu6_3_height(),
+            ironwood_fvk: Some(fvk),
+            ovk,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![IronwoodSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: spend_value,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path: path,
+            }],
+            transparent_inputs: vec![],
+            outputs: vec![IronwoodOutputRequest {
+                destination: IronwoodDestination::Ironwood(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+        build_ironwood_transaction(inputs)
+            .expect("build_ironwood_pczt: build must succeed")
+            .pczt_bytes
+    }
+
+    /// Collect device signatures for all *unsigned* Ironwood actions in a PCZT.
+    fn sign_unsigned_ironwood_actions(
+        pczt_bytes: &[u8],
+        ask: &orchard::keys::SpendAuthorizingKey,
+    ) -> Vec<[u8; 64]> {
+        let pczt = Pczt::parse(pczt_bytes).expect("sign_unsigned_ironwood_actions: parse");
+        let unsigned_indices: Vec<usize> = pczt
+            .ironwood()
+            .actions()
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.spend().spend_auth_sig().is_none())
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut signer =
+            PcztSigner::new(pczt).expect("sign_unsigned_ironwood_actions: Signer::new");
+        for idx in &unsigned_indices {
+            signer
+                .sign_ironwood(*idx, ask)
+                .expect("sign_unsigned_ironwood_actions: sign_ironwood");
+        }
+        let signed_pczt = signer.finish();
+
+        unsigned_indices
+            .iter()
+            .map(|idx| {
+                *signed_pczt.ironwood().actions()[*idx]
+                    .spend()
+                    .spend_auth_sig()
+                    .as_ref()
+                    .expect("spend_auth_sig must be Some after sign_ironwood")
+            })
+            .collect()
+    }
+
+    /// Build a proven mixed PCZT: one real Ironwood spend + one transparent P2PKH input.
+    ///
+    /// Layout:
+    ///   - 1 Ironwood spend (20 000 zat) → device `spendAuthSig` required.
+    ///   - 1 transparent P2PKH input (15 000 zat) → device DER signature required.
+    ///   - 1 Ironwood recipient output (10 000 zat).
+    ///   - Ironwood change (10 000 zat) is added automatically.
+    ///   ZIP-317: Ironwood actions = 2, transparent = 1 → fee = 3 × 5 000 = 15 000.
+    fn build_mixed_ironwood_pczt() -> (Vec<u8>, secp256k1::SecretKey) {
+        use crate::craft::{
+            build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
+            IronwoodOutputRequest, IronwoodSpendInput,
+        };
+        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let ovk = Some(fvk.to_ovk(Scope::External));
+
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let spend_value: u64 = 20_000;
+        let transparent_value: u64 = 15_000;
+        let out_value: u64 = 10_000;
+        let fee: u64 = 15_000;
+
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .unwrap();
+        let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (anchor, path) = synthetic_anchor_and_path(leaf);
+
+        let secp = Secp256k1::new();
+        let t_sk = SecretKey::from_slice(&[0x07u8; 32]).unwrap();
+        let t_pubkey = PublicKey::from_secret_key(&secp, &t_sk).serialize();
+
+        let inputs = IronwoodBuildInputs {
+            network: zcash_protocol::consensus::Network::MainNetwork,
+            target_height: nu6_3_height(),
+            ironwood_fvk: Some(fvk),
+            ovk,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![IronwoodSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: spend_value,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path: path,
+            }],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: t_pubkey,
+                txid: [0x09u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script(pubkey_hash160(&t_pubkey)),
+                value: transparent_value,
+                derivation_scope: 0,
+                derivation_address_index: 0,
+            }],
+            outputs: vec![IronwoodOutputRequest {
+                destination: IronwoodDestination::Ironwood(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+        let pczt_bytes = build_ironwood_transaction(inputs)
+            .expect("build_mixed_ironwood_pczt: build must succeed")
+            .pczt_bytes;
+        (pczt_bytes, t_sk)
+    }
+
+    /// Build → device-sign Ironwood actions → finalize yields a well-formed V6
+    /// transaction that round-trips through `Transaction::read(BranchId::Nu6_3)`.
+    #[test]
+    fn ironwood_only_finalize_produces_valid_v6_tx() {
+        let pczt_bytes = build_ironwood_pczt();
+        let ask = make_ask();
+        let ironwood_signatures = sign_unsigned_ironwood_actions(&pczt_bytes, &ask);
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures,
+            transparent_signatures: vec![],
+        })
+        .expect("ironwood_only_finalize: finalize must succeed");
+
+        assert!(!out.tx_bytes.is_empty(), "tx_bytes must be non-empty");
+        assert_eq!(out.txid.len(), 32, "txid must be 32 bytes");
+
+        let tx = Transaction::read(&out.tx_bytes[..], BranchId::Nu6_3)
+            .expect("Transaction::read must succeed on V6 tx bytes");
+        assert_eq!(
+            *tx.txid().as_ref(),
+            out.txid,
+            "txid from read must match finalize output"
+        );
+        assert!(
+            tx.ironwood_bundle().is_some(),
+            "V6 tx must carry an Ironwood bundle"
+        );
+    }
+
+    /// Mixed Ironwood + transparent finalize: one Ironwood spend + one transparent
+    /// P2PKH input. The result must be a V6 transaction with both bundles and a
+    /// finalized (non-empty) `script_sig` on the transparent input.
+    #[test]
+    fn ironwood_with_transparent_finalize_produces_valid_v6_tx() {
+        let (pczt_bytes, t_sk) = build_mixed_ironwood_pczt();
+        let ask = make_ask();
+        let ironwood_signatures = sign_unsigned_ironwood_actions(&pczt_bytes, &ask);
+        let transparent_sig = valid_transparent_der_signature(&pczt_bytes, 0, &t_sk);
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures,
+            transparent_signatures: vec![transparent_sig],
+        })
+        .expect("mixed ironwood+transparent finalize must succeed");
+
+        assert!(!out.tx_bytes.is_empty(), "tx_bytes must be non-empty");
+        assert_eq!(out.txid.len(), 32, "txid must be 32 bytes");
+
+        let tx = Transaction::read(&out.tx_bytes[..], BranchId::Nu6_3)
+            .expect("Transaction::read must succeed on mixed V6 tx bytes");
+        assert_eq!(
+            *tx.txid().as_ref(),
+            out.txid,
+            "txid from read must match finalize output"
+        );
+        assert!(
+            tx.ironwood_bundle().is_some(),
+            "mixed V6 tx must carry an Ironwood bundle"
+        );
+        let transparent = tx
+            .transparent_bundle()
+            .expect("mixed V6 tx must carry a transparent bundle");
+        assert_eq!(transparent.vin.len(), 1, "exactly one transparent input");
+        assert!(
+            transparent.vin[0].script_sig().serialized_size() > 1,
+            "transparent input must have a finalized (non-empty) script_sig"
+        );
+    }
+
+    /// Providing the wrong number of Ironwood signatures returns `Error::Finalize`.
+    #[test]
+    fn ironwood_signature_count_mismatch_returns_finalize_error() {
+        let pczt_bytes = build_ironwood_pczt();
+        // Pass zero Ironwood sigs when ≥1 real Ironwood spend exists.
+        let err = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures: vec![],
+            transparent_signatures: vec![],
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Finalize(s) if s.contains("Ironwood signature count")),
+            "Ironwood sig count mismatch must produce Error::Finalize, got: {err}"
+        );
+    }
+
+    /// All-zero (invalid) Ironwood signatures are rejected by `apply_ironwood_signature`.
+    #[test]
+    fn invalid_ironwood_signature_rejected() {
+        let pczt_bytes = build_ironwood_pczt();
+        let n = {
+            let pczt = Pczt::parse(&pczt_bytes).unwrap();
+            pczt.ironwood()
+                .actions()
+                .iter()
+                .filter(|a| a.spend().spend_auth_sig().is_none())
+                .count()
+        };
+        let bad_sigs = vec![[0u8; 64]; n];
+        let err = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures: bad_sigs,
+            transparent_signatures: vec![],
+        })
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Finalize(s) if s.contains("apply_ironwood_signature")),
+            "all-zero Ironwood sig must produce Error::Finalize, got: {err}"
+        );
+    }
+
+    /// Regression: pure-Orchard V5 PCZTs finalize unchanged when `ironwood_signatures`
+    /// is explicitly empty — the Ironwood injection path is a no-op for V5 PCZTs.
+    #[test]
+    fn pure_orchard_pczt_unaffected_by_empty_ironwood_signatures() {
+        let pczt_bytes = build_orchard_pczt();
+        let ask = make_ask();
+        let orchard_signatures = sign_unsigned_actions(&pczt_bytes, &ask);
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes: pczt_bytes.clone(),
+            orchard_signatures,
+            ironwood_signatures: vec![],
+            transparent_signatures: vec![],
+        })
+        .expect("V5 path must be unaffected by empty ironwood_signatures");
+
+        assert!(!out.tx_bytes.is_empty());
+        assert_eq!(out.txid.len(), 32);
+
+        let tx = Transaction::read(&out.tx_bytes[..], BranchId::Nu6)
+            .expect("V5 tx must round-trip through Transaction::read");
+        assert_eq!(
+            *tx.txid().as_ref(),
+            out.txid,
+            "txid must match for V5 regression path"
+        );
+        // V5 transaction must not have an Ironwood bundle.
+        assert!(
+            tx.ironwood_bundle().is_none(),
+            "V5 transaction must have no Ironwood bundle"
+        );
     }
 
     #[test]
