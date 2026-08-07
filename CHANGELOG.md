@@ -1,5 +1,92 @@
 # @ledgerhq/zcash-utils
 
+## 2.0.0
+
+### Major Changes
+
+- b555b18: First stable release (1.0.0): end-to-end shielded transaction crafting.
+
+  Since 0.3.1 the addon grew from a scan-only library into a full Orchard send pipeline:
+
+  - V5 PCZT transaction builder supporting Orchard send flows and mixed
+    transparent + Orchard inputs, with bip32 derivation stamped on the change
+    output and every transparent input
+  - `buildTransaction`, `finalizeTransaction`, and `broadcastTransaction` to
+    build, finalize, and submit a shielded transaction
+  - `parsePczt(pcztHex)` to decode canonical PCZT bytes into a structured
+    `PcztTransaction` consumed by `@ledgerhq/device-signer-kit-zcash`
+  - On-demand Orchard ShardTree witness computation at craft time
+  - `findBlockHeight(grpcUrl, timestamp)` binary search over block timestamps
+  - NU6.2-aware crate versions for correct branch-id resolution and shielded
+    parsing at/above the NU6.2 activation height
+
+### Minor Changes
+
+- 65c6a95: Report the transparent bundle of a scanned transaction on `ShieldedTransaction`, via two new fields: `transparentOut` (sum of the transparent outputs, in zatoshis) and `hasTransparentInputs`.
+
+  A shielded→transparent send leaves no decrypted output a wallet can attribute to a counterparty: the value exits through the transparent bundle and only the change comes back, marked `internal`. Consumers therefore saw such a send as a self-transfer moving nothing. The scanner already deserializes the full transaction to compute the fee, so it can report these two facts directly instead of having each consumer re-parse the raw hex. `hasTransparentInputs` is needed alongside the amount: once transparent inputs are present, the transparent outputs may be paid by those inputs rather than out of the shielded pools, and the bundle alone cannot tell the two apart.
+
+- 3f2ea9c: Add `findBlockHeight(grpcUrl, timestamp)` — binary search over block timestamps via gRPC
+
+  - New Rust function `find_block_height` in `zcash-sync` using interpolation search + streaming `GetBlockRange` for fast convergence (~6 RPCs, under 1.5s on mainnet)
+  - Exposed via NAPI as `findBlockHeight(grpcUrl: string, timestamp: number): Promise<number>`
+  - New CLI subcommand `height-at --grpc-url <URL> --date <YYYY-MM-DD|timestamp>`
+  - Returns the height of the first block whose timestamp is ≥ the target
+
+- 01420fd: Add an optional `ironwoodSignatures` field to `FinalizeTransactionParams` to support finalizing V6 Ironwood PCZTs, and widen `finalizeTransaction` to return a V5 (ZIP-225) or V6 (ZIP-230) transaction depending on the input PCZT's shielded bundle. `FinalizeInputs` now accepts per-spend Ironwood `spendAuthSig` bytes injected via `apply_ironwood_signature`.
+
+  The new field is optional, so existing callers that pass only `orchardSignatures` and `transparentSignatures` keep working unchanged — hence a minor rather than a major bump. Each signature list is length-checked against the PCZT's unsigned actions for its pool, so supplying signatures for a pool the PCZT does not spend fails closed.
+
+  Crate dependencies bumped to `pczt 0.9.2`, `zcash_primitives 0.30`, `zcash_transparent 0.10`, `zcash_keys 0.16`, and `zcash_client_backend 0.24.0-rc.7`.
+
+- b7f7d36: Sync the Ironwood (NU6.3) shielded pool in parallel to Orchard. Detect, trial-decrypt, and fully decrypt Ironwood notes (ZIP 2005 `0x03` note plaintext) from the Ironwood bundle of V6 transactions, expose them via a new `ironwoodNotes` array on `ShieldedTransaction` and a per-note `pool` discriminator, derive their position from the Ironwood commitment-tree-size counter, track spends against the Ironwood nullifier set, and compute ShardTree witnesses for the Ironwood tree. Existing Orchard/Sapling sync and the Orchard send path are unchanged. Bumps the Zcash crates to NU6.3-aware versions (orchard 0.15, zcash_primitives 0.29, zcash_protocol 0.10, and the wallet-side crates from crates.io release candidates: `zcash_client_backend 0.24.0-rc.1`, `pczt 0.8.0-rc.1`).
+- 485d063: Add spending fields to ShieldedNote (nullifier, rseed, cmx, position, recipient, is_spent) to support shielded transaction crafting via PCZT. Position is derived from CompactBlock chain_metadata, is_spent is computed by nullifier matching across the scanned range.
+- b8635d1: Expose the default unified receiving address (ZIP-316, `u1...` / `utest1...`) from key derivation. `DerivedKeys` gains a `unified_address` field, and `ledger-zcash-cli derive` now prints it alongside the UFVK in both `human` and `json` output. Derived purely from the UFVK (watch-only, no spending key involved) and independent of `--no-sapling`, since that flag only controls what's bundled into the encoded UFVK string, not the address's receiver set.
+- 0d19606: Add `orchardAddressFromUfvk` — derives the Orchard-only unified address from an encoded UFVK string. Returns the same address the Ledger device shows on the Receive screen (matches `GetShieldedAddress` INS 0x51). Also renames `DerivedKeys.unifiedAddress` to `multiReceiverUnifiedAddress` to distinguish it from the Orchard-only address.
+- 41a83b8: Add `finalizeTransaction` and `broadcastTransaction` NAPI functions for the Orchard send flow.
+- 400dbb5: Add `buildTransaction` NAPI function for Orchard send flows.
+- c16921d: Add `parsePczt(pcztHex)` — decode canonical PCZT bytes into a structured `PcztTransaction`
+
+  - New Rust function `parse_pczt` in `zcash-crypto` that parses the canonical PCZT bytes emitted by `buildTransaction` (`PCZT` magic + u32 LE version + postcard payload) and re-shapes them into a fully structured form: the global header, every transparent input/output, and each Orchard action broken out field-by-field
+  - Exposed via NAPI as `parsePczt(pcztHex: string): PcztTransaction`, matching the object `@ledgerhq/device-signer-kit-zcash`'s `DmkSignerZcash.signPcztTransaction` consumes (`Uint8Array` byte fields, `bigint` zatoshi values, `signingPath` derivation strings)
+  - Bridges `buildTransaction` (returns `pcztHex`) to the device signer without a TypeScript postcard parser
+  - Fails with a clear error when the input is not a valid PCZT or is missing a field the device requires to sign (e.g. Orchard `alpha`/`rcv`, an input's single `bip32_derivation`)
+
+- adb99fb: Add on-demand Orchard ShardTree witness computation.
+
+  Public surface:
+
+  - `zcash_crypto::tree::{build_witnesses, WitnessInputs, WitnessOutput, ShardLeaves}`
+  - `zcash_sync::witness::{compute_witnesses, WitnessRequest, NoteRef}`
+
+  Witness data is fetched and assembled on demand at craft time. No tree state
+  is persisted between calls.
+
+- 68d013b: Add `buildIronwoodTransaction` for the Ironwood (NU6.3) shielded pool: builds, proves, and serializes an unsigned V6 PCZT carrying an Ironwood bundle (spends and/or outputs), reusing the existing Orchard V5 crafting lifecycle against the updated Action circuit. Ironwood outputs use the `0x03` quantum-recoverable note plaintext, the emitted PCZT is redacted and serialized in the v2 wire format (required for any V6 transaction), and a dedicated non-zero-anchor check rejects an all-zero Ironwood commitment-tree root before it can be silently embedded. Anchor/witness resolution reuses the existing Ironwood sync path (`fetchIronwoodAnchor` / Ironwood witness computation). The shipped Orchard V5 send flow (`buildTransaction`) is unchanged. Like the V5 builder, this is device-coupled (not exposed via the CLI) and depends on release-candidate wallet-side crates (`pczt`, `zcash_client_backend`) pending stable NU6.3 releases.
+- 65c6a95: Add `transactionDetails`, which fetches transactions by txid and reads from each what only the raw bytes hold: the fee it actually paid, and the addresses its shielded outputs paid.
+
+  Both answers require the whole transaction, so one fetch serves both. A fee derived from the transparent bundle alone — all an explorer can do — counts value entering a shielded pool as fee and cannot account for value leaving one. Shielded payees are encrypted and recoverable only by the account that created the outputs, through the outgoing viewing key the transaction was built with; pass `ufvk` to recover them.
+
+  Requests are pipelined over a single gRPC channel and answered in order. A transaction that cannot be fetched, parsed, or fully priced yields a `null` fee and no payees rather than an approximation.
+
+  Orchard-family and Sapling notes now also carry the address they pay (`recipient`), which for a note we sent is the payee rather than one of our own addresses.
+
+- e07bc98: Add transparent input support to the V5 PCZT builder.
+
+### Patch Changes
+
+- 4776701: Bump version to deploy new release
+- 0c6f624: Update Zcash crates to NU6.2-aware versions (orchard 0.14, zcash_primitives 0.28, zcash_protocol 0.9, and transitive deps). Restores correct branch-id resolution and shielded-transaction parsing for blocks at or above the NU6.2 activation height (mainnet 3,364,600).
+- b949c30: Keep the transparent and Orchard send paths working past NU6.3. Three things change under `build_transaction` at that activation even though the code did not: the builder derives V6 from the consensus branch, which the PCZT v1 device contract cannot encode, so the V5 format is now pinned explicitly; an Orchard bundle becomes `orchard_v3` in that epoch and only proves against the NU6.3 circuit generation, so the proving and verifying keys are selected from the branch instead of being fixed to the NU6.2 generation; and the Orchard pool disables cross-address transfers, so retained value is added through the builder's change API, which is what makes z→t build again.
+
+  Also fetch an anchor from the commitment-tree frontier alone. A shielded bundle with outputs but no real spend needs an anchor and no witness, and the frontier determines the root, so shielding no longer streams every completed shard root — and no longer depends on the server serving that pool's `GetSubtreeRoots`, which Ironwood does not yet.
+
+- 6e5e9b0: Bump the librustzcash crate set to NU6.3-aware versions (zcash_protocol 0.10, zcash_primitives 0.29, and the compatible zcash_keys/zcash_address/zcash_transparent/orchard set, plus zcash_client_backend and pczt release candidates). This corrects `BranchId::for_height`, which resolves `Nu6_3` at mainnet height 3,428,143, so transactions parse and build correctly after NU6.3 activation. No public API change.
+- 9ccce21: Route surplus change to the pool that funds it: an Orchard change output only when the transaction has Orchard spends (z→z, z→t), a transparent change output when there are none (t→t, t→z). For t→z this keeps the change transparent instead of migrating the whole balance into the shielded pool — only the sent amount is shielded.
+- b1766c6: Add new retryable error for "h2 protocol error"
+- 936b971: Emission happens AFTER Phase 5 so that `is_spent` flags are correct.
+- 50e74c7: Decrease bundle size
+
 ## 1.0.4
 
 ### Minor Changes
