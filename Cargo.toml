@@ -68,8 +68,9 @@ shardtree             = "0.6"
 # Partially Created Zcash Transaction format (wire format + role helpers).
 # Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
 # (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
-# 0.9.2 is a stable release (2026-07-23) that adds Ironwood extraction support
-# (`Signer::apply_ironwood_signature`, dual binding-signature via `TransactionExtractor`).
+# 0.9.2 is a stable release (published 2026-08-04) carrying the Ironwood extraction
+# support that landed in 0.8.0 stable (2026-07-24): `Signer::apply_ironwood_signature`
+# plus the dual binding signature applied via `TransactionExtractor`.
 pczt = { version = "=0.9.2", default-features = false, features = [
     "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
     "signer", "tx-extractor", "spend-finalizer",

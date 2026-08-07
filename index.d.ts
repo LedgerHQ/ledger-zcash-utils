@@ -361,15 +361,20 @@ export interface FinalizeTransactionParams {
   orchardSignatures: Array<string>
   /**
    * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Ironwood spend,
-   * in PCZT-action order over the unsigned actions. Empty for V5/Orchard PCZTs.
+   * in PCZT-action order over the unsigned actions. Optional: omit it (or pass
+   * an empty array) for V5/Orchard and transparent-only PCZTs, which is why
+   * adding it did not break existing callers.
    */
-  ironwoodSignatures: Array<string>
+  ironwoodSignatures?: Array<string>
   /** One DER-hex secp256k1 signature per transparent input (empty for pure shielded). */
   transparentSignatures: Array<string>
 }
 /** Result of a successful `finalizeTransaction` call. */
 export interface FinalizeTransactionResult {
-  /** Hex-encoded signed transaction bytes (ready for `broadcastTransaction`). */
+  /**
+   * Hex-encoded signed transaction bytes (ready for `broadcastTransaction`).
+   * V5 (ZIP-225) or V6 (ZIP-230), depending on the input PCZT's shielded bundle.
+   */
   txHex: string
   /**
    * 64-char hex transaction id, big-endian *display* order (matches the sync
@@ -382,8 +387,13 @@ export interface FinalizeTransactionResult {
  *
  * Accepts the PCZT from `buildTransaction` or `buildIronwoodTransaction`, one
  * 64-byte RedPallas signature per real (unsigned) Orchard or Ironwood action
- * (supply the appropriate list; the other stays empty), and one DER secp256k1
- * signature per transparent input. The binding signature is computed host-side.
+ * (supply the list matching the PCZT's shielded bundle; the other may be empty
+ * or omitted), and one DER secp256k1 signature per transparent input. The
+ * binding signature is computed host-side.
+ *
+ * Each list is length-checked against the PCZT's unsigned actions for that pool,
+ * so passing signatures for a pool the PCZT does not spend fails closed rather
+ * than being silently ignored.
  *
  * CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
  * to `tokio::task::spawn_blocking` so the async executor is not starved.

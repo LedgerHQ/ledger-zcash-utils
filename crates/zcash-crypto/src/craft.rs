@@ -106,7 +106,7 @@ use pczt::{
 };
 use rand::rngs::OsRng;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, BundlePadding, Builder},
+    builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317::{FeeError as Zip317FeeError, FeeRule},
     TxVersion,
 };
@@ -1504,16 +1504,26 @@ fn zip317_fee_ironwood(
 }
 
 /// Applies a representative upstream HW-signer PCZT redaction before v2
-/// emission. Mirrors (without literally calling — `zcash_client_backend`'s
-/// `redact_pczt_for_batch_signer` is not yet published for NU6.3, see the
-/// implementation plan's "Repo-specific pitfalls") the semantics of
-/// librustzcash PRs #2555 (memo-plaintext / ciphertext resolution), #2557
-/// (redact `cv_net`), and #2593 (optional Orchard `cmx`):
+/// emission. Mirrors — without literally calling — the semantics of librustzcash
+/// PRs #2555 (memo-plaintext / ciphertext resolution), #2557 (redact `cv_net`),
+/// and #2593 (optional Orchard `cmx`).
+///
+/// Why not call `zcash_client_backend::data_api::wallet::redact_pczt_for_batch_signer`
+/// directly: it *is* available (`zcash_client_backend 0.24.0-rc.7`) and does strip
+/// `spend_fvk` symmetrically from both the Orchard and Ironwood bundles. But its own
+/// documentation states that its output "cannot be signed with the high level
+/// `pczt::roles::signer::Signer` because that role expects full viewing keys" — it
+/// targets a remote *batch signer* that derives the FVK independently. Our finalize
+/// step deliberately uses that high-level `Signer` role (for its nullifier-consistency
+/// check), so we keep the FVK on the Ironwood bundle; see the per-bundle notes below
+/// and `finalize::finalize_transaction`.
 ///   - both bundles: drop each action's `cv_net` (recomputed from the spend
-///     and output values plus `rcv`) and the spend's full viewing key
-///     (superseded by the `zip32_derivation` already stamped on every
-///     action); resolve `enc_ciphertext` down to its memo plaintext where
-///     decryptable.
+///     and output values plus `rcv`); resolve `enc_ciphertext` down to its
+///     memo plaintext where decryptable.
+///   - the spend's full viewing key is dropped from the **Orchard** bundle only
+///     (superseded there by the `zip32_derivation` stamped on every action). It
+///     is deliberately **retained on the Ironwood** bundle — see the inline note
+///     in the Ironwood closure for the hard requirement that forces this.
 ///   - the classic Orchard bundle only: also drop `cmx` (#2593) — the
 ///     receiver recomputes it from the output fields and the spend
 ///     nullifier. Always a no-op here (this builder never carries Orchard
@@ -1543,11 +1553,24 @@ fn apply_v6_redaction(pczt: Pczt) -> Pczt {
         .redact_ironwood_with(|mut r| {
             r.redact_actions(|mut a| {
                 a.clear_cv_net();
-                // The FVK is intentionally retained for Ironwood spends so the
-                // PCZT Signer role can validate the nullifier before injecting
-                // the device-provided `spendAuthSig` via `apply_ironwood_signature`.
-                // This is consistent with the V5 Orchard flow which never strips
-                // the FVK from real spend actions.
+                // The FVK is deliberately retained on Ironwood spends: it is a hard
+                // requirement of the high-level PCZT Signer role we use at finalize
+                // time, not a preference. `Signer::apply_ironwood_signature` routes
+                // through `verify_nullifier(None)`, whose `fvk_for_validation` returns
+                // `MissingFullViewingKey` when neither an expected FVK nor the wire
+                // `fvk` is present — an error that role does not tolerate. Clearing it
+                // here would make every real Ironwood spend fail to finalize.
+                //
+                // Alternative, deliberately not taken: `pczt::roles::low_level_signer`
+                // skips FVK derivation entirely and would let us strip it, at the cost
+                // of the nullifier-consistency check and a separate host-side
+                // `Verifier` pass over the pre-redaction PCZT.
+                //
+                // Exposure: this PCZT travels only from the host to the user's own
+                // Ledger device, which already holds the spend authority; the host
+                // already holds this account's UFVK to sync it at all. No third party
+                // sees these bytes, so this is not the remote-batch-signer threat model
+                // that upstream's redaction guards against.
                 a.replace_enc_ciphertext_with_decrypted_memo_plaintext(NoteVersion::V3);
             });
         })

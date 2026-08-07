@@ -1,14 +1,16 @@
-//! Inject device signatures into a PCZT and extract the final signed V5 transaction.
+//! Inject device signatures into a PCZT and extract the final signed transaction —
+//! V5 (ZIP-225) or V6 (ZIP-230), depending on the PCZT's shielded bundle.
 //!
-//! Consumes the canonical PCZT bytes produced by `craft::build_transaction`
-//! (`pczt::Pczt::serialize()`), which has already been run through the
-//! Creator → IoFinalizer → Prover roles. The IoFinalizer self-signed every
-//! dummy Orchard action, so only the *real* spend actions (those whose
-//! `spend_auth_sig` is `None`) need a device-provided RedPallas signature.
+//! Consumes the canonical PCZT bytes produced by `craft::build_transaction` (V5 /
+//! Orchard) or `craft::build_ironwood_transaction` (V6 / Ironwood), which has
+//! already been run through the Creator → IoFinalizer → Prover roles. The
+//! IoFinalizer self-signed every dummy action in both pools, so only the *real*
+//! spend actions (those whose `spend_auth_sig` is `None`) need a device-provided
+//! RedPallas signature.
 //!
 //! Pipeline:
 //!   1. `Pczt::parse(bytes)`.
-//!   2. Identify the unsigned Orchard action indices (real spends).
+//!   2. Identify the unsigned Orchard and Ironwood action indices (real spends).
 //!      2b. If there are transparent inputs, stamp each input's `hash160_preimage`
 //!      with its controlling pubkey (taken from the `bip32_derivation` the craft
 //!      step recorded). `append_transparent_signature` and `SpendFinalizer` need
@@ -105,12 +107,13 @@ fn verifying_key_for(consensus_branch_id: u32) -> &'static VerifyingKey {
     }
 }
 
-/// Inject device signatures into a proven PCZT and extract the final V5 transaction.
+/// Inject device signatures into a proven PCZT and extract the final transaction —
+/// V5 (ZIP-225) or V6 (ZIP-230), depending on which shielded bundle the PCZT carries.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Finalize`] if the PCZT is malformed, any signature is rejected,
-/// the Orchard proof verification fails, or serialization fails.
+/// the shielded proof verification fails, or serialization fails.
 pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Error> {
     // 1. Parse PCZT.
     let pczt = Pczt::parse(&inputs.pczt_bytes)
@@ -180,8 +183,9 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
 
     // 3. Inject Orchard spend-auth signatures.
     //    `apply_orchard_signature` verifies each sig against the action's `rk`
-    //    and rejects invalid ones, so a mis-ordered or wrong signature fails
-    //    closed rather than producing an invalid transaction.
+    //    (orchard-0.15.5/src/pczt/signer.rs:47, returning
+    //    `SignerError::InvalidExternalSignature` on mismatch), so a mis-ordered or
+    //    wrong signature fails closed rather than producing an invalid transaction.
     let mut signer =
         Signer::new(pczt).map_err(|e| Error::Finalize(format!("Signer::new: {e:?}")))?;
     for (action_idx, sig_bytes) in unsigned.iter().zip(inputs.orchard_signatures.iter()) {
@@ -234,16 +238,23 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     };
 
     // 7. Extract the final transaction.
-    //    `TransactionExtractor::extract` applies the Orchard binding signature
-    //    host-side (pczt-0.7.0/src/roles/tx_extractor/mod.rs:103-110) and
-    //    verifies the Halo 2 proof. The VerifyingKey OnceLock means only the
-    //    first call pays the multi-second build cost.
+    //    `TransactionExtractor::extract` applies the binding signature host-side
+    //    and verifies the Halo 2 proof, for whichever shielded bundle is present:
+    //    it runs `orchard::verify_bundle` over both `orchard_bundle()` and
+    //    `ironwood_bundle()` against the *same* verifying key
+    //    (pczt-0.9.2/src/roles/tx_extractor/mod.rs:132-139), and
+    //    `TransactionData::try_map_bundles` applies the same binding-signature
+    //    closure to both pools (zcash_primitives-0.30.0/src/transaction/mod.rs:616-617)
+    //    — Ironwood is represented with the Orchard bundle type and shares its
+    //    circuit, so no Ironwood-specific verifying key exists or is needed.
+    //    The VerifyingKey OnceLock means only the first call pays the
+    //    multi-second build cost.
     let tx = TransactionExtractor::new(pczt)
         .with_orchard(verifying_key_for(consensus_branch_id))
         .extract()
         .map_err(|e| Error::Finalize(format!("TransactionExtractor: {e:?}")))?;
 
-    // 8. Serialize (ZIP-225 V5) + compute txid.
+    // 8. Serialize (ZIP-225 V5 or ZIP-230 V6) + compute txid.
     let mut tx_bytes = Vec::new();
     tx.write(&mut tx_bytes)
         .map_err(|e| Error::Finalize(format!("tx serialize: {e}")))?;
@@ -331,6 +342,26 @@ fn stamp_transparent_hash160_preimages(pczt: Pczt) -> Result<Pczt, Error> {
     }
 
     Ok(updated.finish())
+}
+
+/// Decode one hex-encoded 64-byte RedPallas `spendAuthSig` as the FFI layer receives
+/// it (128 hex chars → 64 bytes).
+///
+/// Lives here rather than in `zcash-ffi-node` so it is actually unit-testable: that
+/// crate is `crate-type = ["cdylib"]` with `test = false` (its napi symbols are
+/// resolved by the Node host at runtime, so a standalone test binary cannot link),
+/// which means any `#[cfg(test)]` module inside it never runs.
+///
+/// # Errors
+///
+/// Returns the message *tail* describing the failure — `"hex decode: …"` or
+/// `"must be 64 bytes (got N bytes)"`. The caller prefixes the field name and index
+/// (e.g. `ironwood_signatures[2]`) so one helper serves both signature lists.
+pub fn parse_spend_auth_sig_hex(s: &str) -> Result<[u8; 64], String> {
+    let v = hex::decode(s).map_err(|e| format!("hex decode: {e}"))?;
+    let got = v.len();
+    v.try_into()
+        .map_err(|_: Vec<u8>| format!("must be 64 bytes (got {got} bytes)"))
 }
 
 /// Parse a Ledger-produced transparent ECDSA signature into a libsecp256k1
@@ -1060,6 +1091,75 @@ mod tests {
         ));
     }
 
+    // ── parse_spend_auth_sig_hex tests ────────────────────────────────────────
+    //
+    // These cover the FFI layer's signature-decode branches for *both* the Orchard
+    // and Ironwood lists. They live here because `zcash-ffi-node` is a napi cdylib
+    // with `test = false`, so a test placed next to the binding never runs.
+
+    /// A well-formed 128-hex-char signature decodes to the 64 raw bytes.
+    #[test]
+    fn parse_spend_auth_sig_hex_accepts_64_bytes() {
+        let mut expected = [0u8; 64];
+        for (i, b) in expected.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let decoded = parse_spend_auth_sig_hex(&hex::encode(expected))
+            .expect("128 hex chars must decode to 64 bytes");
+        assert_eq!(decoded, expected, "decoded bytes must round-trip the input");
+    }
+
+    /// Uppercase hex is accepted (the FFI contract does not mandate a case).
+    #[test]
+    fn parse_spend_auth_sig_hex_accepts_uppercase() {
+        let sig = [0xabu8; 64];
+        let decoded =
+            parse_spend_auth_sig_hex(&hex::encode_upper(sig)).expect("uppercase hex must decode");
+        assert_eq!(decoded, sig);
+    }
+
+    /// A non-hex character yields the `hex decode` message tail the FFI layer
+    /// prefixes with the field name and index.
+    #[test]
+    fn parse_spend_auth_sig_hex_rejects_non_hex() {
+        let err =
+            parse_spend_auth_sig_hex(&"zz".repeat(64)).expect_err("non-hex input must be rejected");
+        assert!(
+            err.starts_with("hex decode:"),
+            "expected a `hex decode:` tail, got: {err}"
+        );
+    }
+
+    /// Valid hex of the wrong length is rejected, and the message reports the actual
+    /// byte count so a caller can see how far off it was.
+    #[test]
+    fn parse_spend_auth_sig_hex_rejects_wrong_length() {
+        // 32 bytes instead of 64.
+        let err = parse_spend_auth_sig_hex(&hex::encode([0u8; 32]))
+            .expect_err("a 32-byte signature must be rejected");
+        assert_eq!(err, "must be 64 bytes (got 32 bytes)");
+
+        // 65 bytes: one too many.
+        let err = parse_spend_auth_sig_hex(&hex::encode([0u8; 65]))
+            .expect_err("a 65-byte signature must be rejected");
+        assert_eq!(err, "must be 64 bytes (got 65 bytes)");
+
+        // Empty string decodes to zero bytes rather than erroring on hex.
+        let err = parse_spend_auth_sig_hex("").expect_err("an empty signature must be rejected");
+        assert_eq!(err, "must be 64 bytes (got 0 bytes)");
+    }
+
+    /// An odd number of hex digits fails on the hex decode, not the length check.
+    #[test]
+    fn parse_spend_auth_sig_hex_odd_length_fails_as_hex_error() {
+        let err = parse_spend_auth_sig_hex(&"a".repeat(127))
+            .expect_err("odd-length hex must be rejected");
+        assert!(
+            err.starts_with("hex decode:"),
+            "odd-length input must fail hex decoding, got: {err}"
+        );
+    }
+
     // ── parse_transparent_der tests ───────────────────────────────────────────
 
     /// A standard DER signature (no Ledger modifications) round-trips correctly.
@@ -1230,8 +1330,15 @@ mod tests {
 
     /// Mainnet NU6.3 activation height + 1 — the first height at which V6
     /// transactions can be built and an Ironwood bundle is valid.
+    ///
+    /// Read from `zcash_protocol`'s network parameters rather than hardcoded, so it
+    /// tracks the crate rather than needing a manual edit if the height ever moves.
     fn nu6_3_height() -> u32 {
-        3_428_143 + 1
+        use zcash_protocol::consensus::{Network, NetworkUpgrade, Parameters};
+        let height = Network::MainNetwork
+            .activation_height(NetworkUpgrade::Nu6_3)
+            .expect("mainnet must define an NU6.3 activation height");
+        u32::from(height) + 1
     }
 
     /// Build a proven Ironwood-only PCZT with a single real spend.
@@ -1250,7 +1357,9 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
-        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
         let fee: u64 = 10_000;
         let spend_value: u64 = 20_000;
         let out_value: u64 = spend_value - fee;
@@ -1342,7 +1451,8 @@ mod tests {
     ///   - 1 transparent P2PKH input (15 000 zat) → device DER signature required.
     ///   - 1 Ironwood recipient output (10 000 zat).
     ///   - Ironwood change (10 000 zat) is added automatically.
-    ///   ZIP-317: Ironwood actions = 2, transparent = 1 → fee = 3 × 5 000 = 15 000.
+    ///
+    /// ZIP-317: Ironwood actions = 2, transparent = 1 → fee = 3 × 5 000 = 15 000.
     fn build_mixed_ironwood_pczt() -> (Vec<u8>, secp256k1::SecretKey) {
         use crate::craft::{
             build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
@@ -1356,7 +1466,9 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
-        let rseed = RandomSeed::from_bytes([0xab; 32], &rho).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
         let spend_value: u64 = 20_000;
         let transparent_value: u64 = 15_000;
         let out_value: u64 = 10_000;
