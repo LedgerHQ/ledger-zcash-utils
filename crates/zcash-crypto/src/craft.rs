@@ -1517,13 +1517,31 @@ fn zip317_fee_ironwood(
 /// step deliberately uses that high-level `Signer` role (for its nullifier-consistency
 /// check), so we keep the FVK on the Ironwood bundle; see the per-bundle notes below
 /// and `finalize::finalize_transaction`.
+///
+/// Why not its sibling `redact_pczt_for_signer(pczt, SignerView)` either — which *does*
+/// retain full viewing keys, and whose docs name hardware signers as its target: both
+/// upstream helpers return a throwaway *view* and require the caller to "retain `pczt`
+/// and combine the Signer's contribution into that authoritative copy". We have no
+/// second copy — the redacted PCZT emitted here *is* the authoritative one: it is both
+/// what is streamed to the device and what `finalize::finalize_transaction` later
+/// parses, signs and extracts. `SignerView::Compact` additionally clears `zkproof`,
+/// `bsk` and (for V6) the bundle anchor, all of which extraction still needs, and
+/// `SignerView::Full` redacts a different field set than the one below. Hence a local
+/// redactor rather than either upstream helper.
 ///   - both bundles: drop each action's `cv_net` (recomputed from the spend
 ///     and output values plus `rcv`); resolve `enc_ciphertext` down to its
 ///     memo plaintext where decryptable.
-///   - the spend's full viewing key is dropped from the **Orchard** bundle only
-///     (superseded there by the `zip32_derivation` stamped on every action). It
-///     is deliberately **retained on the Ironwood** bundle — see the inline note
-///     in the Ironwood closure for the hard requirement that forces this.
+///   - the spend's full viewing key is dropped from the **Orchard** bundle only,
+///     and is deliberately **retained on the Ironwood** bundle — see the inline
+///     note in the Ironwood closure for the hard requirement that forces this.
+///     The asymmetry is *not* because `zip32_derivation` supersedes the FVK on the
+///     Orchard side: `fvk_for_validation` never consults it, and the Orchard signer
+///     path (`Signer::apply_orchard_signature`) is symmetric with the Ironwood one,
+///     so it would fail identically. Dropping it is safe here only because this
+///     builder never emits real Orchard actions — the sole caller is
+///     `build_ironwood_transaction`, whose `orchard_anchor` is always `None`. A
+///     future co-present Orchard bundle (e.g. the ZIP 2006 winddown / same-receiver
+///     path noted above) must retain the FVK on that bundle too.
 ///   - the classic Orchard bundle only: also drop `cmx` (#2593) — the
 ///     receiver recomputes it from the output fields and the spend
 ///     nullifier. Always a no-op here (this builder never carries Orchard
