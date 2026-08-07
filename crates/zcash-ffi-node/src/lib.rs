@@ -624,12 +624,18 @@ pub async fn build_ironwood_transaction(
 /// Parameters for finalizing a PCZT with device-provided signatures.
 #[napi(object)]
 pub struct FinalizeTransactionParams {
-    /// Hex-encoded canonical PCZT bytes from `buildTransaction`.
+    /// Hex-encoded canonical PCZT bytes from `buildTransaction` or
+    /// `buildIronwoodTransaction`.
     pub pczt: String,
     /// One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
-    /// in PCZT-action order over the unsigned actions.
+    /// in PCZT-action order over the unsigned actions. Empty for V6/Ironwood PCZTs.
     pub orchard_signatures: Vec<String>,
-    /// One DER-hex secp256k1 signature per transparent input (empty for pure Orchard).
+    /// One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Ironwood spend,
+    /// in PCZT-action order over the unsigned actions. Optional: omit it (or pass
+    /// an empty array) for V5/Orchard and transparent-only PCZTs, which is why
+    /// adding it did not break existing callers.
+    pub ironwood_signatures: Option<Vec<String>>,
+    /// One DER-hex secp256k1 signature per transparent input (empty for pure shielded).
     pub transparent_signatures: Vec<String>,
 }
 
@@ -637,18 +643,25 @@ pub struct FinalizeTransactionParams {
 #[napi(object)]
 #[derive(Debug)]
 pub struct FinalizeTransactionResult {
-    /// Hex-encoded signed V5 transaction bytes (ready for `broadcastTransaction`).
+    /// Hex-encoded signed transaction bytes (ready for `broadcastTransaction`).
+    /// V5 (ZIP-225) or V6 (ZIP-230), depending on the input PCZT's shielded bundle.
     pub tx_hex: String,
     /// 64-char hex transaction id, big-endian *display* order (matches the sync
     /// path's `ShieldedTransaction.txid` and the Ledger Live operation hash).
     pub txid: String,
 }
 
-/// Inject device signatures into a PCZT and extract the final signed V5 transaction.
+/// Inject device signatures into a PCZT and extract the final signed transaction.
 ///
-/// Accepts the PCZT from `buildTransaction`, one 64-byte RedPallas signature per
-/// real (unsigned) Orchard action, and one DER secp256k1 signature per transparent
-/// input. The Orchard binding signature is computed host-side.
+/// Accepts the PCZT from `buildTransaction` or `buildIronwoodTransaction`, one
+/// 64-byte RedPallas signature per real (unsigned) Orchard or Ironwood action
+/// (supply the list matching the PCZT's shielded bundle; the other may be empty
+/// or omitted), and one DER secp256k1 signature per transparent input. The
+/// binding signature is computed host-side.
+///
+/// Each list is length-checked against the PCZT's unsigned actions for that pool,
+/// so passing signatures for a pool the PCZT does not spend fails closed rather
+/// than being silently ignored.
 ///
 /// CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
 /// to `tokio::task::spawn_blocking` so the async executor is not starved.
@@ -660,20 +673,28 @@ pub async fn finalize_transaction(
     let pczt_bytes = hex::decode(&params.pczt)
         .map_err(|e| napi::Error::from_reason(format!("pczt hex decode: {e}")))?;
 
-    // Decode each Orchard signature (128 hex chars → 64 bytes).
+    // Decode each Orchard signature (128 hex chars → 64 bytes). The decode itself
+    // lives in `zcash-crypto` so it is unit-testable (this crate has `test = false`).
     let orchard_signatures: Vec<[u8; 64]> = params
         .orchard_signatures
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let v = hex::decode(s).map_err(|e| {
-                napi::Error::from_reason(format!("orchard_signatures[{i}] hex decode: {e}"))
-            })?;
-            v.try_into().map_err(|got: Vec<u8>| {
-                napi::Error::from_reason(format!(
-                    "orchard_signatures[{i}] must be 64 bytes (got {} bytes)",
-                    got.len()
-                ))
+            zcash_crypto::finalize::parse_spend_auth_sig_hex(s)
+                .map_err(|tail| napi::Error::from_reason(format!("orchard_signatures[{i}] {tail}")))
+        })
+        .collect::<napi::Result<_>>()?;
+
+    // Decode each Ironwood signature (128 hex chars → 64 bytes). An omitted field
+    // is treated as "no Ironwood spends", the same as an empty array.
+    let ironwood_signatures: Vec<[u8; 64]> = params
+        .ironwood_signatures
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            zcash_crypto::finalize::parse_spend_auth_sig_hex(s).map_err(|tail| {
+                napi::Error::from_reason(format!("ironwood_signatures[{i}] {tail}"))
             })
         })
         .collect::<napi::Result<_>>()?;
@@ -697,6 +718,7 @@ pub async fn finalize_transaction(
         zcash_crypto::finalize::finalize_transaction(zcash_crypto::finalize::FinalizeInputs {
             pczt_bytes,
             orchard_signatures,
+            ironwood_signatures,
             transparent_signatures,
         })
     })
@@ -1366,6 +1388,8 @@ mod tests {
         let params = FinalizeTransactionParams {
             pczt: "not valid hex @@@@".to_string(),
             orchard_signatures: vec![],
+            // Omitted entirely — the V5/transparent-only caller shape.
+            ironwood_signatures: None,
             transparent_signatures: vec![],
         };
         let err = finalize_transaction(params).await.unwrap_err();
@@ -1381,6 +1405,7 @@ mod tests {
         let params = FinalizeTransactionParams {
             pczt: hex::encode(b"definitely not a pczt"),
             orchard_signatures: vec![],
+            ironwood_signatures: Some(vec![]),
             transparent_signatures: vec![],
         };
         let err = finalize_transaction(params).await.unwrap_err();
@@ -1389,6 +1414,11 @@ mod tests {
             "expected non-empty NAPI error reason"
         );
     }
+
+    // The signature hex-decode and 64-byte-length branches are covered by
+    // `zcash_crypto::finalize::parse_spend_auth_sig_hex`'s own unit tests, not here:
+    // this crate sets `test = false` (see its Cargo.toml — a napi cdylib cannot link
+    // a standalone test binary), so nothing in this module runs under `cargo test`.
 
     /// Malformed URL must return a NAPI error from broadcast_transaction.
     #[tokio::test]

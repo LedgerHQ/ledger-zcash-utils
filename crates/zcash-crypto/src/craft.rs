@@ -90,7 +90,6 @@
 use std::sync::OnceLock;
 
 use orchard::{
-    builder::BundleType as OrchardBundleType,
     circuit::{OrchardCircuitVersion, ProvingKey},
     keys::{FullViewingKey as OrchardFvk, OutgoingViewingKey},
     note::{Note, NoteVersion, RandomSeed, Rho},
@@ -107,7 +106,7 @@ use pczt::{
 };
 use rand::rngs::OsRng;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder},
+    builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317::{FeeError as Zip317FeeError, FeeRule},
     TxVersion,
 };
@@ -380,7 +379,8 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         sapling_anchor: None,
         orchard_anchor,
         ironwood_anchor: None,
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+        orchard_padding: BundlePadding::DEFAULT,
+        ironwood_padding: BundlePadding::DEFAULT,
     };
 
     // ── 1. Builder + Orchard spends + transparent inputs + non-change outputs ──
@@ -1178,7 +1178,8 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
         // NU6.3 scope).
         orchard_anchor: None,
         ironwood_anchor: Some(ironwood_anchor),
-        orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+        orchard_padding: BundlePadding::DEFAULT,
+        ironwood_padding: BundlePadding::DEFAULT,
     };
 
     // ── 1. Builder + Ironwood spends + transparent inputs + non-change outputs ──
@@ -1503,16 +1504,44 @@ fn zip317_fee_ironwood(
 }
 
 /// Applies a representative upstream HW-signer PCZT redaction before v2
-/// emission. Mirrors (without literally calling — `zcash_client_backend`'s
-/// `redact_pczt_for_batch_signer` is not yet published for NU6.3, see the
-/// implementation plan's "Repo-specific pitfalls") the semantics of
-/// librustzcash PRs #2555 (memo-plaintext / ciphertext resolution), #2557
-/// (redact `cv_net`), and #2593 (optional Orchard `cmx`):
+/// emission. Mirrors — without literally calling — the semantics of librustzcash
+/// PRs #2555 (memo-plaintext / ciphertext resolution), #2557 (redact `cv_net`),
+/// and #2593 (optional Orchard `cmx`).
+///
+/// Why not call `zcash_client_backend::data_api::wallet::redact_pczt_for_batch_signer`
+/// directly: it *is* available (`zcash_client_backend 0.24.0-rc.7`) and does strip
+/// `spend_fvk` symmetrically from both the Orchard and Ironwood bundles. But its own
+/// documentation states that its output "cannot be signed with the high level
+/// `pczt::roles::signer::Signer` because that role expects full viewing keys" — it
+/// targets a remote *batch signer* that derives the FVK independently. Our finalize
+/// step deliberately uses that high-level `Signer` role (for its nullifier-consistency
+/// check), so we keep the FVK on the Ironwood bundle; see the per-bundle notes below
+/// and `finalize::finalize_transaction`.
+///
+/// Why not its sibling `redact_pczt_for_signer(pczt, SignerView)` either — which *does*
+/// retain full viewing keys, and whose docs name hardware signers as its target: both
+/// upstream helpers return a throwaway *view* and require the caller to "retain `pczt`
+/// and combine the Signer's contribution into that authoritative copy". We have no
+/// second copy — the redacted PCZT emitted here *is* the authoritative one: it is both
+/// what is streamed to the device and what `finalize::finalize_transaction` later
+/// parses, signs and extracts. `SignerView::Compact` additionally clears `zkproof`,
+/// `bsk` and (for V6) the bundle anchor, all of which extraction still needs, and
+/// `SignerView::Full` redacts a different field set than the one below. Hence a local
+/// redactor rather than either upstream helper.
 ///   - both bundles: drop each action's `cv_net` (recomputed from the spend
-///     and output values plus `rcv`) and the spend's full viewing key
-///     (superseded by the `zip32_derivation` already stamped on every
-///     action); resolve `enc_ciphertext` down to its memo plaintext where
-///     decryptable.
+///     and output values plus `rcv`); resolve `enc_ciphertext` down to its
+///     memo plaintext where decryptable.
+///   - the spend's full viewing key is dropped from the **Orchard** bundle only,
+///     and is deliberately **retained on the Ironwood** bundle — see the inline
+///     note in the Ironwood closure for the hard requirement that forces this.
+///     The asymmetry is *not* because `zip32_derivation` supersedes the FVK on the
+///     Orchard side: `fvk_for_validation` never consults it, and the Orchard signer
+///     path (`Signer::apply_orchard_signature`) is symmetric with the Ironwood one,
+///     so it would fail identically. Dropping it is safe here only because this
+///     builder never emits real Orchard actions — the sole caller is
+///     `build_ironwood_transaction`, whose `orchard_anchor` is always `None`. A
+///     future co-present Orchard bundle (e.g. the ZIP 2006 winddown / same-receiver
+///     path noted above) must retain the FVK on that bundle too.
 ///   - the classic Orchard bundle only: also drop `cmx` (#2593) — the
 ///     receiver recomputes it from the output fields and the spend
 ///     nullifier. Always a no-op here (this builder never carries Orchard
@@ -1542,7 +1571,24 @@ fn apply_v6_redaction(pczt: Pczt) -> Pczt {
         .redact_ironwood_with(|mut r| {
             r.redact_actions(|mut a| {
                 a.clear_cv_net();
-                a.clear_spend_fvk();
+                // The FVK is deliberately retained on Ironwood spends: it is a hard
+                // requirement of the high-level PCZT Signer role we use at finalize
+                // time, not a preference. `Signer::apply_ironwood_signature` routes
+                // through `verify_nullifier(None)`, whose `fvk_for_validation` returns
+                // `MissingFullViewingKey` when neither an expected FVK nor the wire
+                // `fvk` is present — an error that role does not tolerate. Clearing it
+                // here would make every real Ironwood spend fail to finalize.
+                //
+                // Alternative, deliberately not taken: `pczt::roles::low_level_signer`
+                // skips FVK derivation entirely and would let us strip it, at the cost
+                // of the nullifier-consistency check and a separate host-side
+                // `Verifier` pass over the pre-redaction PCZT.
+                //
+                // Exposure: this PCZT travels only from the host to the user's own
+                // Ledger device, which already holds the spend authority; the host
+                // already holds this account's UFVK to sync it at all. No third party
+                // sees these bytes, so this is not the remote-batch-signer threat model
+                // that upstream's redaction guards against.
                 a.replace_enc_ciphertext_with_decrypted_memo_plaintext(NoteVersion::V3);
             });
         })
@@ -3705,7 +3751,8 @@ mod tests {
             sapling_anchor: None,
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
             ironwood_anchor: Some(orchard::Anchor::empty_tree()),
-            orchard_pool_bundle_type: OrchardBundleType::DEFAULT,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
         };
         let mut builder = Builder::new(network, target, build_config);
         // Fund the two 1_000-zat outputs plus the ZIP-317 fee for the resulting

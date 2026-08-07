@@ -107,10 +107,13 @@ withhold the binding itself.
 
 **Exception: transaction finalization (`finalize`, `finalize_transaction`).**
 Finalization is device-coupled for the same reason as `craft`: it consumes the
-device-produced Orchard `spendAuthSig`s and transparent input signatures, which
-only exist after the PCZT has been APDU-streamed to and signed by the Ledger
-device. A CLI invocation has no source for those signatures, so it could not
-produce a finalized transaction. Reachable only through `zcash-ffi-node`.
+device-produced shielded `spendAuthSig`s — Orchard for a V5 PCZT, Ironwood for a
+V6 one — and the transparent input signatures, which only exist after the PCZT has
+been APDU-streamed to and signed by the Ledger device. A CLI invocation has no
+source for those signatures, so it could not produce a finalized transaction.
+Reachable only through `zcash-ffi-node`. The output is a V5 (ZIP-225) or V6
+(ZIP-230) transaction, following whichever shielded bundle the input PCZT carries;
+the matching binding signature is applied host-side by the PCZT tx-extractor.
 
 **Exception: broadcast (`broadcast_transaction`).**
 Broadcast is a thin gRPC pass-through (`SendTransaction`) over an

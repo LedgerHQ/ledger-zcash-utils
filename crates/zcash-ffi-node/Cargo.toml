@@ -7,6 +7,12 @@ license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]
+# `test = false` is required, not incidental: the napi symbols (`napi_throw`,
+# `napi_create_error`, …) are supplied by the Node host at runtime, so a standalone
+# test binary for this crate fails to link. Consequence: the `#[cfg(test)] mod tests`
+# in `src/lib.rs` never runs under `cargo test`. Logic that needs real unit coverage
+# therefore lives in `zcash-crypto` (see `finalize::parse_spend_auth_sig_hex`), with
+# this crate kept to a thin, declarative binding layer.
 test = false
 doctest = false
 
