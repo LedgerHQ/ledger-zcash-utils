@@ -965,6 +965,45 @@ pub struct PcztOrchardBundle {
     pub anchor: Uint8Array,
 }
 
+/// A single Ironwood action (NU6.3, V6 transactions). Mirrors
+/// `PcztOrchardAction` with the addition of `notePlaintextVersion`.
+#[napi(object)]
+pub struct PcztIronwoodAction {
+    pub cv_net: Uint8Array,
+    pub nullifier: Uint8Array,
+    pub rk: Uint8Array,
+    pub spend_recipient: Uint8Array,
+    /// Spent-note value in zatoshis (decimal string).
+    pub spend_value: String,
+    pub spend_rho: Uint8Array,
+    pub spend_rseed: Uint8Array,
+    pub alpha: Uint8Array,
+    pub signing_path: String,
+    pub seed_fingerprint: Uint8Array,
+    pub cmx: Uint8Array,
+    pub ephemeral_key: Uint8Array,
+    pub enc_ciphertext: Uint8Array,
+    pub out_ciphertext: Uint8Array,
+    pub recipient: Uint8Array,
+    /// Output-note value in zatoshis (decimal string).
+    pub value: String,
+    pub rseed: Uint8Array,
+    pub rcv: Uint8Array,
+    /// Note-plaintext version byte (`3` for Ironwood / NoteVersion::V3).
+    pub note_plaintext_version: u32,
+}
+
+/// The Ironwood action bundle plus its trailer (V6 transactions only).
+#[napi(object)]
+pub struct PcztIronwoodBundle {
+    pub actions: Vec<PcztIronwoodAction>,
+    pub flags: u32,
+    /// Net value balance in zatoshis (signed decimal string, lossless for i128).
+    pub value_balance: String,
+    /// Ironwood commitment-tree anchor, 32 bytes.
+    pub anchor: Uint8Array,
+}
+
 /// A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`.
 #[napi(object)]
 pub struct PcztTransaction {
@@ -973,6 +1012,8 @@ pub struct PcztTransaction {
     pub transparent_outputs: Vec<PcztTransparentOutput>,
     /// `null` when the transaction has no Orchard actions.
     pub orchard_bundle: Option<PcztOrchardBundle>,
+    /// `null` for V5 transactions; non-null for V6 Ironwood transactions.
+    pub ironwood_bundle: Option<PcztIronwoodBundle>,
 }
 
 /// Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
@@ -1014,6 +1055,30 @@ fn derivation_to_napi(d: zcash_crypto::parse::ParsedBip32Derivation) -> PcztBip3
         signing_path: d.signing_path,
         pubkey: bytes_to_napi(d.pubkey.to_vec()),
         seed_fingerprint: bytes_to_napi(d.seed_fingerprint.to_vec()),
+    }
+}
+
+fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> PcztIronwoodAction {
+    PcztIronwoodAction {
+        cv_net: bytes_to_napi(a.cv_net.to_vec()),
+        nullifier: bytes_to_napi(a.nullifier.to_vec()),
+        rk: bytes_to_napi(a.rk.to_vec()),
+        spend_recipient: bytes_to_napi(a.spend_recipient.to_vec()),
+        spend_value: a.spend_value.to_string(),
+        spend_rho: bytes_to_napi(a.spend_rho.to_vec()),
+        spend_rseed: bytes_to_napi(a.spend_rseed.to_vec()),
+        alpha: bytes_to_napi(a.alpha.to_vec()),
+        signing_path: a.signing_path,
+        seed_fingerprint: bytes_to_napi(a.seed_fingerprint.to_vec()),
+        cmx: bytes_to_napi(a.cmx.to_vec()),
+        ephemeral_key: bytes_to_napi(a.ephemeral_key.to_vec()),
+        enc_ciphertext: bytes_to_napi(a.enc_ciphertext),
+        out_ciphertext: bytes_to_napi(a.out_ciphertext),
+        recipient: bytes_to_napi(a.recipient.to_vec()),
+        value: a.value.to_string(),
+        rseed: bytes_to_napi(a.rseed.to_vec()),
+        rcv: bytes_to_napi(a.rcv.to_vec()),
+        note_plaintext_version: a.note_plaintext_version,
     }
 }
 
@@ -1082,11 +1147,23 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
         anchor: bytes_to_napi(b.anchor.to_vec()),
     });
 
+    let ironwood_bundle = parsed.ironwood_bundle.map(|b| PcztIronwoodBundle {
+        actions: b
+            .actions
+            .into_iter()
+            .map(ironwood_action_to_napi)
+            .collect(),
+        flags: u32::from(b.flags),
+        value_balance: b.value_balance.to_string(),
+        anchor: bytes_to_napi(b.anchor.to_vec()),
+    });
+
     PcztTransaction {
         global,
         transparent_inputs,
         transparent_outputs,
         orchard_bundle,
+        ironwood_bundle,
     }
 }
 

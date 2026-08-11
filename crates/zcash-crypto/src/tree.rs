@@ -9,7 +9,7 @@
 
 use std::io::Cursor;
 
-use incrementalmerkletree::{Level, Marking, Position, Retention};
+use incrementalmerkletree::{Hashable, Level, Marking, Position, Retention};
 use orchard::tree::MerkleHashOrchard;
 use shardtree::{store::memory::MemoryShardStore, ShardTree};
 
@@ -230,6 +230,71 @@ pub fn frontier_leaf_count(bytes: &[u8]) -> Result<u64, Error> {
 /// Returns the empty-tree root for the genesis (empty) frontier.
 pub fn frontier_anchor(bytes: &[u8]) -> Result<[u8; 32], Error> {
     Ok(decode_orchard_frontier(bytes)?.root().to_bytes())
+}
+
+/// Compute the Merkle root of a **completed** Orchard/Ironwood shard from its
+/// `2^ORCHARD_SHARD_HEIGHT` (65 536) cmx leaves, without any network call.
+///
+/// This produces the same 32-byte value that `GetSubtreeRoots` returns for a
+/// completed shard — callers use it when the server does not yet support
+/// `GetSubtreeRoots` for the pool in question (e.g. Ironwood on Zaino before
+/// NU6.3 server-side support is deployed).
+///
+/// # Algorithm
+///
+/// Performs a standard bottom-up binary Merkle reduction using
+/// [`MerkleHashOrchard::combine`]: at each level `l` (0 → `ORCHARD_SHARD_HEIGHT−1`),
+/// consecutive pairs of nodes are combined to produce the layer above.  After
+/// `ORCHARD_SHARD_HEIGHT` = 16 rounds the single remaining node is the shard root
+/// at `Level(ORCHARD_SHARD_HEIGHT)`.  The Orchard hash function encodes only the
+/// *level* — not the absolute position within the full tree — so this computation
+/// is independent of the shard index.
+///
+/// # Complexity
+///
+/// O(shard_size) hash operations (~131 071 Sinsemilla calls).  In release mode
+/// this typically takes a few seconds per completed shard; acceptable for a pool
+/// that is young enough to have at most a handful of completed shards.  When
+/// server-side support for `GetSubtreeRoots` is eventually deployed, callers
+/// should switch back to the server endpoint.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidShardSize`] if `cmxs.len() != 2^ORCHARD_SHARD_HEIGHT`.
+/// Returns [`Error::InvalidLeaf`] for any cmx that is not a valid Pallas
+/// base-field element.
+pub fn compute_shard_root(cmxs: &[[u8; 32]]) -> Result<[u8; 32], Error> {
+    let shard_size = 1usize << ORCHARD_SHARD_HEIGHT;
+    if cmxs.len() != shard_size {
+        return Err(Error::InvalidShardSize {
+            got: cmxs.len(),
+            expected: shard_size,
+        });
+    }
+
+    // Parse leaves into MerkleHashOrchard values.
+    let mut nodes: Vec<MerkleHashOrchard> = cmxs
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            MerkleHashOrchard::from_bytes(c)
+                .into_option()
+                .ok_or(Error::InvalidLeaf { position: i as u64 })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // Bottom-up reduction: at level l, combine pairs to produce level l+1.
+    // combine(Level::from(l), left, right) → node at level l+1.
+    for l in 0..ORCHARD_SHARD_HEIGHT {
+        let mut next = Vec::with_capacity(nodes.len() / 2);
+        for pair in nodes.chunks(2) {
+            next.push(MerkleHashOrchard::combine(Level::from(l), &pair[0], &pair[1]));
+        }
+        nodes = next;
+    }
+
+    debug_assert_eq!(nodes.len(), 1, "reduction must converge to one root");
+    Ok(nodes[0].to_bytes())
 }
 
 #[cfg(test)]
@@ -869,6 +934,60 @@ mod tests {
             .into_option()
             .unwrap();
         assert_eq!(path.root(leaf).to_bytes(), anchor);
+    }
+
+    // ── compute_shard_root ────────────────────────────────────────────────────
+
+    /// Wrong input length → `InvalidShardSize`.
+    #[test]
+    fn compute_shard_root_wrong_size_returns_error() {
+        let err = compute_shard_root(&[[0u8; 32]; 4]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidShardSize { got: 4, .. }),
+            "expected InvalidShardSize, got: {err}"
+        );
+    }
+
+    /// An off-curve cmx byte string → `InvalidLeaf`.
+    #[test]
+    fn compute_shard_root_bad_leaf_returns_invalid_leaf() {
+        let shard_size = 1usize << ORCHARD_SHARD_HEIGHT;
+        let mut cmxs = vec![[0u8; 32]; shard_size];
+        cmxs[0] = [0xffu8; 32]; // not a valid Pallas field element
+        let err = compute_shard_root(&cmxs).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidLeaf { position: 0 }),
+            "expected InvalidLeaf at position 0, got: {err}"
+        );
+    }
+
+    /// A shard filled with `empty_leaf` values must produce the same root as
+    /// `MerkleHashOrchard::empty_root(Level::from(ORCHARD_SHARD_HEIGHT))`.
+    ///
+    /// This is the primary correctness assertion for `compute_shard_root`:
+    /// both sides compute the same fixed Merkle root for an all-empty shard,
+    /// which cross-validates the bottom-up reduction algorithm against the
+    /// incremental-tree library's own `empty_root` recursion.
+    ///
+    /// Marked `#[ignore]` because filling 2^16 leaves involves ~65 535
+    /// Sinsemilla hashes — roughly 10–30 s in debug mode.  Run on demand:
+    ///   cargo test -p zcash-crypto compute_shard_root_all_empty_matches_empty_root -- --ignored
+    ///   (add `--release` for ~10× speed-up)
+    #[test]
+    #[ignore = "expensive: ~65k Sinsemilla hashes; run with --ignored (ideally --release)"]
+    fn compute_shard_root_all_empty_matches_empty_root() {
+        let shard_size = 1usize << ORCHARD_SHARD_HEIGHT;
+        let leaf = MerkleHashOrchard::empty_leaf().to_bytes();
+        let cmxs = vec![leaf; shard_size];
+
+        let root = compute_shard_root(&cmxs).expect("all-empty shard root must succeed");
+
+        let expected =
+            MerkleHashOrchard::empty_root(Level::from(ORCHARD_SHARD_HEIGHT)).to_bytes();
+        assert_eq!(
+            root, expected,
+            "compute_shard_root(all empty_leaf) must equal empty_root(ORCHARD_SHARD_HEIGHT)"
+        );
     }
 
     // ── decode_orchard_frontier helper tests ──────────────────────────────────

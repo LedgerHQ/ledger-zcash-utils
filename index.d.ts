@@ -352,7 +352,10 @@ export interface BuildIronwoodTransactionResult {
 export declare function buildIronwoodTransaction(params: BuildIronwoodTransactionParams): Promise<BuildIronwoodTransactionResult>
 /** Parameters for finalizing a PCZT with device-provided signatures. */
 export interface FinalizeTransactionParams {
-  /** Hex-encoded canonical PCZT bytes from `buildTransaction` or `buildIronwoodTransaction`. */
+  /**
+   * Hex-encoded canonical PCZT bytes from `buildTransaction` or
+   * `buildIronwoodTransaction`.
+   */
   pczt: string
   /**
    * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
@@ -557,6 +560,43 @@ export interface PcztOrchardBundle {
   /** Orchard commitment-tree anchor, 32 bytes. */
   anchor: Uint8Array
 }
+/**
+ * A single Ironwood action (NU6.3, V6 transactions). Mirrors
+ * `PcztOrchardAction` with the addition of `notePlaintextVersion`.
+ */
+export interface PcztIronwoodAction {
+  cvNet: Uint8Array
+  nullifier: Uint8Array
+  rk: Uint8Array
+  spendRecipient: Uint8Array
+  /** Spent-note value in zatoshis (decimal string). */
+  spendValue: string
+  spendRho: Uint8Array
+  spendRseed: Uint8Array
+  alpha: Uint8Array
+  signingPath: string
+  seedFingerprint: Uint8Array
+  cmx: Uint8Array
+  ephemeralKey: Uint8Array
+  encCiphertext: Uint8Array
+  outCiphertext: Uint8Array
+  recipient: Uint8Array
+  /** Output-note value in zatoshis (decimal string). */
+  value: string
+  rseed: Uint8Array
+  rcv: Uint8Array
+  /** Note-plaintext version byte (`3` for Ironwood / NoteVersion::V3). */
+  notePlaintextVersion: number
+}
+/** The Ironwood action bundle plus its trailer (V6 transactions only). */
+export interface PcztIronwoodBundle {
+  actions: Array<PcztIronwoodAction>
+  flags: number
+  /** Net value balance in zatoshis (signed decimal string, lossless for i128). */
+  valueBalance: string
+  /** Ironwood commitment-tree anchor, 32 bytes. */
+  anchor: Uint8Array
+}
 /** A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`. */
 export interface PcztTransaction {
   global: PcztGlobal
@@ -564,6 +604,8 @@ export interface PcztTransaction {
   transparentOutputs: Array<PcztTransparentOutput>
   /** `null` when the transaction has no Orchard actions. */
   orchardBundle?: PcztOrchardBundle
+  /** `null` for V5 transactions; non-null for V6 Ironwood transactions. */
+  ironwoodBundle?: PcztIronwoodBundle
 }
 /**
  * Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
