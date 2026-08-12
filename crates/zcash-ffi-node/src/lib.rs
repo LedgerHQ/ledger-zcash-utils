@@ -965,6 +965,63 @@ pub struct PcztOrchardBundle {
     pub anchor: Uint8Array,
 }
 
+/// A single Ironwood action (NU6.3, V6 transactions only).
+///
+/// The wire format mirrors an Orchard action with the PCZT v2
+/// `note_plaintext_version` byte appended; the fields are spelled out here
+/// rather than nested so the object maps 1:1 onto the signer's
+/// `PcztIronwoodAction`.
+#[napi(object)]
+pub struct PcztIronwoodAction {
+    /// Value commitment, 32 bytes.
+    pub cv_net: Uint8Array,
+    /// Spend nullifier, 32 bytes.
+    pub nullifier: Uint8Array,
+    /// Randomized verification key, 32 bytes.
+    pub rk: Uint8Array,
+    /// Raw Orchard address of the spent note, 43 bytes.
+    pub spend_recipient: Uint8Array,
+    /// Spent-note value in zatoshis (decimal string to avoid f64 precision loss).
+    pub spend_value: String,
+    /// Spend rho, 32 bytes.
+    pub spend_rho: Uint8Array,
+    /// Spend rseed, 32 bytes.
+    pub spend_rseed: Uint8Array,
+    /// Spend-authorization randomizer, 32 bytes.
+    pub alpha: Uint8Array,
+    /// ZIP-32 derivation path of the signing key.
+    pub signing_path: String,
+    /// ZIP-32 seed fingerprint, 32 bytes.
+    pub seed_fingerprint: Uint8Array,
+    /// Note commitment x-coordinate, 32 bytes.
+    pub cmx: Uint8Array,
+    /// Ephemeral key, 32 bytes.
+    pub ephemeral_key: Uint8Array,
+    pub enc_ciphertext: Uint8Array,
+    pub out_ciphertext: Uint8Array,
+    /// Raw Orchard address of the output note, 43 bytes.
+    pub recipient: Uint8Array,
+    /// Output-note value in zatoshis (decimal string to avoid f64 precision loss).
+    pub value: String,
+    /// Output rseed, 32 bytes.
+    pub rseed: Uint8Array,
+    /// Value commitment randomness, 32 bytes.
+    pub rcv: Uint8Array,
+    /// Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2.
+    pub note_plaintext_version: u32,
+}
+
+/// The Ironwood action bundle plus its trailer (V6 transactions only).
+#[napi(object)]
+pub struct PcztIronwoodBundle {
+    pub actions: Vec<PcztIronwoodAction>,
+    pub flags: u32,
+    /// Net value balance in zatoshis (signed decimal string, lossless for i128).
+    pub value_balance: String,
+    /// Ironwood commitment-tree anchor, 32 bytes.
+    pub anchor: Uint8Array,
+}
+
 /// A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`.
 #[napi(object)]
 pub struct PcztTransaction {
@@ -973,6 +1030,10 @@ pub struct PcztTransaction {
     pub transparent_outputs: Vec<PcztTransparentOutput>,
     /// `null` when the transaction has no Orchard actions.
     pub orchard_bundle: Option<PcztOrchardBundle>,
+    /// `null` when the transaction has no Ironwood actions. Always `null` below
+    /// transaction version 6 — the Ironwood pool is V6-only, and the signer
+    /// rejects an Ironwood bundle on a V5 transaction.
+    pub ironwood_bundle: Option<PcztIronwoodBundle>,
 }
 
 /// Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
@@ -1040,6 +1101,53 @@ fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOr
     }
 }
 
+/// Flattens the composed Ironwood action into the signer's flat shape.
+fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> PcztIronwoodAction {
+    let note_plaintext_version = u32::from(a.note_plaintext_version);
+    let PcztOrchardAction {
+        cv_net,
+        nullifier,
+        rk,
+        spend_recipient,
+        spend_value,
+        spend_rho,
+        spend_rseed,
+        alpha,
+        signing_path,
+        seed_fingerprint,
+        cmx,
+        ephemeral_key,
+        enc_ciphertext,
+        out_ciphertext,
+        recipient,
+        value,
+        rseed,
+        rcv,
+    } = orchard_action_to_napi(a.action);
+
+    PcztIronwoodAction {
+        cv_net,
+        nullifier,
+        rk,
+        spend_recipient,
+        spend_value,
+        spend_rho,
+        spend_rseed,
+        alpha,
+        signing_path,
+        seed_fingerprint,
+        cmx,
+        ephemeral_key,
+        enc_ciphertext,
+        out_ciphertext,
+        recipient,
+        value,
+        rseed,
+        rcv,
+        note_plaintext_version,
+    }
+}
+
 fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransaction {
     let global = PcztGlobal {
         tx_version: parsed.global.tx_version,
@@ -1082,11 +1190,19 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
         anchor: bytes_to_napi(b.anchor.to_vec()),
     });
 
+    let ironwood_bundle = parsed.ironwood_bundle.map(|b| PcztIronwoodBundle {
+        actions: b.actions.into_iter().map(ironwood_action_to_napi).collect(),
+        flags: u32::from(b.flags),
+        value_balance: b.value_balance.to_string(),
+        anchor: bytes_to_napi(b.anchor.to_vec()),
+    });
+
     PcztTransaction {
         global,
         transparent_inputs,
         transparent_outputs,
         orchard_bundle,
+        ironwood_bundle,
     }
 }
 
@@ -1760,6 +1876,8 @@ mod tests {
                 value_balance: -100_000,
                 anchor: [0x31u8; 32],
             }),
+            // The fixture models a V5 transaction, which has no Ironwood pool.
+            ironwood_bundle: None,
         }
     }
 

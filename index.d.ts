@@ -352,7 +352,10 @@ export interface BuildIronwoodTransactionResult {
 export declare function buildIronwoodTransaction(params: BuildIronwoodTransactionParams): Promise<BuildIronwoodTransactionResult>
 /** Parameters for finalizing a PCZT with device-provided signatures. */
 export interface FinalizeTransactionParams {
-  /** Hex-encoded canonical PCZT bytes from `buildTransaction` or `buildIronwoodTransaction`. */
+  /**
+   * Hex-encoded canonical PCZT bytes from `buildTransaction` or
+   * `buildIronwoodTransaction`.
+   */
   pczt: string
   /**
    * One 64-byte (128-hex-char) RedPallas `spendAuthSig` per real Orchard spend,
@@ -557,6 +560,61 @@ export interface PcztOrchardBundle {
   /** Orchard commitment-tree anchor, 32 bytes. */
   anchor: Uint8Array
 }
+/**
+ * A single Ironwood action (NU6.3, V6 transactions only).
+ *
+ * The wire format mirrors an Orchard action with the PCZT v2
+ * `note_plaintext_version` byte appended; the fields are spelled out here
+ * rather than nested so the object maps 1:1 onto the signer's
+ * `PcztIronwoodAction`.
+ */
+export interface PcztIronwoodAction {
+  /** Value commitment, 32 bytes. */
+  cvNet: Uint8Array
+  /** Spend nullifier, 32 bytes. */
+  nullifier: Uint8Array
+  /** Randomized verification key, 32 bytes. */
+  rk: Uint8Array
+  /** Raw Orchard address of the spent note, 43 bytes. */
+  spendRecipient: Uint8Array
+  /** Spent-note value in zatoshis (decimal string to avoid f64 precision loss). */
+  spendValue: string
+  /** Spend rho, 32 bytes. */
+  spendRho: Uint8Array
+  /** Spend rseed, 32 bytes. */
+  spendRseed: Uint8Array
+  /** Spend-authorization randomizer, 32 bytes. */
+  alpha: Uint8Array
+  /** ZIP-32 derivation path of the signing key. */
+  signingPath: string
+  /** ZIP-32 seed fingerprint, 32 bytes. */
+  seedFingerprint: Uint8Array
+  /** Note commitment x-coordinate, 32 bytes. */
+  cmx: Uint8Array
+  /** Ephemeral key, 32 bytes. */
+  ephemeralKey: Uint8Array
+  encCiphertext: Uint8Array
+  outCiphertext: Uint8Array
+  /** Raw Orchard address of the output note, 43 bytes. */
+  recipient: Uint8Array
+  /** Output-note value in zatoshis (decimal string to avoid f64 precision loss). */
+  value: string
+  /** Output rseed, 32 bytes. */
+  rseed: Uint8Array
+  /** Value commitment randomness, 32 bytes. */
+  rcv: Uint8Array
+  /** Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2. */
+  notePlaintextVersion: number
+}
+/** The Ironwood action bundle plus its trailer (V6 transactions only). */
+export interface PcztIronwoodBundle {
+  actions: Array<PcztIronwoodAction>
+  flags: number
+  /** Net value balance in zatoshis (signed decimal string, lossless for i128). */
+  valueBalance: string
+  /** Ironwood commitment-tree anchor, 32 bytes. */
+  anchor: Uint8Array
+}
 /** A fully structured PCZT ready for `DmkSignerZcash.signPcztTransaction`. */
 export interface PcztTransaction {
   global: PcztGlobal
@@ -564,6 +622,12 @@ export interface PcztTransaction {
   transparentOutputs: Array<PcztTransparentOutput>
   /** `null` when the transaction has no Orchard actions. */
   orchardBundle?: PcztOrchardBundle
+  /**
+   * `null` when the transaction has no Ironwood actions. Always `null` below
+   * transaction version 6 — the Ironwood pool is V6-only, and the signer
+   * rejects an Ironwood bundle on a V5 transaction.
+   */
+  ironwoodBundle?: PcztIronwoodBundle
 }
 /**
  * Parse canonical PCZT bytes (hex, as returned by `buildTransaction`) into the
