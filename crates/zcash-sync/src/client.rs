@@ -263,9 +263,9 @@ pub(crate) async fn get_tree_state_at(
 /// Returns the txid (hex) on success (`error_code == 0`). On a non-zero
 /// `error_code`, returns an error carrying the server's `error_message`.
 ///
-/// The txid is recomputed from the V5 transaction bytes (which embed the
-/// consensus branch ID in the stream, making the branch-id argument to
-/// `Transaction::read` advisory for V5).
+/// The txid is recomputed from the transaction bytes, which may be V5 (Orchard)
+/// or V6 (Ironwood/NU6.3). Both embed the consensus branch ID in the stream,
+/// making the branch-id argument to `Transaction::read` advisory for either.
 ///
 /// # Errors
 ///
@@ -275,10 +275,10 @@ pub async fn broadcast_transaction(grpc_url: String, tx_bytes: Vec<u8>) -> Resul
     let channel = connect(&grpc_url).await?;
     let mut client = CompactTxStreamerClient::new(channel);
 
-    // Recompute the txid from the V5 bytes before moving them into the request.
-    // For V5 transactions `Transaction::read` derives the txid from the stream
-    // (the branch id argument is ignored for V5).
-    let txid = txid_from_v5_bytes(&tx_bytes)?;
+    // Recompute the txid before moving the bytes into the request. For V5 and
+    // V6 `Transaction::read` derives the txid from the stream (the branch id
+    // argument reaches only the V4 reader).
+    let txid = txid_from_tx_bytes(&tx_bytes)?;
 
     let mut req = tonic::Request::new(RawTransaction {
         data: tx_bytes,
@@ -431,16 +431,19 @@ fn interpret_send_response(resp: SendResponse) -> Result<()> {
     Ok(())
 }
 
-/// Compute the txid from a serialized V5 transaction, in big-endian (display)
-/// hex order.
+/// Compute the txid from a serialized V5 or V6 transaction, in big-endian
+/// (display) hex order.
 ///
-/// Rejects non-V5 bytes with a descriptive error before calling
-/// `Transaction::read`, so callers cannot accidentally compute a txid from a
-/// legacy transaction whose wire format differs from ZIP-225.
+/// Both post-ZIP-225 versions are accepted: V5 (NU5, ZIP 225) carries an
+/// Orchard bundle, V6 (NU6.3, ZIP 229) carries an Ironwood bundle. A shielded
+/// send builds as V6, a transparent-only send as V5, so the broadcast path must
+/// handle either. Legacy versions (Sprout/V3/V4) are rejected with a
+/// descriptive error, since their wire format predates ZIP 225.
 ///
-/// For V5 transactions the consensus branch ID is embedded in the stream, so
-/// the `BranchId` argument to `Transaction::read` is not used. We pass
-/// `BranchId::Nu6` as a safe placeholder.
+/// For V5 and V6 the consensus branch ID is embedded in the stream and
+/// `Transaction::read` dispatches on the version header — it forwards the
+/// `BranchId` argument only to `read_v4`. We pass `BranchId::Nu6` as an inert
+/// placeholder; it does not influence the parse or the resulting txid.
 ///
 /// Byte order: `Transaction::txid()` returns internal little-endian bytes; this
 /// function reverses them to big-endian *display* order so the result matches
@@ -448,19 +451,19 @@ fn interpret_send_response(resp: SendResponse) -> Result<()> {
 /// Ledger Live records as the operation hash. Keeping the two paths consistent
 /// is required so a freshly-broadcast transaction reconciles with the same
 /// transaction once it is discovered by sync.
-fn txid_from_v5_bytes(tx_bytes: &[u8]) -> Result<String> {
+fn txid_from_tx_bytes(tx_bytes: &[u8]) -> Result<String> {
     // Peek at the version header without consuming from the slice that
     // `Transaction::read` will use — use a separate cursor for the check.
     let version = TxVersion::read(std::io::Cursor::new(tx_bytes))
-        .map_err(|e| anyhow!("txid_from_v5_bytes: version parse failed: {}", e))?;
-    if !matches!(version, TxVersion::V5) {
+        .map_err(|e| anyhow!("txid_from_tx_bytes: version parse failed: {}", e))?;
+    if !matches!(version, TxVersion::V5 | TxVersion::V6) {
         return Err(anyhow!(
-            "txid_from_v5_bytes: expected V5 transaction, got {:?}",
+            "txid_from_tx_bytes: expected a V5 or V6 transaction, got {:?}",
             version
         ));
     }
     let tx = Transaction::read(tx_bytes, BranchId::Nu6)
-        .map_err(|e| anyhow!("txid_from_v5_bytes: Transaction::read failed: {}", e))?;
+        .map_err(|e| anyhow!("txid_from_tx_bytes: Transaction::read failed: {}", e))?;
     let mut txid_bytes: [u8; 32] = *tx.txid().as_ref();
     txid_bytes.reverse(); // internal little-endian -> big-endian display order
     Ok(hex::encode(txid_bytes))
@@ -756,7 +759,7 @@ mod tests {
         );
     }
 
-    // ── txid_from_v5_bytes — direct tests ────────────────────────────────────
+    // ── txid_from_tx_bytes — direct tests ────────────────────────────────────
     //
     // Known vectors reused from `zcash-crypto/tests/fixtures` (same workspace).
     // The expected txids are the big-endian *display* form documented in
@@ -768,16 +771,20 @@ mod tests {
     /// Its canonical (big-endian, display) txid.
     const TX_V5_TXID_DISPLAY: &str =
         "0b5baa0c01ea74f93effe5cc0566eaf086bf67329ff2923bc07a5d0e8859a65e";
-    /// A real V4 transaction (header `04000080`) — used to exercise the V5 guard.
+    /// A real V4 transaction (header `04000080`) — used to exercise the legacy guard.
     const TX_V4_HEX: &str =
         include_str!("../../zcash-crypto/tests/fixtures/tx_c534920d_h954650_testnet.hex");
+    /// V6 (NU6.3 / ZIP 229) header: version 6 with the overwintered bit set
+    /// (`0x80000006`, LE `06000080`) followed by `V6_VERSION_GROUP_ID`
+    /// (`0xD884B698`, LE `98b684d8`).
+    const TX_V6_HEADER_HEX: &str = "0600008098b684d8";
 
     #[test]
-    fn txid_from_v5_bytes_computes_canonical_txid() {
+    fn txid_from_tx_bytes_computes_canonical_txid() {
         let bytes = hex::decode(TX_V5_HEX.trim()).expect("fixture must be valid hex");
-        let got = txid_from_v5_bytes(&bytes).expect("V5 txid computation must succeed");
+        let got = txid_from_tx_bytes(&bytes).expect("V5 txid computation must succeed");
         assert_eq!(got.len(), 64, "txid hex must be 64 chars");
-        // `txid_from_v5_bytes` returns big-endian display order, matching the
+        // `txid_from_tx_bytes` returns big-endian display order, matching the
         // sync path (`ShieldedTransaction.txid`) and the LL operation hash.
         assert_eq!(
             got, TX_V5_TXID_DISPLAY,
@@ -786,13 +793,37 @@ mod tests {
     }
 
     #[test]
-    fn txid_from_v5_bytes_rejects_non_v5() {
+    fn txid_from_tx_bytes_rejects_legacy_versions() {
         let bytes = hex::decode(TX_V4_HEX.trim()).expect("fixture must be valid hex");
-        let err = txid_from_v5_bytes(&bytes).unwrap_err();
+        let err = txid_from_tx_bytes(&bytes).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("expected V5 transaction"),
-            "non-V5 input must be rejected by the version guard, got: {msg}"
+            msg.contains("expected a V5 or V6 transaction"),
+            "a pre-ZIP-225 transaction must be rejected by the version guard, got: {msg}"
+        );
+    }
+
+    /// Regression guard for the broadcast failure where a shielded (Ironwood)
+    /// send finalized to V6 and was rejected before its txid was ever computed.
+    ///
+    /// A full V6 transaction body cannot be built here — it requires the
+    /// Ironwood proving key from `zcash-crypto` — so this asserts the narrower
+    /// property that actually regressed: the *version guard* admits V6 and
+    /// hands the bytes to `Transaction::read`. A truncated body therefore fails
+    /// in the parser, never in the guard.
+    #[test]
+    fn txid_from_tx_bytes_admits_v6_past_the_version_guard() {
+        let bytes = hex::decode(TX_V6_HEADER_HEX).expect("V6 header must be valid hex");
+        let err = txid_from_tx_bytes(&bytes)
+            .expect_err("a header with no transaction body cannot parse");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("expected a V5 or V6 transaction"),
+            "V6 must pass the version guard, not be rejected by it, got: {msg}"
+        );
+        assert!(
+            msg.contains("Transaction::read failed"),
+            "V6 must reach the parser, got: {msg}"
         );
     }
 
