@@ -28,6 +28,11 @@ pub enum Error {
     #[error("invalid shard root for shard {shard_index}")]
     InvalidShardRoot { shard_index: u32 },
 
+    /// Wrong number of cmx leaves passed to `compute_shard_root`: a completed shard
+    /// must have exactly `2^ORCHARD_SHARD_HEIGHT` (65 536) leaves.
+    #[error("invalid shard size: expected {expected} leaves, got {got}")]
+    InvalidShardSize { got: usize, expected: usize },
+
     /// A 32-byte cmx value does not represent a valid Pallas base-field element.
     #[error("invalid leaf bytes at position {position}")]
     InvalidLeaf { position: u64 },
@@ -182,6 +187,18 @@ mod tests {
             network: "regtest".into(),
         };
         assert_eq!(e.to_string(), "unsupported network in UFVK: regtest");
+    }
+
+    #[test]
+    fn test_invalid_shard_size_display() {
+        let e = Error::InvalidShardSize {
+            got: 100,
+            expected: 65536,
+        };
+        assert_eq!(
+            e.to_string(),
+            "invalid shard size: expected 65536 leaves, got 100"
+        );
     }
 
     #[test]
