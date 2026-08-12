@@ -1,5 +1,11 @@
 # @ledgerhq/zcash-utils
 
+## 2.1.0
+
+### Minor Changes
+
+- abe272e: Surface the Ironwood bundle from `parsePczt`.
+
 ## 2.0.0
 
 ### Major Changes

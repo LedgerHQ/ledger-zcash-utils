@@ -3354,6 +3354,83 @@ mod tests {
         assert!(!parsed.ironwood().actions().is_empty());
     }
 
+    /// An Ironwood transaction built here must round-trip through
+    /// [`crate::parse::parse_pczt`] into the structured form the device signer
+    /// consumes — the signer rejects a V6 transaction whose `ironwoodBundle` is
+    /// null, so a bundle that survives `pczt::parse` but is dropped by our own
+    /// parser is indistinguishable, to the caller, from never having been built.
+    #[test]
+    fn parse_pczt_ironwood_roundtrips() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        let out = build_ironwood_transaction(inputs).expect("ironwood→ironwood must succeed");
+
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+
+        assert_eq!(
+            parsed.global.tx_version, 6,
+            "an Ironwood bundle only exists on a V6 transaction"
+        );
+        assert_eq!(parsed.global.coin_type, 133);
+
+        let bundle = parsed
+            .ironwood_bundle
+            .expect("ironwood bundle must survive parse_pczt");
+        assert_eq!(
+            bundle.actions.len() as u32,
+            out.n_actions_ironwood,
+            "every built action must reach the signer"
+        );
+        assert_eq!(bundle.anchor.len(), 32);
+
+        for action in &bundle.actions {
+            assert_eq!(
+                action.note_plaintext_version, 0x03,
+                "Ironwood notes are ZIP 2005 (V3) plaintexts"
+            );
+            // Fixed-width fields at the sizes the device parser expects.
+            assert_eq!(action.action.spend_recipient.len(), 43);
+            assert_eq!(action.action.recipient.len(), 43);
+            assert_eq!(action.action.alpha.len(), 32);
+            assert_eq!(action.action.rcv.len(), 32);
+            assert_eq!(action.action.enc_ciphertext.len(), 580);
+            assert_eq!(action.action.out_ciphertext.len(), 80);
+            // The Ironwood spend path is fully hardened: 32'/133'/<account>'.
+            assert_eq!(action.action.signing_path, "32'/133'/0'");
+        }
+    }
+
+    /// This builder never emits an Orchard bundle, so the Orchard section of a
+    /// V6 PCZT must map to `None` — the two pools are parsed independently and
+    /// an empty one must not mask a populated one.
+    #[test]
+    fn parse_pczt_ironwood_only_has_no_orchard_bundle() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        let out = build_ironwood_transaction(inputs).expect("ironwood→ironwood must succeed");
+
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+
+        assert!(
+            parsed.orchard_bundle.is_none(),
+            "an Ironwood-only transaction carries no Orchard actions"
+        );
+        assert!(
+            parsed.ironwood_bundle.is_some(),
+            "...but its Ironwood bundle must still be present"
+        );
+    }
+
     #[test]
     fn ironwood_send_to_transparent_produces_valid_pczt() {
         let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);

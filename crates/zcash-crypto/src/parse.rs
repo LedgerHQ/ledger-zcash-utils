@@ -31,11 +31,19 @@
 use std::collections::BTreeMap;
 
 use ff::PrimeField;
+use orchard::bundle::BundleVersion;
+use orchard::note::NoteVersion;
+use orchard::ValuePool;
 use pczt::roles::verifier::{OrchardError, TransparentError, Verifier};
 use pczt::Pczt;
+use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
+use zcash_protocol::consensus::BranchId;
 use zcash_script::script::Evaluable;
 
 use crate::error::Error;
+
+/// The transaction version that introduces the Ironwood pool (NU6.3).
+const V6_TX_VERSION: u32 = 6;
 
 /// A BIP-32 / ZIP-32 derivation entry (keyed by its controlling public key).
 #[derive(Debug, Clone)]
@@ -118,36 +126,23 @@ pub struct ParsedOrchardBundle {
     pub anchor: [u8; 32],
 }
 
-/// A single Ironwood action (NU6.3, V6 transactions). Mirrors
-/// `ParsedOrchardAction` with the addition of `note_plaintext_version`
-/// (always `0x03` for Ironwood; carried to the device as part of PCZT v2).
+/// A single Ironwood action (NU6.3, V6 transactions only).
+///
+/// An Ironwood action *is* an Orchard action plus the PCZT v2 note-plaintext
+/// lead byte, so it composes [`ParsedOrchardAction`] rather than repeating its
+/// eighteen fields: the device's Ironwood wire format mirrors `orchard::Action`
+/// with `note_plaintext_version` appended (`PcztIronwoodAction` in
+/// `@ledgerhq/device-signer-kit-zcash`). Composing keeps the two shapes from
+/// drifting when a field is added to the Orchard action.
 #[derive(Debug, Clone)]
 pub struct ParsedIronwoodAction {
-    pub cv_net: [u8; 32],
-    pub nullifier: [u8; 32],
-    pub rk: [u8; 32],
-    pub spend_recipient: [u8; 43],
-    pub spend_value: u64,
-    pub spend_rho: [u8; 32],
-    pub spend_rseed: [u8; 32],
-    pub alpha: [u8; 32],
-    pub signing_path: String,
-    pub seed_fingerprint: [u8; 32],
-    pub cmx: [u8; 32],
-    pub ephemeral_key: [u8; 32],
-    pub enc_ciphertext: Vec<u8>,
-    pub out_ciphertext: Vec<u8>,
-    pub recipient: [u8; 43],
-    pub value: u64,
-    pub rseed: [u8; 32],
-    pub rcv: [u8; 32],
-    /// Note-plaintext version byte (`0x03` for Ironwood). Required by PCZT v2
-    /// parsing in the device app.
-    pub note_plaintext_version: u32,
+    /// The Orchard-shaped body of the action.
+    pub action: ParsedOrchardAction,
+    /// Note-plaintext lead byte (`0x03` for the ZIP 2005 Ironwood format).
+    pub note_plaintext_version: u8,
 }
 
-/// The Ironwood action bundle plus its trailing bundle-level fields
-/// (V6 transactions only).
+/// The Ironwood action bundle plus its trailing bundle-level fields.
 #[derive(Debug, Clone)]
 pub struct ParsedIronwoodBundle {
     pub actions: Vec<ParsedIronwoodAction>,
@@ -165,7 +160,8 @@ pub struct ParsedPczt {
     pub transparent_outputs: Vec<ParsedTransparentOutput>,
     /// `None` when the transaction has no Orchard actions.
     pub orchard_bundle: Option<ParsedOrchardBundle>,
-    /// `None` for V5 transactions; `Some` for V6 Ironwood transactions.
+    /// `None` when the transaction has no Ironwood actions, which is always the
+    /// case below transaction version 6 — the Ironwood pool is V6-only.
     pub ironwood_bundle: Option<ParsedIronwoodBundle>,
 }
 
@@ -181,6 +177,13 @@ pub fn parse_pczt(bytes: &[u8]) -> Result<ParsedPczt, Error> {
     let mut transparent_outputs = Vec::new();
     let mut orchard_bundle = None;
     let mut ironwood_bundle = None;
+
+    let branch = BranchId::try_from(global.consensus_branch_id).map_err(|_| {
+        Error::Parse(format!(
+            "unrecognized consensus branch id {:#010x}",
+            global.consensus_branch_id
+        ))
+    })?;
 
     // The Verifier role parses the protocol-specific bundles into their fully
     // typed forms and lends them read-only inside a closure.
@@ -200,21 +203,25 @@ pub fn parse_pczt(bytes: &[u8]) -> Result<ParsedPczt, Error> {
 
     let verifier = verifier
         .with_orchard::<String, _>(|bundle| {
-            orchard_bundle = convert_orchard_bundle(bundle).map_err(OrchardError::Custom)?;
+            orchard_bundle = convert_orchard_bundle(bundle, branch, ValuePool::Orchard)
+                .map_err(OrchardError::Custom)?;
             Ok(())
         })
         .map_err(map_orchard_err)?;
 
-    // V6 transactions carry an Ironwood bundle in addition to (or instead of)
-    // the Orchard bundle. `with_ironwood` uses the same `OrchardError` type as
-    // `with_orchard`; `map_orchard_err` reused intentionally.
-    verifier
-        .with_ironwood::<String, _>(|bundle| {
-            ironwood_bundle =
-                convert_ironwood_bundle(bundle).map_err(OrchardError::Custom)?;
-            Ok(())
-        })
-        .map_err(map_orchard_err)?;
+    // The Ironwood pool exists only from V6. Below that the PCZT's Ironwood
+    // section is the canonical empty bundle, and asking the Verifier to parse it
+    // under a pre-NU6.3 anchor requirement would be meaningless work on every
+    // V5 (Orchard) transaction — so leave it untouched and report `None`.
+    if global.tx_version >= V6_TX_VERSION {
+        verifier
+            .with_ironwood::<String, _>(|bundle| {
+                ironwood_bundle =
+                    convert_ironwood_bundle(bundle, branch).map_err(OrchardError::Custom)?;
+                Ok(())
+            })
+            .map_err(map_ironwood_err)?;
+    }
 
     Ok(ParsedPczt {
         global,
@@ -322,12 +329,28 @@ fn single_derivation(
 
 // ─── orchard ─────────────────────────────────────────────────────────────────
 
+/// The bundle version in force for `pool` on `branch`.
+///
+/// The flags byte is only representable against the right version — the Orchard
+/// pool flips `cross_address_enabled` at NU6.3, and the Ironwood pool encodes it
+/// in its own bit — so the version cannot be hardcoded. This follows the epoch
+/// the bundle is mined in rather than the transaction version, the same rule
+/// (and the same upstream function) as [`crate::circuit`].
+fn bundle_version_for(branch: BranchId, pool: ValuePool) -> Result<BundleVersion, String> {
+    bundle_version_for_branch(branch, pool)
+        .ok_or_else(|| format!("no {pool:?} bundle version for branch {branch:?}"))
+}
+
 fn convert_orchard_bundle(
     bundle: &orchard::pczt::Bundle,
+    branch: BranchId,
+    pool: ValuePool,
 ) -> Result<Option<ParsedOrchardBundle>, String> {
     if bundle.actions().is_empty() {
         return Ok(None);
     }
+
+    let bundle_version = bundle_version_for(branch, pool)?;
 
     let mut actions = Vec::with_capacity(bundle.actions().len());
     for action in bundle.actions() {
@@ -343,13 +366,59 @@ fn convert_orchard_bundle(
 
     Ok(Some(ParsedOrchardBundle {
         actions,
-        flags: bundle
-            .flags()
-            .to_byte(orchard::bundle::BundleVersion::orchard_v2())
-            .ok_or("orchard bundle flags not representable for the Orchard v2 bundle version")?,
+        flags: bundle.flags().to_byte(bundle_version).ok_or_else(|| {
+            format!("bundle flags not representable for bundle version {bundle_version:?}")
+        })?,
         value_balance,
         anchor: bundle.anchor().to_bytes(),
     }))
+}
+
+/// Converts the PCZT's Ironwood section, which the `pczt` crate exposes as the
+/// same [`orchard::pczt::Bundle`] type as the Orchard section.
+///
+/// The two differ only in the bundle version used to encode the flags byte and
+/// in the per-action note-plaintext lead byte the device needs for PCZT v2, so
+/// this reuses [`convert_orchard_bundle`] for the shared body.
+fn convert_ironwood_bundle(
+    bundle: &orchard::pczt::Bundle,
+    branch: BranchId,
+) -> Result<Option<ParsedIronwoodBundle>, String> {
+    let Some(orchard_shaped) = convert_orchard_bundle(bundle, branch, ValuePool::Ironwood)? else {
+        return Ok(None);
+    };
+
+    // Every action in a bundle carries the note version of the bundle itself;
+    // `orchard`'s parser rejects a PCZT whose actions disagree with it, so the
+    // bundle version is the authoritative source for the lead byte.
+    let note_plaintext_version =
+        note_plaintext_lead_byte(bundle_version_for(branch, ValuePool::Ironwood)?.note_version());
+
+    Ok(Some(ParsedIronwoodBundle {
+        actions: orchard_shaped
+            .actions
+            .into_iter()
+            .map(|action| ParsedIronwoodAction {
+                action,
+                note_plaintext_version,
+            })
+            .collect(),
+        flags: orchard_shaped.flags,
+        value_balance: orchard_shaped.value_balance,
+        anchor: orchard_shaped.anchor,
+    }))
+}
+
+/// The note-plaintext lead byte signalling `version`.
+///
+/// `orchard` keeps its own `NoteVersion::lead_byte` crate-private, so the
+/// mapping is restated here against the values the variants document: ZIP 212
+/// (`0x02`) and ZIP 2005 (`0x03`).
+fn note_plaintext_lead_byte(version: NoteVersion) -> u8 {
+    match version {
+        NoteVersion::V2 => 0x02,
+        NoteVersion::V3 => 0x03,
+    }
 }
 
 fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchardAction, String> {
@@ -429,130 +498,6 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
     })
 }
 
-// ─── ironwood ─────────────────────────────────────────────────────────────────
-
-/// Ironwood uses the same `orchard::pczt::Bundle` type as Orchard — the two
-/// pools share the same cryptography (Pallas, Sinsemilla, ShardTree 32/16).
-/// The only structural difference is the flags byte encoding
-/// (`ironwood_v3()` instead of `orchard_v2()`) and the `note_plaintext_version`
-/// field on each action (`0x03` for Ironwood, vs `0x02` for Orchard).
-fn convert_ironwood_bundle(
-    bundle: &orchard::pczt::Bundle,
-) -> Result<Option<ParsedIronwoodBundle>, String> {
-    if bundle.actions().is_empty() {
-        return Ok(None);
-    }
-
-    let mut actions = Vec::with_capacity(bundle.actions().len());
-    for action in bundle.actions() {
-        actions.push(convert_ironwood_action(action)?);
-    }
-
-    let (magnitude, sign) = bundle.value_sum().magnitude_sign();
-    let value_balance = if matches!(sign, orchard::value::Sign::Negative) {
-        -(magnitude as i128)
-    } else {
-        magnitude as i128
-    };
-
-    Ok(Some(ParsedIronwoodBundle {
-        actions,
-        flags: bundle
-            .flags()
-            .to_byte(orchard::bundle::BundleVersion::ironwood_v3())
-            .ok_or(
-                "ironwood bundle flags not representable for the Ironwood v3 bundle version",
-            )?,
-        value_balance,
-        anchor: bundle.anchor().to_bytes(),
-    }))
-}
-
-fn convert_ironwood_action(action: &orchard::pczt::Action) -> Result<ParsedIronwoodAction, String> {
-    let spend = action.spend();
-    let output = action.output();
-
-    let rk: [u8; 32] = spend.rk().into();
-
-    let spend_recipient = spend
-        .recipient()
-        .map(|r| r.to_raw_address_bytes())
-        .ok_or("ironwood spend missing recipient")?;
-    let spend_value = spend
-        .value()
-        .map(|v| v.inner())
-        .ok_or("ironwood spend missing value")?;
-    let spend_rho = spend
-        .rho()
-        .map(|r| r.to_bytes())
-        .ok_or("ironwood spend missing rho")?;
-    let spend_rseed = spend
-        .rseed()
-        .map(|r| *r.as_bytes())
-        .ok_or("ironwood spend missing rseed")?;
-    let alpha = spend
-        .alpha()
-        .map(|a| a.to_repr())
-        .ok_or("ironwood spend missing alpha")?;
-
-    let zip32 = spend
-        .zip32_derivation()
-        .as_ref()
-        .ok_or("ironwood spend missing zip32_derivation")?;
-    let signing_path = format_derivation_path(zip32.derivation_path().iter().map(|c| c.index()));
-    let seed_fingerprint = *zip32.seed_fingerprint();
-
-    let note = output.encrypted_note();
-
-    let recipient = output
-        .recipient()
-        .map(|r| r.to_raw_address_bytes())
-        .ok_or("ironwood output missing recipient")?;
-    let value = output
-        .value()
-        .map(|v| v.inner())
-        .ok_or("ironwood output missing value")?;
-    let rseed = output
-        .rseed()
-        .map(|r| *r.as_bytes())
-        .ok_or("ironwood output missing rseed")?;
-
-    let rcv = action
-        .rcv()
-        .as_ref()
-        .map(|r| r.to_bytes())
-        .ok_or("ironwood action missing rcv")?;
-
-    // `note_version()` returns `NoteVersion::V3` for all Ironwood spend/output
-    // actions; convert to the wire lead byte (`0x03`) the device expects.
-    let note_plaintext_version = match spend.note_version() {
-        orchard::NoteVersion::V2 => 2u32,
-        orchard::NoteVersion::V3 => 3u32,
-    };
-
-    Ok(ParsedIronwoodAction {
-        cv_net: action.cv_net().to_bytes(),
-        nullifier: spend.nullifier().to_bytes(),
-        rk,
-        spend_recipient,
-        spend_value,
-        spend_rho,
-        spend_rseed,
-        alpha,
-        signing_path,
-        seed_fingerprint,
-        cmx: output.cmx().to_bytes(),
-        ephemeral_key: note.epk_bytes,
-        enc_ciphertext: note.enc_ciphertext.to_vec(),
-        out_ciphertext: note.out_ciphertext.to_vec(),
-        recipient,
-        value,
-        rseed,
-        rcv,
-        note_plaintext_version,
-    })
-}
-
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 /// Formats a sequence of raw ZIP-32/BIP-32 indices (hardened bit in bit 31) as
@@ -584,9 +529,90 @@ fn map_orchard_err(e: OrchardError<String>) -> Error {
     }
 }
 
+/// As [`map_orchard_err`], but labelled for the Ironwood section — both sections
+/// are parsed through the same `orchard` machinery and so share its error type.
+fn map_ironwood_err(e: OrchardError<String>) -> Error {
+    match e {
+        OrchardError::Custom(msg) => Error::Parse(msg),
+        other => Error::Parse(format!("ironwood bundle: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flags byte is only representable against the pool's own bundle
+    /// version: the Orchard pool disables cross-address transfers at NU6.3 and
+    /// the Ironwood pool carries the choice in its own bit, so a hardcoded
+    /// version would make `to_byte` return `None` for one of them.
+    #[test]
+    fn bundle_version_tracks_the_pool_and_the_branch() {
+        let orchard_v2 = bundle_version_for(BranchId::Nu6_2, ValuePool::Orchard)
+            .expect("the Orchard pool exists at NU6.2");
+        assert_eq!(orchard_v2, BundleVersion::orchard_v2());
+
+        let orchard_v3 = bundle_version_for(BranchId::Nu6_3, ValuePool::Orchard)
+            .expect("the Orchard pool exists at NU6.3");
+        assert_eq!(
+            orchard_v3,
+            BundleVersion::orchard_v3(),
+            "past NU6.3 the Orchard bundle is v3, not v2"
+        );
+
+        let ironwood = bundle_version_for(BranchId::Nu6_3, ValuePool::Ironwood)
+            .expect("the Ironwood pool is introduced at NU6.3");
+        assert_eq!(ironwood, BundleVersion::ironwood_v3());
+    }
+
+    /// The Ironwood pool does not exist before NU6.3, so asking for its bundle
+    /// version on an earlier branch must fail loudly rather than fall back to a
+    /// version whose flags encoding would be wrong.
+    #[test]
+    fn ironwood_has_no_bundle_version_before_nu6_3() {
+        for branch in [
+            BranchId::Nu5,
+            BranchId::Nu6,
+            BranchId::Nu6_1,
+            BranchId::Nu6_2,
+        ] {
+            assert!(
+                bundle_version_for(branch, ValuePool::Ironwood).is_err(),
+                "{branch:?} predates the Ironwood pool"
+            );
+        }
+    }
+
+    /// The device needs the note-plaintext lead byte to parse a PCZT v2 note.
+    /// `orchard` keeps its own mapping crate-private, so this pins ours to the
+    /// values the `NoteVersion` variants document (ZIP 212 / ZIP 2005).
+    #[test]
+    fn note_plaintext_lead_bytes_match_their_zips() {
+        assert_eq!(note_plaintext_lead_byte(NoteVersion::V2), 0x02);
+        assert_eq!(note_plaintext_lead_byte(NoteVersion::V3), 0x03);
+    }
+
+    /// The Ironwood pool uses V3 note plaintexts; the byte the device receives
+    /// follows from the bundle version rather than being hardcoded at the call
+    /// site.
+    #[test]
+    fn ironwood_bundle_version_selects_the_v3_note_plaintext() {
+        let ironwood = bundle_version_for(BranchId::Nu6_3, ValuePool::Ironwood)
+            .expect("the Ironwood pool is introduced at NU6.3");
+        assert_eq!(
+            note_plaintext_lead_byte(ironwood.note_version()),
+            0x03,
+            "Ironwood notes are ZIP 2005 (V3) plaintexts"
+        );
+
+        let orchard = bundle_version_for(BranchId::Nu6_3, ValuePool::Orchard)
+            .expect("the Orchard pool exists at NU6.3");
+        assert_eq!(
+            note_plaintext_lead_byte(orchard.note_version()),
+            0x02,
+            "the Orchard pool keeps ZIP 212 (V2) plaintexts even at NU6.3"
+        );
+    }
 
     #[test]
     fn parse_pczt_rejects_too_short_input() {
