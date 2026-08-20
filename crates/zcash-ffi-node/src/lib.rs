@@ -322,10 +322,32 @@ pub struct TransparentInputJs {
     pub address_index: u32,
 }
 
+/// Arguments for [`build_transaction`].
+///
+/// **Invariant: supply `ufvk`, or `transparentAccountPubkey`, or both.** The two
+/// are declared independently optional because this struct crosses into JS,
+/// where "exactly one of" has no encoding — napi rejects a data-carrying enum —
+/// so the rule cannot live in the type. Supplying neither is refused up front,
+/// before any work, rather than deeper in the build. Which one a given flow
+/// needs is on each field below.
 #[napi(object)]
 pub struct BuildTransactionParams {
     pub grpc_url: String,
-    pub ufvk: String,
+    /// Unified full viewing key of the spending account. Required by every flow
+    /// that carries an Orchard bundle (an Orchard spend, or a shielded
+    /// recipient); omit it only for a fully transparent send, which reads no
+    /// shielded key material and takes its transparent account key from
+    /// `transparentAccountPubkey` instead. Spending transparent funds therefore
+    /// never requires exporting a viewing key from the device.
+    pub ufvk: Option<String>,
+    /// 130-char hex (65 bytes: 32-byte chain code ‖ 33-byte compressed pubkey):
+    /// the account-level transparent pubkey at `m/44'/coin'/account'` — the
+    /// payload of the account xpub, which a wallet already holds. Used to derive
+    /// the internal change address and to verify each transparent input's
+    /// signing path. Optional when `ufvk` is supplied (its transparent component
+    /// serves, and this field then only has to agree with it); required for a
+    /// transparent send that omits the UFVK.
+    pub transparent_account_pubkey: Option<String>,
     pub network: Option<String>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// read from the device. Stamped onto each real spend so the device can
@@ -368,7 +390,8 @@ pub struct BuildTransactionResult {
 /// Supports Orchard-source (Private→*) and transparent-source (Public→*)
 /// flows. Halo 2 proof generation happens here for Orchard-bundle transactions
 /// (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
-/// ProvingKey cache). Transparent-only transactions skip the Orchard prover.
+/// ProvingKey cache). Transparent-only transactions skip the Orchard prover, and
+/// need no UFVK — see `ufvk` / `transparentAccountPubkey` on the params.
 ///
 /// Note: unlike `finalize_transaction` (purely CPU-bound, offloaded via
 /// `spawn_blocking`), this is an async orchestrator that interleaves gRPC
@@ -424,6 +447,7 @@ pub async fn build_transaction(
     let req = zcash_sync::craft::CraftRequest {
         grpc_url: params.grpc_url,
         ufvk: params.ufvk,
+        transparent_account_pubkey_hex: params.transparent_account_pubkey,
         network: params.network,
         seed_fingerprint_hex: params.seed_fingerprint,
         account_index: params.account_index,

@@ -9,6 +9,14 @@
 //!   - Private → Public   (Orchard spends + transparent outputs)
 //!   - Public  → Private  (transparent inputs + Orchard output; anchor-only)
 //!   - Public  → Public   (transparent inputs + transparent outputs; no Orchard bundle)
+//!
+//! The first three read Orchard key material and therefore require a UFVK. The
+//! fully transparent flow reads none: the only key it needs is the account-level
+//! transparent pubkey (`m/44'/coin'/account'`), used to verify each input's
+//! signing path and to derive the internal change address. A caller that holds
+//! that pubkey — a wallet always does, it is the account xpub's payload — can
+//! supply it directly and omit the UFVK, so spending transparent funds never
+//! requires exporting a viewing key.
 
 use anyhow::{anyhow, Result};
 use orchard::keys::Scope;
@@ -22,6 +30,7 @@ use zcash_crypto::{
     network::parse_network,
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
+use zcash_transparent::keys::AccountPubKey;
 
 use crate::witness::{
     compute_ironwood_witnesses, compute_witnesses, fetch_ironwood_anchor, fetch_orchard_anchor,
@@ -85,7 +94,24 @@ pub struct OutputRequestDto {
 
 pub struct CraftRequest {
     pub grpc_url: String,
-    pub ufvk: String,
+    /// Unified full viewing key of the spending account. Required by every flow
+    /// that carries an Orchard bundle (an Orchard spend or an Orchard output);
+    /// `None` is accepted only for the fully transparent flow, which reads no
+    /// shielded key material and takes its transparent account key from
+    /// `transparent_account_pubkey_hex` instead.
+    pub ufvk: Option<String>,
+    /// 130-char hex (65 bytes: 32-byte chain code ‖ 33-byte compressed pubkey)
+    /// account-level transparent pubkey at `m/44'/coin'/account'` — the payload
+    /// of the account xpub, and the same bytes a UFVK carries as its P2PKH item.
+    ///
+    /// Optional next to `ufvk`: when the UFVK is present its own transparent
+    /// component is authoritative and this field only has to agree with it (a
+    /// disagreement is a caller bug and fails the build). It is the sole source
+    /// when the UFVK is absent.
+    ///
+    /// One of the two must be supplied — see the guard at the top of
+    /// [`craft_transaction`] for why the rule is checked rather than typed.
+    pub transparent_account_pubkey_hex: Option<String>,
     /// `"mainnet"` / `"testnet"`. `None` ⇒ testnet (matches sync default).
     pub network: Option<String>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
@@ -120,15 +146,36 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     if req.outputs.is_empty() {
         return Err(anyhow!("craft: outputs list is empty"));
     }
+    // Supplying neither key source is a caller mistake no flow can recover from,
+    // so it is refused here with one message rather than a few calls deeper,
+    // where it would surface as whichever of change derivation or input
+    // verification the flow happened to reach first. The two fields are
+    // independently optional because the JS-facing struct they cross
+    // (`BuildTransactionParams`) cannot express "exactly one of" — napi has no
+    // encoding for a data-carrying enum.
+    if req.ufvk.is_none() && req.transparent_account_pubkey_hex.is_none() {
+        return Err(anyhow!(
+            "craft: no account key — neither a UFVK nor transparent_account_pubkey was \
+             supplied; a fully transparent send needs the account's transparent pubkey, and \
+             every flow with a shielded bundle needs the UFVK"
+        ));
+    }
 
     let network = parse_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
-    let (_net, ufvk_str) =
-        Ufvk::decode(&req.ufvk).map_err(|e| anyhow!("UFVK decode failed: {e:?}"))?;
-    let ufvk =
-        UnifiedFullViewingKey::parse(&ufvk_str).map_err(|e| anyhow!("UFVK parse failed: {e:?}"))?;
+    // Absent for a fully transparent send; step 2 rejects that for any flow that
+    // needs Orchard key material.
+    let ufvk = req
+        .ufvk
+        .as_deref()
+        .map(|encoded| {
+            let (_net, ufvk_str) =
+                Ufvk::decode(encoded).map_err(|e| anyhow!("UFVK decode failed: {e:?}"))?;
+            UnifiedFullViewingKey::parse(&ufvk_str).map_err(|e| anyhow!("UFVK parse failed: {e:?}"))
+        })
+        .transpose()?;
 
     // Decode destination addresses once, up front. The resulting destinations
     // both drive the flow-type detection below and are reused when assembling
@@ -155,6 +202,14 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     // ── 2. Extract Orchard FVK and change address when needed ────────────────
     let (orchard_fvk, change_address, ovk) = if has_orchard_bundle {
         let fvk = ufvk
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "this flow carries an Orchard bundle (an Orchard spend or an Orchard \
+                     recipient) and needs the account's Orchard key material, so a UFVK is \
+                     required; only a fully transparent send may omit it"
+                )
+            })?
             .orchard()
             .ok_or_else(|| anyhow!("UFVK does not contain an Orchard component"))?
             .clone();
@@ -168,6 +223,32 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         (None, None, None)
     };
 
+    // The account-level transparent key, used twice below: to derive the internal
+    // change address (step 3) and to verify each input's signing path (step 5).
+    // A UFVK's P2PKH item and the standalone field carry the same 65 bytes, so
+    // when both are present they must agree — a mismatch means the caller mixed
+    // key material from two accounts, and deriving from either one would produce
+    // a change address or a signing path that does not belong to the funds being
+    // spent, so it fails the build rather than picking a winner.
+    let account_pubkey: Option<AccountPubKey> = match (
+        ufvk.as_ref().and_then(|k| k.transparent()),
+        req.transparent_account_pubkey_hex.as_deref(),
+    ) {
+        (Some(from_ufvk), Some(explicit_hex)) => {
+            let explicit = decode_account_pubkey(explicit_hex)?;
+            if explicit.serialize() != from_ufvk.serialize() {
+                return Err(anyhow!(
+                    "transparent_account_pubkey does not match the UFVK's transparent component; \
+                     they must describe the same account"
+                ));
+            }
+            Some(explicit)
+        }
+        (Some(from_ufvk), None) => Some(from_ufvk.clone()),
+        (None, Some(explicit_hex)) => Some(decode_account_pubkey(explicit_hex)?),
+        (None, None) => None,
+    };
+
     // ── 3. Transparent change address (transparent-funded flows) ─────────────
     // Change returns to the pool that funds it: with no Orchard spends the
     // surplus comes from the transparent inputs, so change is transparent. This
@@ -176,12 +257,12 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     // migrating the whole balance into the shielded pool. Flows that spend from
     // Orchard (z→z, z→t) take change in Orchard (handled above).
     //
-    // We derive the internal change address from the UFVK's transparent
-    // component when available, otherwise accept None (exact-balance
-    // transactions need no change address). When the UFVK has no transparent
-    // receiver we can only proceed if the transaction produces no change; if it
-    // would, fail fast here with an actionable error rather than letting the
-    // deeper, generic builder error surface later.
+    // We derive the internal change address from the account's transparent key
+    // (step 2) when available, otherwise accept None (exact-balance transactions
+    // need no change address). Without that key we can only proceed if the
+    // transaction produces no change; if it would, fail fast here with an
+    // actionable error rather than letting the deeper, generic builder error
+    // surface later.
     // Derive the internal change address *and* the metadata the device needs to
     // recognize it as change: the change pubkey (33 bytes) and its non-hardened
     // address index. These flow into the change output's `bip32_derivation`.
@@ -190,7 +271,7 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         [u8; 33],
         u32,
     )> = if !has_orchard_spends {
-        let derived = ufvk.transparent().and_then(|tpk| {
+        let derived = account_pubkey.as_ref().and_then(|tpk| {
             use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
             let ivk = tpk.derive_internal_ivk().ok()?;
             // `default_address()` returns the first non-hardened index whose key
@@ -231,10 +312,10 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
                 .ok_or_else(|| anyhow!("total_out + fee overflow"))?;
             if total_in > outflow {
                 return Err(anyhow!(
-                    "transparent change of {} zatoshis is required but the UFVK has no \
-                     transparent receiver to derive an internal change address from; \
-                     use a UFVK with a transparent component or send an exact-balance \
-                     amount (transparent inputs == outputs + fee)",
+                    "transparent change of {} zatoshis is required but no transparent account \
+                     key was supplied to derive an internal change address from; pass \
+                     transparent_account_pubkey (or a UFVK carrying a transparent component), \
+                     or send an exact-balance amount (transparent inputs == outputs + fee)",
                     total_in - outflow
                 ));
             }
@@ -312,73 +393,14 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
 
     // ── 5. Decode transparent inputs ─────────────────────────────────────────
     // For each input we verify that its (derivation_scope, address_index) really
-    // identifies the supplied pubkey under this UFVK, then record the path so the
-    // builder can stamp the input's `bip32_derivation` (the device's only source
-    // for the transparent signing path). The device signs with that path without
-    // re-checking it against the pubkey, so getting it wrong would yield an
-    // invalid signature — this up-front check turns that into a clear build error.
-    let account_pubkey = ufvk.transparent();
-    let transparent_inputs: Vec<TransparentInput> = req
-        .transparent_inputs
-        .iter()
-        .map(|dto| {
-            use zcash_transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
-
-            let txid = hex_to_array::<32>(&dto.txid_hex, "txid")?;
-            let pubkey = hex_to_array::<33>(&dto.pubkey_hex, "pubkey")?;
-            let script_pubkey = hex::decode(&dto.script_pubkey_hex)
-                .map_err(|e| anyhow!("script_pubkey hex: {e}"))?;
-
-            let scope = match dto.derivation_scope {
-                0 => TransparentKeyScope::EXTERNAL,
-                1 => TransparentKeyScope::INTERNAL,
-                other => {
-                    return Err(anyhow!(
-                        "transparent input derivation_scope must be 0 (external) or 1 (internal), \
-                         got {other}"
-                    ))
-                }
-            };
-            let apk = account_pubkey.ok_or_else(|| {
-                anyhow!(
-                    "transparent inputs were supplied but the UFVK has no transparent component \
-                     to derive (and verify) their signing keys from"
-                )
-            })?;
-            let index = NonHardenedChildIndex::from_index(dto.address_index).ok_or_else(|| {
-                anyhow!(
-                    "transparent input address_index {} is not a valid non-hardened index",
-                    dto.address_index
-                )
-            })?;
-            let derived_pubkey = apk.derive_address_pubkey(scope, index).map_err(|e| {
-                anyhow!(
-                    "failed to derive transparent input pubkey at scope {} index {}: {e}",
-                    dto.derivation_scope,
-                    dto.address_index
-                )
-            })?;
-            if derived_pubkey.serialize() != pubkey {
-                return Err(anyhow!(
-                    "transparent input pubkey does not match the key derived from the UFVK at \
-                     scope {} index {}; the supplied (derivation_scope, address_index) does not \
-                     identify this UTXO's key",
-                    dto.derivation_scope,
-                    dto.address_index
-                ));
-            }
-
-            Ok(TransparentInput {
-                txid,
-                vout: dto.vout,
-                script_pubkey,
-                value: dto.value_zat,
-                pubkey,
-                derivation_scope: dto.derivation_scope,
-                derivation_address_index: dto.address_index,
-            })
-        })
-        .collect::<Result<_>>()?;
+    // identifies the supplied pubkey under this account key, then record the path
+    // so the builder can stamp the input's `bip32_derivation` (the device's only
+    // source for the transparent signing path). The device signs with that path
+    // without re-checking it against the pubkey, so getting it wrong would yield
+    // an invalid signature — this up-front check turns that into a clear build
+    // error.
+    let transparent_inputs =
+        decode_transparent_inputs(account_pubkey.as_ref(), &req.transparent_inputs)?;
 
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
@@ -447,6 +469,20 @@ fn hex_to_array<const N: usize>(s: &str, field: &str) -> Result<[u8; N]> {
         .try_into()
         .map_err(|got: Vec<u8>| anyhow!("{field}: expected {N} bytes, got {}", got.len()))?;
     Ok(arr)
+}
+
+/// Decode a hex account-level transparent pubkey (32-byte chain code ‖ 33-byte
+/// compressed secp256k1 pubkey) into an [`AccountPubKey`].
+///
+/// This is the same 65-byte serialization a UFVK carries as its P2PKH item, so a
+/// key decoded here derives exactly what the equivalent UFVK component would: the
+/// BIP-32 metadata a UFVK does not preserve (depth, parent fingerprint, child
+/// number) plays no part in child derivation.
+fn decode_account_pubkey(hex_str: &str) -> Result<AccountPubKey> {
+    let bytes = hex_to_array::<65>(hex_str, "transparent_account_pubkey")?;
+    AccountPubKey::deserialize(&bytes).map_err(|e| {
+        anyhow!("transparent_account_pubkey is not a valid account-level transparent pubkey: {e}")
+    })
 }
 
 // ── Ironwood (NU6.3) — V6 orchestrator ──────────────────────────────────────
@@ -712,7 +748,8 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
     };
 
     // ── 5. Decode + verify transparent inputs ────────────────────────────────
-    let transparent_inputs = decode_transparent_inputs(&ufvk, &req.transparent_inputs)?;
+    let transparent_inputs =
+        decode_transparent_inputs(ufvk.transparent(), &req.transparent_inputs)?;
 
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
@@ -774,18 +811,20 @@ fn decode_ironwood_destination(
     }
 }
 
-/// Decode and verify each transparent input's signing-key derivation against
-/// the UFVK, producing the builder's `TransparentInput` records. Identical
-/// logic to the inline block `craft_transaction` uses (step 5 there); factored
-/// out fresh as a new function — rather than refactoring `craft_transaction`
-/// itself — so the existing V5 path is never touched by this addition.
+/// Decode and verify each transparent input's signing-key derivation against the
+/// account's transparent key, producing the builder's `TransparentInput` records.
+/// Shared by both orchestrators (step 5 of each).
+///
+/// `account_pubkey` is `None` only when the caller supplied neither a UFVK with a
+/// transparent component nor a standalone transparent account pubkey; that is an
+/// error as soon as there is any input to verify, so a spend never proceeds on an
+/// unverified derivation path.
 fn decode_transparent_inputs(
-    ufvk: &UnifiedFullViewingKey,
+    account_pubkey: Option<&AccountPubKey>,
     dtos: &[TransparentInputDto],
 ) -> Result<Vec<TransparentInput>> {
     use zcash_transparent::keys::{NonHardenedChildIndex, TransparentKeyScope};
 
-    let account_pubkey = ufvk.transparent();
     dtos.iter()
         .map(|dto| {
             let txid = hex_to_array::<32>(&dto.txid_hex, "txid")?;
@@ -805,8 +844,9 @@ fn decode_transparent_inputs(
             };
             let apk = account_pubkey.ok_or_else(|| {
                 anyhow!(
-                    "transparent inputs were supplied but the UFVK has no transparent component \
-                     to derive (and verify) their signing keys from"
+                    "transparent inputs were supplied but no transparent account key was given \
+                     to derive (and verify) their signing keys from; pass \
+                     transparent_account_pubkey, or a UFVK carrying a transparent component"
                 )
             })?;
             let index = NonHardenedChildIndex::from_index(dto.address_index).ok_or_else(|| {
@@ -824,9 +864,9 @@ fn decode_transparent_inputs(
             })?;
             if derived_pubkey.serialize() != pubkey {
                 return Err(anyhow!(
-                    "transparent input pubkey does not match the key derived from the UFVK at \
-                     scope {} index {}; the supplied (derivation_scope, address_index) does not \
-                     identify this UTXO's key",
+                    "transparent input pubkey does not match the key derived from the account's \
+                     transparent key at scope {} index {}; the supplied (derivation_scope, \
+                     address_index) does not identify this UTXO's key",
                     dto.derivation_scope,
                     dto.address_index
                 ));
@@ -971,7 +1011,8 @@ mod tests {
     async fn empty_spends_and_transparent_inputs_returns_error() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: "uview1bogus".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -989,7 +1030,8 @@ mod tests {
     async fn empty_outputs_returns_error() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: "uview1bogus".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1010,7 +1052,8 @@ mod tests {
     async fn malformed_ufvk_returns_error() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: "this is not a UFVK".into(),
+            ufvk: Some("this is not a UFVK".into()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1031,7 +1074,8 @@ mod tests {
     async fn transparent_only_input_passes_input_guard() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: "uview1bogus".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1082,7 +1126,8 @@ mod tests {
 
         let req = CraftRequest {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
-            ufvk: keys.ufvk.clone(),
+            ufvk: Some(keys.ufvk.clone()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1144,7 +1189,8 @@ mod tests {
 
         let req = CraftRequest {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
-            ufvk: keys.ufvk.clone(),
+            ufvk: Some(keys.ufvk.clone()),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1206,7 +1252,8 @@ mod tests {
         // 100_000 in, 10_000 out, 10_000 fee → 80_000 of transparent change.
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: ufvk_no_transparent,
+            ufvk: Some(ufvk_no_transparent),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1224,8 +1271,8 @@ mod tests {
             "expected actionable change error, got: {msg}"
         );
         assert!(
-            msg.contains("UFVK has no transparent receiver"),
-            "error must explain the missing transparent receiver, got: {msg}"
+            msg.contains("no transparent account key was supplied"),
+            "error must explain the missing transparent account key, got: {msg}"
         );
     }
 
@@ -1252,7 +1299,8 @@ mod tests {
         // 100_000 in, 90_000 out, 10_000 fee → exactly 0 change.
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
-            ufvk: ufvk_no_transparent,
+            ufvk: Some(ufvk_no_transparent),
+            transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
@@ -1272,6 +1320,323 @@ mod tests {
             !msg.contains("transparent change"),
             "exact-balance tx must not trip the change guard, got: {msg}"
         );
+    }
+
+    // ── Transparent sends without a UFVK ──────────────────────────────────────
+    //
+    // A fully transparent send reads no shielded key material, so the wallet must
+    // be able to build one from the account's transparent pubkey alone — the
+    // payload of the account xpub it already holds. Requiring a UFVK there would
+    // force a viewing-key export on a user who only ever holds public funds.
+
+    const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    /// The test account's transparent key material, in both the forms a caller can
+    /// supply: the full UFVK, and the standalone 65-byte account pubkey (chain
+    /// code ‖ compressed pubkey) that a wallet slices out of its account xpub.
+    fn test_account_keys() -> (String, AccountPubKey, String) {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        let keys = derive_keys(TEST_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (_net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&container).unwrap();
+        let apk = ufvk
+            .transparent()
+            .expect("test UFVK has a P2PKH item")
+            .clone();
+        let apk_hex = hex::encode(apk.serialize());
+        (keys.ufvk, apk, apk_hex)
+    }
+
+    /// A transparent input whose pubkey and scriptPubKey really are the ones the
+    /// account key derives at `(scope, index)`, so it passes the step-5
+    /// verification and reaches the builder.
+    fn owned_transparent_input(apk: &AccountPubKey, value_zat: u64) -> TransparentInputDto {
+        use zcash_transparent::keys::{
+            IncomingViewingKey, NonHardenedChildIndex, TransparentKeyScope,
+        };
+
+        let index = NonHardenedChildIndex::from_index(0).unwrap();
+        let pubkey = apk
+            .derive_address_pubkey(TransparentKeyScope::EXTERNAL, index)
+            .unwrap();
+        let address = apk
+            .derive_external_ivk()
+            .unwrap()
+            .derive_address(index)
+            .unwrap();
+        // `Script` is the serialized (byte) form of the address's scriptPubKey;
+        // `TransparentAddress::script()` itself yields opcodes.
+        let script_pubkey = zcash_transparent::address::Script::from(address.script());
+
+        TransparentInputDto {
+            txid_hex: "01".repeat(32),
+            vout: 0,
+            script_pubkey_hex: hex::encode(&script_pubkey.0 .0),
+            value_zat,
+            pubkey_hex: hex::encode(pubkey.serialize()),
+            derivation_scope: 0,
+            address_index: 0,
+        }
+    }
+
+    /// Mainnet height well past NU5, so `target_height` lands on a real consensus
+    /// branch. Explicit, so the transparent path resolves it without any network.
+    const OFFLINE_ANCHOR_HEIGHT: u32 = 2_800_000;
+
+    fn transparent_request(
+        ufvk: Option<String>,
+        transparent_account_pubkey_hex: Option<String>,
+        input: TransparentInputDto,
+        output_value_zat: u64,
+    ) -> CraftRequest {
+        CraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk,
+            transparent_account_pubkey_hex,
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![input],
+            outputs: vec![OutputRequestDto {
+                value_zat: output_value_zat,
+                ..dummy_transparent_output()
+            }],
+            anchor_height: Some(OFFLINE_ANCHOR_HEIGHT),
+        }
+    }
+
+    /// The regression this whole path exists for: Public→Public with **no UFVK**,
+    /// only the transparent account pubkey, must build a complete PCZT — change
+    /// output included — without touching the network or the shielded pool.
+    #[tokio::test]
+    async fn public_to_public_builds_without_ufvk() {
+        let (_ufvk, apk, apk_hex) = test_account_keys();
+        // 100_000 in, 10_000 out, 10_000 fee → 80_000 of transparent change, so
+        // the change-derivation path is exercised rather than skipped.
+        let req = transparent_request(
+            None,
+            Some(apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+
+        let out = craft_transaction(req).await.expect("transparent build");
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(
+            out.n_transparent_outputs, 2,
+            "recipient + transparent change"
+        );
+        assert_eq!(out.n_actions_orchard, 0, "no Orchard bundle in a t→t send");
+        assert_eq!(out.fee, 10_000);
+    }
+
+    /// The transparent account pubkey and the UFVK's P2PKH item are the same 65
+    /// bytes, so the two forms must produce byte-identical transactions. This is
+    /// the fund-safety property behind the option: the change address and every
+    /// input's signing path cannot depend on which form the caller passed.
+    #[tokio::test]
+    async fn transparent_account_pubkey_and_ufvk_build_identically() {
+        let (ufvk, apk, apk_hex) = test_account_keys();
+
+        let from_ufvk = craft_transaction(transparent_request(
+            Some(ufvk),
+            None,
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        ))
+        .await
+        .expect("build from UFVK");
+        let from_apk = craft_transaction(transparent_request(
+            None,
+            Some(apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        ))
+        .await
+        .expect("build from account pubkey");
+
+        assert_eq!(from_apk.pczt_bytes, from_ufvk.pczt_bytes);
+    }
+
+    /// Neither form supplied: refused by the up-front guard, so the caller gets
+    /// one actionable message instead of whichever of change derivation or input
+    /// verification the flow would have reached first.
+    #[tokio::test]
+    async fn no_account_key_at_all_is_rejected_up_front() {
+        let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let req = transparent_request(None, None, owned_transparent_input(&apk, 100_000), 90_000);
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("craft: no account key"), "got: {msg}");
+    }
+
+    /// The guard is about the *absence of any key source*, not about the flow:
+    /// an Orchard spend with neither form hits the same up-front message rather
+    /// than the Orchard-specific one, since there is nothing to build from.
+    #[tokio::test]
+    async fn no_account_key_is_rejected_before_the_flow_matters() {
+        let req = CraftRequest {
+            spends: vec![dummy_spend()],
+            transparent_inputs: vec![],
+            ..transparent_request(None, None, dummy_transparent_input(), 10_000)
+        };
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("craft: no account key"), "got: {msg}");
+    }
+
+    /// A UFVK that carries no transparent component still leaves the deeper
+    /// verification in place: the guard above passes (a key source *was*
+    /// supplied) and step 5 refuses the input it cannot verify.
+    #[tokio::test]
+    async fn transparent_input_unverifiable_under_the_supplied_ufvk_is_rejected() {
+        use zcash_address::unified::{Container, Fvk};
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let keys = derive_keys(TEST_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let filtered = container
+            .items_as_parsed()
+            .iter()
+            .filter(|item| !matches!(item, Fvk::P2pkh(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ufvk_no_transparent = Ufvk::try_from_items(filtered).unwrap().encode(&net);
+
+        // Exact balance, so the change guard does not fire first and the error
+        // comes from input verification.
+        let req = transparent_request(
+            Some(ufvk_no_transparent),
+            None,
+            owned_transparent_input(&apk, 100_000),
+            90_000,
+        );
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("no transparent account key was given"),
+            "got: {msg}"
+        );
+    }
+
+    /// The two forms describing different accounts is a caller bug: deriving from
+    /// either one would produce a change address or signing path that does not
+    /// belong to the funds being spent, so the build fails instead of choosing.
+    #[tokio::test]
+    async fn mismatched_account_pubkey_and_ufvk_is_rejected() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        let (ufvk, apk, _apk_hex) = test_account_keys();
+        let other = derive_keys(TEST_MNEMONIC, 1, ZcashNetwork::Mainnet, None).unwrap();
+        let (_net, other_container) = Ufvk::decode(&other.ufvk).unwrap();
+        let other_apk_hex = hex::encode(
+            UnifiedFullViewingKey::parse(&other_container)
+                .unwrap()
+                .transparent()
+                .unwrap()
+                .serialize(),
+        );
+
+        let req = transparent_request(
+            Some(ufvk),
+            Some(other_apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("does not match the UFVK's transparent component"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_transparent_account_pubkey_is_rejected() {
+        let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let req = transparent_request(
+            None,
+            Some("ff".repeat(65)), // right length, not a valid secp256k1 point
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("not a valid account-level transparent pubkey"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transparent_account_pubkey_wrong_length_is_rejected() {
+        let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let req = transparent_request(
+            None,
+            Some("ab".repeat(64)),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(
+            msg.contains("transparent_account_pubkey: expected 65 bytes"),
+            "got: {msg}"
+        );
+    }
+
+    /// A shielded recipient makes the flow carry an Orchard bundle, which needs
+    /// Orchard key material the transparent pubkey cannot supply — so the UFVK
+    /// stays mandatory there, with an error that says so.
+    #[tokio::test]
+    async fn shielded_flow_without_ufvk_is_rejected() {
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        let (ufvk_str, apk, apk_hex) = test_account_keys();
+        let (_net, container) = Ufvk::decode(&ufvk_str).unwrap();
+        let (ua, _) = UnifiedFullViewingKey::parse(&container)
+            .unwrap()
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+
+        let req = CraftRequest {
+            // A unified address resolves to an Orchard destination.
+            outputs: vec![OutputRequestDto {
+                address: ua.encode(&Network::MainNetwork),
+                value_zat: 10_000,
+                memo: None,
+            }],
+            ..transparent_request(
+                None,
+                Some(apk_hex),
+                owned_transparent_input(&apk, 100_000),
+                10_000,
+            )
+        };
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("a UFVK is required"), "got: {msg}");
+    }
+
+    /// Same for an Orchard spend: the note cannot be spent without its FVK, and
+    /// the transparent account pubkey is no substitute — supplying it gets past
+    /// the key-source guard and straight to the Orchard requirement.
+    #[tokio::test]
+    async fn orchard_spend_without_ufvk_is_rejected() {
+        let (_ufvk, _apk, apk_hex) = test_account_keys();
+        let req = CraftRequest {
+            spends: vec![dummy_spend()],
+            transparent_inputs: vec![],
+            ..transparent_request(None, Some(apk_hex), dummy_transparent_input(), 10_000)
+        };
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("a UFVK is required"), "got: {msg}");
     }
 
     // ── Ironwood (NU6.3) — craft_ironwood_transaction ─────────────────────────
@@ -1408,10 +1773,7 @@ mod tests {
             anchor_height: Some(1),
         };
         let err = craft_ironwood_transaction(req).await.unwrap_err();
-        assert!(
-            err.to_string().contains("no Ironwood bundle"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("no Ironwood bundle"), "got: {err}");
     }
 
     /// Ironwood→* routing: a real Ironwood spend must route through

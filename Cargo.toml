@@ -49,6 +49,8 @@ napi-derive  = "2.16"
 
 # Key derivation
 bip39     = "2"
+# Keep the lock on the 0.32.x maintenance line: the parallel 0.32.10x feature line sorts
+# higher, so a broad `cargo update` silently drifts onto it.
 bitcoin   = "0.32"
 # secp256k1 0.29.x is already in Cargo.lock (transitive via bitcoin + zcash_transparent).
 # Declared explicitly here so zcash-crypto can name the secp256k1::PublicKey that
@@ -60,18 +62,17 @@ rayon   = "1"
 futures = "0.3"
 
 # Merkle tree for on-demand witness computation.
-# Must stay version-compatible with the transitive copies pulled by orchard
-# and zcash_client_backend (locked at 0.8.2 / 0.6.2 in Cargo.lock).
+# Must match the copy zcash_client_backend links (0.7), or the tree types diverge under
+# identical names and witnesses cannot cross.
 incrementalmerkletree = "0.8"
-shardtree             = "0.6"
+shardtree             = "0.7"
 
 # Partially Created Zcash Transaction format (wire format + role helpers).
 # Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
 # (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
-# 0.9.2 is a stable release (published 2026-08-04) carrying the Ironwood extraction
-# support that landed in 0.8.0 stable (2026-07-24): `Signer::apply_ironwood_signature`
-# plus the dual binding signature applied via `TransactionExtractor`.
-pczt = { version = "=0.9.2", default-features = false, features = [
+# Pinned exactly: this defines the byte stream the firmware parses, so it moves only as a
+# deliberate, tested step — never as a side effect of `cargo update`.
+pczt = { version = "=0.9.3", default-features = false, features = [
     "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
     "signer", "tx-extractor", "spend-finalizer",
 ] }
