@@ -108,6 +108,9 @@ pub struct CraftRequest {
     /// component is authoritative and this field only has to agree with it (a
     /// disagreement is a caller bug and fails the build). It is the sole source
     /// when the UFVK is absent.
+    ///
+    /// One of the two must be supplied — see the guard at the top of
+    /// [`craft_transaction`] for why the rule is checked rather than typed.
     pub transparent_account_pubkey_hex: Option<String>,
     /// `"mainnet"` / `"testnet"`. `None` ⇒ testnet (matches sync default).
     pub network: Option<String>,
@@ -142,6 +145,20 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     }
     if req.outputs.is_empty() {
         return Err(anyhow!("craft: outputs list is empty"));
+    }
+    // Supplying neither key source is a caller mistake no flow can recover from,
+    // so it is refused here with one message rather than a few calls deeper,
+    // where it would surface as whichever of change derivation or input
+    // verification the flow happened to reach first. The two fields are
+    // independently optional because the JS-facing struct they cross
+    // (`BuildTransactionParams`) cannot express "exactly one of" — napi has no
+    // encoding for a data-carrying enum.
+    if req.ufvk.is_none() && req.transparent_account_pubkey_hex.is_none() {
+        return Err(anyhow!(
+            "craft: no account key — neither a UFVK nor transparent_account_pubkey was \
+             supplied; a fully transparent send needs the account's transparent pubkey, and \
+             every flow with a shielded bundle needs the UFVK"
+        ));
     }
 
     let network = parse_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
@@ -1444,14 +1461,60 @@ mod tests {
         assert_eq!(from_apk.pczt_bytes, from_ufvk.pczt_bytes);
     }
 
-    /// Neither form supplied: the build must refuse rather than proceed on an
-    /// unverified derivation path.
+    /// Neither form supplied: refused by the up-front guard, so the caller gets
+    /// one actionable message instead of whichever of change derivation or input
+    /// verification the flow would have reached first.
     #[tokio::test]
-    async fn transparent_input_without_any_account_key_is_rejected() {
+    async fn no_account_key_at_all_is_rejected_up_front() {
         let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let req = transparent_request(None, None, owned_transparent_input(&apk, 100_000), 90_000);
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("craft: no account key"), "got: {msg}");
+    }
+
+    /// The guard is about the *absence of any key source*, not about the flow:
+    /// an Orchard spend with neither form hits the same up-front message rather
+    /// than the Orchard-specific one, since there is nothing to build from.
+    #[tokio::test]
+    async fn no_account_key_is_rejected_before_the_flow_matters() {
+        let req = CraftRequest {
+            spends: vec![dummy_spend()],
+            transparent_inputs: vec![],
+            ..transparent_request(None, None, dummy_transparent_input(), 10_000)
+        };
+
+        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        assert!(msg.contains("craft: no account key"), "got: {msg}");
+    }
+
+    /// A UFVK that carries no transparent component still leaves the deeper
+    /// verification in place: the guard above passes (a key source *was*
+    /// supplied) and step 5 refuses the input it cannot verify.
+    #[tokio::test]
+    async fn transparent_input_unverifiable_under_the_supplied_ufvk_is_rejected() {
+        use zcash_address::unified::{Container, Fvk};
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        let (_ufvk, apk, _apk_hex) = test_account_keys();
+        let keys = derive_keys(TEST_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let filtered = container
+            .items_as_parsed()
+            .iter()
+            .filter(|item| !matches!(item, Fvk::P2pkh(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let ufvk_no_transparent = Ufvk::try_from_items(filtered).unwrap().encode(&net);
+
         // Exact balance, so the change guard does not fire first and the error
         // comes from input verification.
-        let req = transparent_request(None, None, owned_transparent_input(&apk, 100_000), 90_000);
+        let req = transparent_request(
+            Some(ufvk_no_transparent),
+            None,
+            owned_transparent_input(&apk, 100_000),
+            90_000,
+        );
 
         let msg = craft_transaction(req).await.unwrap_err().to_string();
         assert!(
@@ -1560,13 +1623,16 @@ mod tests {
         assert!(msg.contains("a UFVK is required"), "got: {msg}");
     }
 
-    /// Same for an Orchard spend: the note cannot be spent without its FVK.
+    /// Same for an Orchard spend: the note cannot be spent without its FVK, and
+    /// the transparent account pubkey is no substitute — supplying it gets past
+    /// the key-source guard and straight to the Orchard requirement.
     #[tokio::test]
     async fn orchard_spend_without_ufvk_is_rejected() {
+        let (_ufvk, _apk, apk_hex) = test_account_keys();
         let req = CraftRequest {
             spends: vec![dummy_spend()],
             transparent_inputs: vec![],
-            ..transparent_request(None, None, dummy_transparent_input(), 10_000)
+            ..transparent_request(None, Some(apk_hex), dummy_transparent_input(), 10_000)
         };
 
         let msg = craft_transaction(req).await.unwrap_err().to_string();

@@ -322,6 +322,14 @@ pub struct TransparentInputJs {
     pub address_index: u32,
 }
 
+/// Arguments for [`build_transaction`].
+///
+/// **Invariant: supply `ufvk`, or `transparentAccountPubkey`, or both.** The two
+/// are declared independently optional because this struct crosses into JS,
+/// where "exactly one of" has no encoding — napi rejects a data-carrying enum —
+/// so the rule cannot live in the type. Supplying neither is refused up front,
+/// before any work, rather than deeper in the build. Which one a given flow
+/// needs is on each field below.
 #[napi(object)]
 pub struct BuildTransactionParams {
     pub grpc_url: String,
