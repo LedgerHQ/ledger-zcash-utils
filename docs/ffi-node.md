@@ -61,9 +61,10 @@ const stats: SyncStats = await stream.stats()
 
 ### Building a transaction
 
-`buildTransaction` assembles, proves, and serializes a PCZT for an Orchard
-send. The spend inputs come from notes previously found during scanning, and
-the result is the canonical PCZT hex ready for the device APDU streaming layer.
+`buildTransaction` assembles, proves, and serializes a PCZT for a send from the
+Orchard pool, from the transparent pool, or from both. Orchard spend inputs come
+from notes previously found during scanning, and the result is the canonical PCZT
+hex ready for the device APDU streaming layer.
 
 > **Note:** The fee is selected by the caller (ledger-live), not computed here.
 > It is validated against ZIP-317 and used to derive change. The
@@ -116,6 +117,40 @@ const result: BuildTransactionResult = await buildTransaction({
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex)
 ```
+
+#### Transparent-only sends: no UFVK
+
+A fully transparent send (transparent inputs, transparent recipient) carries no
+shielded bundle and reads no shielded key material. Its only key requirement is
+the account-level transparent pubkey at `m/44'/coin'/account'` — used to derive
+the internal change address and to verify each input's signing path — so it can
+be built without a UFVK at all. That matters for the wallet: exporting a UFVK
+takes a user confirmation on the device, and spending public funds must not
+require one.
+
+Pass those 65 bytes (32-byte chain code ‖ 33-byte compressed pubkey, the payload
+of the account xpub) as `transparentAccountPubkey` and omit `ufvk`:
+
+```typescript
+const result = await buildTransaction({
+  grpcUrl: 'https://zaino-zec-testnet.nodes.stg.ledger-test.com/',
+  // No `ufvk` — this send has no shielded bundle.
+  transparentAccountPubkey: '<130-char hex: chainCode ‖ compressed pubkey>',
+  network: 'testnet',
+  seedFingerprint: '...',
+  accountIndex: 0,
+  feeZat: '10000',
+  spends: [], // no Orchard notes
+  transparentInputs: [/* UTXOs, with their (derivationScope, addressIndex) */],
+  outputs: [{ address: 't1...', valueZat: '90000' }],
+})
+```
+
+Both fields may be supplied together — the UFVK's transparent component is then
+authoritative and `transparentAccountPubkey` only has to agree with it; a
+mismatch fails the build rather than picking one. Any flow with a shielded
+bundle (an Orchard spend, or a shielded recipient) still requires `ufvk`, and
+`buildIronwoodTransaction` always does.
 
 ### Parsing a PCZT for the device signer
 
