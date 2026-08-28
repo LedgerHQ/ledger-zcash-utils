@@ -14,6 +14,8 @@
 //!   flows and the Ironwood (NU6.3) V6 bundle path
 //! - [`finalize`]: Inject device signatures into a PCZT and extract the final signed V5 transaction
 //! - [`parse`]: Parse canonical PCZT bytes into a structured, device-signer-ready form
+//! - [`testing`]: TEST-ONLY signing surface for the `ledger-live` coin-tester —
+//!   never call from production wallet code
 
 mod circuit;
 pub mod craft;
@@ -25,4 +27,5 @@ pub mod keys;
 pub mod network;
 pub mod parse;
 pub mod payee;
+pub mod testing;
 pub mod tree;

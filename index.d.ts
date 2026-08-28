@@ -679,6 +679,57 @@ export declare function parsePczt(pcztHex: string): PcztTransaction
  * all available receivers and does NOT match the device address.
  */
 export declare function orchardAddressFromUfvk(ufvk: string): string
+/** TEST-ONLY. Account UFVK + transparent xpub, as derived from a mnemonic. */
+export interface TestDerivedKeys {
+  ufvk: string
+  xpub: string
+}
+/**
+ * TEST-ONLY. Derives the account UFVK and transparent xpub from a mnemonic.
+ * Not named `deriveKeys` — that name is reserved for an anticipated future
+ * production export.
+ *
+ * Exists so the `ledger-live` coin-tester can obtain the same UFVK/xpub a
+ * device would report, without a physical Ledger. Never call this from
+ * production wallet code: it holds the mnemonic (spending-key material) in
+ * process memory, which the production host must never do.
+ */
+export declare function testDeriveKeys(mnemonic: string, account: number, network: string): TestDerivedKeys
+/** TEST-ONLY. Result of [`test_sign_pczt`]. */
+export interface TestSignPcztResult {
+  /**
+   * 128-hex-char RedPallas `spendAuthSig`, one per unsigned Orchard action,
+   * in PCZT-action order. Empty when the PCZT carries no Orchard bundle.
+   */
+  orchardSignatures: Array<string>
+  /**
+   * 128-hex-char RedPallas `spendAuthSig`, one per unsigned Ironwood
+   * action, in PCZT-action order. Empty when the PCZT carries no Ironwood
+   * bundle (e.g. a V5/Orchard or transparent-only PCZT).
+   */
+  ironwoodSignatures: Array<string>
+  /**
+   * Hex DER secp256k1 signature, one per transparent input, in input order.
+   * Empty when the PCZT carries no transparent inputs.
+   */
+  transparentSignatures: Array<string>
+}
+/**
+ * TEST-ONLY. Signs whichever bundles the PCZT carries (Orchard actions,
+ * Ironwood actions, transparent inputs) using spending-key material derived
+ * from `mnemonic`. An absent bundle yields an empty list for that leg, not
+ * an error.
+ *
+ * Exists so the `ledger-live` coin-tester can act as a device stand-in in
+ * CI: `coin-zcash` routes z→z, z→t and t→z through the V6/Ironwood builder
+ * (only t→t stays V5), so both spend-auth legs are covered here. Never call
+ * this from production wallet code: it derives and holds spending-key
+ * material from a seed, which the production host must never do.
+ *
+ * CPU-bound (Orchard/Ironwood proving-key-adjacent signing work): dispatched
+ * to `tokio::task::spawn_blocking`, mirroring `finalize_transaction`.
+ */
+export declare function testSignPczt(mnemonic: string, account: number, network: string, pcztHex: string): Promise<TestSignPcztResult>
 /**
  * Async iterator over matched shielded transactions.
  *

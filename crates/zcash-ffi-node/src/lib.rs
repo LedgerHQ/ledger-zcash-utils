@@ -1301,6 +1301,128 @@ fn grpc_tx_to_napi(tx: GrpcTx) -> ShieldedTransaction {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST-ONLY SURFACE — never call from production wallet code.
+// Derives/holds spending-key material from a seed. Exists solely so the
+// ledger-live coin-tester can act as a device stand-in in CI. The production
+// host stays watch-only; do not add a spending-key parameter to any function
+// outside this block.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Parses `"mainnet"` / `"testnet"` into [`zcash_crypto::keys::ZcashNetwork`].
+/// Kept local to this test-only block rather than reusing
+/// `zcash_crypto::network::parse_network` because that helper returns
+/// `zcash_protocol::consensus::Network` (a different type, not otherwise
+/// needed by this crate).
+fn parse_test_network(network: &str) -> napi::Result<zcash_crypto::keys::ZcashNetwork> {
+    match network {
+        "mainnet" => Ok(zcash_crypto::keys::ZcashNetwork::Mainnet),
+        "testnet" => Ok(zcash_crypto::keys::ZcashNetwork::Testnet),
+        other => Err(napi::Error::from_reason(format!(
+            "unknown network {other:?}, expected \"mainnet\" or \"testnet\""
+        ))),
+    }
+}
+
+/// TEST-ONLY. Account UFVK + transparent xpub, as derived from a mnemonic.
+#[napi(object)]
+pub struct TestDerivedKeys {
+    pub ufvk: String,
+    pub xpub: String,
+}
+
+/// TEST-ONLY. Derives the account UFVK and transparent xpub from a mnemonic.
+/// Not named `deriveKeys` — that name is reserved for an anticipated future
+/// production export.
+///
+/// Exists so the `ledger-live` coin-tester can obtain the same UFVK/xpub a
+/// device would report, without a physical Ledger. Never call this from
+/// production wallet code: it holds the mnemonic (spending-key material) in
+/// process memory, which the production host must never do.
+#[napi]
+pub fn test_derive_keys(
+    mnemonic: String,
+    account: u32,
+    network: String,
+) -> napi::Result<TestDerivedKeys> {
+    let network = parse_test_network(&network)?;
+    let (ufvk, xpub) = zcash_crypto::testing::derive_ufvk_and_xpub(&mnemonic, account, network)
+        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+    Ok(TestDerivedKeys { ufvk, xpub })
+}
+
+/// TEST-ONLY. Result of [`test_sign_pczt`].
+#[napi(object)]
+pub struct TestSignPcztResult {
+    /// 128-hex-char RedPallas `spendAuthSig`, one per unsigned Orchard action,
+    /// in PCZT-action order. Empty when the PCZT carries no Orchard bundle.
+    pub orchard_signatures: Vec<String>,
+    /// 128-hex-char RedPallas `spendAuthSig`, one per unsigned Ironwood
+    /// action, in PCZT-action order. Empty when the PCZT carries no Ironwood
+    /// bundle (e.g. a V5/Orchard or transparent-only PCZT).
+    pub ironwood_signatures: Vec<String>,
+    /// Hex DER secp256k1 signature, one per transparent input, in input order.
+    /// Empty when the PCZT carries no transparent inputs.
+    pub transparent_signatures: Vec<String>,
+}
+
+/// TEST-ONLY. Signs whichever bundles the PCZT carries (Orchard actions,
+/// Ironwood actions, transparent inputs) using spending-key material derived
+/// from `mnemonic`. An absent bundle yields an empty list for that leg, not
+/// an error.
+///
+/// Exists so the `ledger-live` coin-tester can act as a device stand-in in
+/// CI: `coin-zcash` routes z→z, z→t and t→z through the V6/Ironwood builder
+/// (only t→t stays V5), so both spend-auth legs are covered here. Never call
+/// this from production wallet code: it derives and holds spending-key
+/// material from a seed, which the production host must never do.
+///
+/// CPU-bound (Orchard/Ironwood proving-key-adjacent signing work): dispatched
+/// to `tokio::task::spawn_blocking`, mirroring `finalize_transaction`.
+#[napi]
+pub async fn test_sign_pczt(
+    mnemonic: String,
+    account: u32,
+    network: String,
+    pczt_hex: String,
+) -> napi::Result<TestSignPcztResult> {
+    let network = parse_test_network(&network)?;
+    let pczt_bytes = hex::decode(&pczt_hex)
+        .map_err(|e| napi::Error::from_reason(format!("pczt_hex decode: {e}")))?;
+
+    let result = tokio::task::spawn_blocking(move || -> Result<_, zcash_crypto::error::Error> {
+        let seed = zcash_crypto::testing::mnemonic_to_seed(&mnemonic)?;
+        let ask = zcash_crypto::testing::derive_orchard_ask(&mnemonic, network, account)?;
+
+        let orchard_signatures =
+            zcash_crypto::testing::sign_pczt_orchard_actions(&pczt_bytes, &ask)?;
+        let ironwood_signatures =
+            zcash_crypto::testing::sign_pczt_ironwood_actions(&pczt_bytes, &ask)?;
+        let transparent_signatures =
+            zcash_crypto::testing::sign_pczt_transparent_inputs(&pczt_bytes, &seed, network)?;
+
+        Ok((orchard_signatures, ironwood_signatures, transparent_signatures))
+    })
+    .await
+    .map_err(|e| {
+        let kind = if e.is_cancelled() {
+            "was cancelled"
+        } else {
+            "panicked"
+        };
+        napi::Error::from_reason(format!("test_sign_pczt task {kind}: {e}"))
+    })?
+    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+    let (orchard_signatures, ironwood_signatures, transparent_signatures) = result;
+
+    Ok(TestSignPcztResult {
+        orchard_signatures: orchard_signatures.iter().map(hex::encode).collect(),
+        ironwood_signatures: ironwood_signatures.iter().map(hex::encode).collect(),
+        transparent_signatures: transparent_signatures.iter().map(hex::encode).collect(),
+    })
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
