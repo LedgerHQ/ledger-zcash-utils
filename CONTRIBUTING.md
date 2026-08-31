@@ -79,6 +79,30 @@ cargo check --workspace
 - [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
 - [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
 
+## Contributing workflow
+
+Branch off `main`. Names are lowercase and hyphen-separated, prefixed with the same type word the commits will use; when the work has a JIRA ticket, its number follows that prefix:
+
+```
+feat/live-35017-transaction-details    # with a ticket
+fix/zero-anchor                        # without
+release/2.2.0                          # version bump
+```
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) — `type(scope): subject`. No CI check validates the format: it holds by review, so match the surrounding history (`git log --oneline`) when in doubt.
+
+`type` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, or `release` for a version bump. `scope` is optional and names either a crate (`zcash-crypto`, `zcash-sync`, `zcash-ffi-node`, `zcash-cli`) or the area touched (`craft`, `broadcast`, `ironwood`, `ci`, `deps`). The subject is lowercase and imperative with no trailing period, and the body carries why the change is needed and what it implies — the reasoning a diff cannot show, which most non-trivial commits here do have.
+
+```
+fix(craft): reject a build with no account key up front
+feat: surface the Ironwood bundle from parsePczt
+release: 2.2.0
+```
+
+Commits must be signed; a branch ruleset on `main` rejects unsigned ones. Do not work around it by disabling signing.
+
+Open the pull request against `main` — it needs one approval to merge, and an extra one if it contains changes GitHub cannot attribute to an identified author. Title it like a commit subject; the JIRA key may be appended in brackets (`feat(craft): … [LIVE-36260]`) but is not required. A user-visible change also needs a changeset (see [Release](#release)).
+
 ## Release
 
 Versioning is managed with [Changesets](https://github.com/changesets/action). Every merge to `main` triggers the CI workflow, which:

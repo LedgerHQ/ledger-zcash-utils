@@ -2,7 +2,7 @@
 
 Rust workspace exposing Zcash shielded scanning and PCZT crafting to Ledger Live, as a Node.js native addon and a developer CLI.
 
-Three files already answer the usual questions: [`README.md`](README.md) is the published JS/TS API, [`CONTRIBUTING.md`](CONTRIBUTING.md) is build, test, CLI usage and release, [`docs/`](docs/) is architecture and per-area detail. This file adds only the invariants those leave implicit, and points at wherever each one is enforced rather than restating a value that will move.
+Three files already answer the usual questions: [`README.md`](README.md) is the published JS/TS API, [`CONTRIBUTING.md`](CONTRIBUTING.md) is build, test, CLI usage, the contribution conventions and release, [`docs/`](docs/) is architecture and per-area detail. This file adds only the invariants those leave implicit, and points at wherever each one is enforced rather than restating a value that will move.
 
 ## Dependency pins are load-bearing — never run a broad `cargo update`
 
@@ -36,6 +36,12 @@ Before trusting a bare `cargo check` or `cargo test`, read `default-members` in 
 ## New exports follow the CLI-exposure rule
 
 `docs/architecture.md` fixes the sequence, from the core crate through the NAPI wrapper to a CLI subcommand, and allows the CLI step to be skipped for a device-coupled feature whose standalone invocation could only produce an unsignable artifact. Skipping is allowed; skipping silently is not — record the reason inline in that document, alongside the exceptions already listed there.
+
+## Branch, commit and PR conventions are written down — read them, don't infer them
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md#contributing-workflow) holds the branch naming, the commit grammar and what a pull request needs. It is not repeated here.
+
+Two properties of it change how an agent should behave. Nothing in CI validates a commit subject or a PR title — there is no commitlint, no gitmoji check, no reviewing bot — so a malformed message is caught by a human or not at all, and the convention differs from one Ledger repo to the next: read this repo's own history rather than carrying over a house style from another. And signed commits are required by a branch ruleset on `main`, so an unsigned commit simply cannot merge — when signing fails, fix the signing setup and never propose bypassing it.
 
 ## Every user-visible change needs a changeset
 
