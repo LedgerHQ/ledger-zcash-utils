@@ -1,8 +1,6 @@
 # @ledgerhq/zcash-utils
 
-Rust workspace for Zcash cryptographic operations. Provides key derivation,
-shielded transaction decryption, and compact block scanning across multiple
-runtime targets.
+Rust workspace for Zcash cryptographic operations. Provides key derivation, shielded transaction decryption, and compact block scanning across multiple runtime targets.
 
 ## Build targets
 
@@ -23,8 +21,7 @@ zcash-ffi-node   Node.js / Electron native addon (napi-rs)
 zcash-cli        CLI binary (ledger-zcash-cli)
 ```
 
-See [`docs/architecture.md`](docs/architecture.md) for the dependency graph and
-design decisions.
+See [`docs/architecture.md`](docs/architecture.md) for the dependency graph and design decisions.
 
 ## CLI usage
 
@@ -45,9 +42,7 @@ ledger-zcash-cli sync \
     --format json
 ```
 
-`derive` prints the UFVK, the multi-receiver unified address, the
-transparent xpub, and per-pool (Sapling + Orchard) FVK/IVK/OVK. No spending
-key material is ever exposed.
+`derive` prints the UFVK, the multi-receiver unified address, the transparent xpub, and per-pool (Sapling + Orchard) FVK/IVK/OVK. No spending key material is ever exposed.
 
 ### `derive` options
 
@@ -123,10 +118,10 @@ CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are no
 
 ### Required secrets and variables
 
-| Secret / Variable              | Purpose                                               |
-| ------------------------------ | ----------------------------------------------------- |
-| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions              |
-| `vars.ARTIFACTORY_PUBLISH_URL` | JFrog Artifactory registry URL (without `https://`)  |
+| Secret / Variable              | Purpose                                             |
+| ------------------------------ | --------------------------------------------------- |
+| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions            |
+| `vars.ARTIFACTORY_PUBLISH_URL` | JFrog Artifactory registry URL (without `https://`) |
 
 ## License
 

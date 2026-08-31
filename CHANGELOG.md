@@ -4,48 +4,19 @@
 
 ### Minor Changes
 
-- 0a94002: Build a transparent send without a UFVK. `buildTransaction` required a UFVK for
-  every flow, including a fully transparent one — which carries no shielded bundle
-  and reads no shielded key material. Its only key requirement is the
-  account-level transparent pubkey at `m/44'/coin'/account'`, used to derive the
-  internal change address and to verify each input's signing path. A wallet always
-  holds those bytes (they are the payload of the account xpub) whereas obtaining a
-  UFVK takes a user confirmation on the device, so the requirement forced a
-  viewing-key export on anyone spending public funds.
+- 0a94002: Build a transparent send without a UFVK. `buildTransaction` required a UFVK for every flow, including a fully transparent one — which carries no shielded bundle and reads no shielded key material. Its only key requirement is the account-level transparent pubkey at `m/44'/coin'/account'`, used to derive the internal change address and to verify each input's signing path. A wallet always holds those bytes (they are the payload of the account xpub) whereas obtaining a UFVK takes a user confirmation on the device, so the requirement forced a viewing-key export on anyone spending public funds.
 
-  `ufvk` is now optional and a `transparentAccountPubkey` field accepts those 65
-  bytes (32-byte chain code ‖ 33-byte compressed pubkey) as hex. A transparent
-  send supplies the pubkey and omits the UFVK; both may be supplied together, in
-  which case the UFVK's transparent component is authoritative and the standalone
-  field only has to agree with it — a mismatch means key material from two
-  different accounts and fails the build rather than picking one. Every flow with
-  a shielded bundle (an Orchard spend, or a shielded recipient) still requires the
-  UFVK and now says so explicitly instead of failing deeper on a missing Orchard
-  component; `buildIronwoodTransaction`, whose bundle is always shielded, is
-  unchanged.
+  `ufvk` is now optional and a `transparentAccountPubkey` field accepts those 65 bytes (32-byte chain code ‖ 33-byte compressed pubkey) as hex. A transparent send supplies the pubkey and omits the UFVK; both may be supplied together, in which case the UFVK's transparent component is authoritative and the standalone field only has to agree with it — a mismatch means key material from two different accounts and fails the build rather than picking one. Every flow with a shielded bundle (an Orchard spend, or a shielded recipient) still requires the UFVK and now says so explicitly instead of failing deeper on a missing Orchard component; `buildIronwoodTransaction`, whose bundle is always shielded, is unchanged.
 
-  The two orchestrators now share one transparent-input decoder, so the
-  fund-safety check that ties each input's `(derivationScope, addressIndex)` to
-  its pubkey has a single implementation instead of two copies.
+  The two orchestrators now share one transparent-input decoder, so the fund-safety check that ties each input's `(derivationScope, addressIndex)` to its pubkey has a single implementation instead of two copies.
 
 ### Patch Changes
 
-- 0a94002: Refresh the dependency lock and collapse the duplicate `shardtree`. The lock
-  carried two copies of it — our own `0.6.2` plus the `0.7.0` that
-  `zcash_client_backend` links — so the commitment-tree types existed twice under
-  identical names and a witness built against one could not cross into the other.
-  Declaring `shardtree = "0.7"` leaves a single `0.7.1` copy that both sides share.
+- 0a94002: Refresh the dependency lock and collapse the duplicate `shardtree`. The lock carried two copies of it — our own `0.6.2` plus the `0.7.0` that `zcash_client_backend` links — so the commitment-tree types existed twice under identical names and a witness built against one could not cross into the other. Declaring `shardtree = "0.7"` leaves a single `0.7.1` copy that both sides share.
 
-  `pczt` moves to `0.9.3`, still pinned exactly: it defines the byte stream the
-  firmware parses, so it may only move as a deliberate, tested step and never as a
-  side effect of `cargo update`. `bitcoin` stays on the `0.32.x` maintenance line
-  for the same reason — the parallel `0.32.10x` feature line sorts higher and a
-  broad update would otherwise drift onto it — and the pin is now documented in
-  `Cargo.toml` so the next refresh keeps it.
+  `pczt` moves to `0.9.3`, still pinned exactly: it defines the byte stream the firmware parses, so it may only move as a deliberate, tested step and never as a side effect of `cargo update`. `bitcoin` stays on the `0.32.x` maintenance line for the same reason — the parallel `0.32.10x` feature line sorts higher and a broad update would otherwise drift onto it — and the pin is now documented in `Cargo.toml` so the next refresh keeps it.
 
-  The rest is a routine refresh of transitive dependencies. No Zcash protocol crate
-  moves: `zcash_primitives`, `zcash_keys`, `zcash_transparent`, `orchard` and
-  `zcash_client_backend` all stay where they were.
+  The rest is a routine refresh of transitive dependencies. No Zcash protocol crate moves: `zcash_primitives`, `zcash_keys`, `zcash_transparent`, `orchard` and `zcash_client_backend` all stay where they were.
 
 ## 2.1.1
 
@@ -73,17 +44,12 @@
 
   Since 0.3.1 the addon grew from a scan-only library into a full Orchard send pipeline:
 
-  - V5 PCZT transaction builder supporting Orchard send flows and mixed
-    transparent + Orchard inputs, with bip32 derivation stamped on the change
-    output and every transparent input
-  - `buildTransaction`, `finalizeTransaction`, and `broadcastTransaction` to
-    build, finalize, and submit a shielded transaction
-  - `parsePczt(pcztHex)` to decode canonical PCZT bytes into a structured
-    `PcztTransaction` consumed by `@ledgerhq/device-signer-kit-zcash`
+  - V5 PCZT transaction builder supporting Orchard send flows and mixed transparent + Orchard inputs, with bip32 derivation stamped on the change output and every transparent input
+  - `buildTransaction`, `finalizeTransaction`, and `broadcastTransaction` to build, finalize, and submit a shielded transaction
+  - `parsePczt(pcztHex)` to decode canonical PCZT bytes into a structured `PcztTransaction` consumed by `@ledgerhq/device-signer-kit-zcash`
   - On-demand Orchard ShardTree witness computation at craft time
   - `findBlockHeight(grpcUrl, timestamp)` binary search over block timestamps
-  - NU6.2-aware crate versions for correct branch-id resolution and shielded
-    parsing at/above the NU6.2 activation height
+  - NU6.2-aware crate versions for correct branch-id resolution and shielded parsing at/above the NU6.2 activation height
 
 ### Minor Changes
 
@@ -124,8 +90,7 @@
   - `zcash_crypto::tree::{build_witnesses, WitnessInputs, WitnessOutput, ShardLeaves}`
   - `zcash_sync::witness::{compute_witnesses, WitnessRequest, NoteRef}`
 
-  Witness data is fetched and assembled on demand at craft time. No tree state
-  is persisted between calls.
+  Witness data is fetched and assembled on demand at craft time. No tree state is persisted between calls.
 
 - 68d013b: Add `buildIronwoodTransaction` for the Ironwood (NU6.3) shielded pool: builds, proves, and serializes an unsigned V6 PCZT carrying an Ironwood bundle (spends and/or outputs), reusing the existing Orchard V5 crafting lifecycle against the updated Action circuit. Ironwood outputs use the `0x03` quantum-recoverable note plaintext, the emitted PCZT is redacted and serialized in the v2 wire format (required for any V6 transaction), and a dedicated non-zero-anchor check rejects an all-zero Ironwood commitment-tree root before it can be silently embedded. Anchor/witness resolution reuses the existing Ironwood sync path (`fetchIronwoodAnchor` / Ironwood witness computation). The shipped Orchard V5 send flow (`buildTransaction`) is unchanged. Like the V5 builder, this is device-coupled (not exposed via the CLI) and depends on release-candidate wallet-side crates (`pczt`, `zcash_client_backend`) pending stable NU6.3 releases.
 - 65c6a95: Add `transactionDetails`, which fetches transactions by txid and reads from each what only the raw bytes hold: the fee it actually paid, and the addresses its shielded outputs paid.

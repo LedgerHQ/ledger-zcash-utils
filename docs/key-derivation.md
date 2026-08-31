@@ -2,9 +2,7 @@
 
 ## Overview
 
-`zcash-crypto::keys` derives all Zcash viewing keys — and the default
-receiving address — for a given account from a BIP-39 mnemonic. No spending
-key material is returned.
+`zcash-crypto::keys` derives all Zcash viewing keys — and the default receiving address — for a given account from a BIP-39 mnemonic. No spending key material is returned.
 
 ## Derivation pipeline
 
@@ -31,7 +29,7 @@ BIP-39 mnemonic (12 or 24 words)
 ## Key formats
 
 | Key | Format | Size | Reveals |
-|-----|--------|------|---------|
+| --- | --- | --- | --- |
 | UFVK | Bech32m (`uview1` / `uviewtest1`) | ~300 chars | all transactions (in + out) |
 | Multi-receiver unified address | Bech32m (`u1` / `utest1`) | ~120 chars | nothing (public, all receivers) |
 | Orchard-only unified address | Bech32m (`u1` / `utest1`) | ~106 chars | nothing (public, Orchard receiver only) |
@@ -45,37 +43,21 @@ BIP-39 mnemonic (12 or 24 words)
 
 ## Unified addresses — two distinct variants
 
-There are two different unified addresses produced by this library. They have
-different receiver sets and are **not interchangeable**.
+There are two different unified addresses produced by this library. They have different receiver sets and are **not interchangeable**.
 
 ### `DerivedKeys::multi_receiver_unified_address` (derive_keys output)
 
-Derived via `UnifiedAddress::default_address(AllAvailableKeys)` — includes
-every receiver the UFVK can produce (Orchard + Sapling, or Orchard + Sapling +
-transparent depending on the UFVK composition). Around 120 chars (`u1…`).
-It is independent of `DeriveOptions.include_sapling_in_ufvk`, which only
-controls what's bundled into the encoded UFVK *string*, not the in-memory
-viewing key object. **This address is NOT what the Ledger device shows on the
-Receive screen** — the device derives an Orchard-only address.
+Derived via `UnifiedAddress::default_address(AllAvailableKeys)` — includes every receiver the UFVK can produce (Orchard + Sapling, or Orchard + Sapling + transparent depending on the UFVK composition). Around 120 chars (`u1…`). It is independent of `DeriveOptions.include_sapling_in_ufvk`, which only controls what's bundled into the encoded UFVK _string_, not the in-memory viewing key object. **This address is NOT what the Ledger device shows on the Receive screen** — the device derives an Orchard-only address.
 
 ### `orchard_address_from_ufvk(ufvk_str)` (standalone function)
 
-Takes an encoded UFVK string (`uview1…`) and returns an Orchard-only unified
-address — a `UnifiedAddress` with only an Orchard receiver, no Sapling, no
-transparent. Around 106 chars (`u1…`). This matches exactly what the Zcash
-Ledger app derives internally when `GetShieldedAddress` is called (INS 0x51),
-so it is the correct address to display on the Receive screen and to verify
-against the device.
+Takes an encoded UFVK string (`uview1…`) and returns an Orchard-only unified address — a `UnifiedAddress` with only an Orchard receiver, no Sapling, no transparent. Around 106 chars (`u1…`). This matches exactly what the Zcash Ledger app derives internally when `GetShieldedAddress` is called (INS 0x51), so it is the correct address to display on the Receive screen and to verify against the device.
 
-Use this function when you need to show the user their shielded receive address
-without having the device connected.
+Use this function when you need to show the user their shielded receive address without having the device connected.
 
 ## UFVK composition (ZIP-316)
 
-The UFVK bundles multiple pool FVKs in a single Bech32m string. By default it
-includes: transparent (P2PKH), Sapling, and Orchard. Sapling can be excluded
-via `DeriveOptions { include_sapling_in_ufvk: false }` (e.g. for wallets that
-have migrated fully to Orchard).
+The UFVK bundles multiple pool FVKs in a single Bech32m string. By default it includes: transparent (P2PKH), Sapling, and Orchard. Sapling can be excluded via `DeriveOptions { include_sapling_in_ufvk: false }` (e.g. for wallets that have migrated fully to Orchard).
 
 ## Known test vector
 
@@ -90,6 +72,7 @@ network  : mainnet
 ```
 
 Alice testnet account (used in integration tests):
+
 ```
 mnemonic : "wish puppy smile loan doll ..."
 account  : 0
@@ -126,6 +109,7 @@ pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error>;
 ```
 
 NAPI (Node.js) exposure:
+
 ```ts
 // From @ledgerhq/zcash-utils
 orchardAddressFromUfvk(ufvk: string): string

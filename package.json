@@ -32,6 +32,9 @@
     "// ── Coverage ───────────────────────────────────────────────────────": "",
     "coverage": "./scripts/coverage.sh",
     "coverage:open": "OPEN_REPORT=1 ./scripts/coverage.sh",
+    "// ── Formatting ─────────────────────────────────────────────────────": "",
+    "format": "prettier --write \"**/*.md\"",
+    "format:check": "prettier --check \"**/*.md\"",
     "// ── Rustdoc ────────────────────────────────────────────────────────": "",
     "doc": "cargo doc --workspace --no-deps",
     "doc:open": "cargo doc --workspace --no-deps --open",
@@ -50,6 +53,7 @@
     "@changesets/cli": "^2.29.8",
     "@napi-rs/cli": "^2.18.0",
     "@types/node": "^25.5.2",
+    "prettier": "^3.9.6",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   },

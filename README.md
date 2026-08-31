@@ -15,9 +15,7 @@ pnpm add @ledgerhq/zcash-utils
 ```typescript
 import { startSync, getChainTip } from "@ledgerhq/zcash-utils";
 
-const tip = await getChainTip(
-  "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
-);
+const tip = await getChainTip("https://zaino-zec-testnet.nodes.stg.ledger-test.com/");
 
 const stream = await startSync({
   grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
@@ -51,11 +49,11 @@ Returns the current chain tip height from the gRPC endpoint.
 
 Async iterator over matched shielded transactions.
 
-| Method                                         | Description                                                                                       |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `next(): Promise<ShieldedTransaction \| null>` | Returns the next matched transaction, or `null` when the scan is complete.                        |
-| `cancel(): void`                               | Cancels the background scan immediately. Buffered transactions are still consumable via `next()`. |
-| `stats(): Promise<SyncStats>`                  | Returns scan statistics once the stream is exhausted.                                             |
+| Method | Description |
+| --- | --- |
+| `next(): Promise<ShieldedTransaction \| null>` | Returns the next matched transaction, or `null` when the scan is complete. |
+| `cancel(): void` | Cancels the background scan immediately. Buffered transactions are still consumable via `next()`. |
+| `stats(): Promise<SyncStats>` | Returns scan statistics once the stream is exhausted. |
 
 ## Types
 
