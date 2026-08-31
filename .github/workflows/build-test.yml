@@ -7,6 +7,28 @@ on:
   pull_request:
 
 jobs:
+  # Cheapest gate, so it runs on its own rather than three times in the matrix
+  # below: no Rust toolchain, no cargo cache, node dependencies only.
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Check markdown formatting
+        run: pnpm format:check
+
   build-test:
     name: Build & test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -54,3 +54,5 @@ The same quantity is spelled two ways on purpose, and "normalizing" it breaks ca
 ## Markdown is formatted
 
 Run the repository's format script after editing any `.md`. `.prettierrc` holds the style and `.prettierignore` the exclusions, which cover the generated and released files. Do not hard-wrap prose against the configured setting.
+
+Unlike the commit convention above, this one is checked: a CI job runs the check script on every branch and pull request, so an unformatted file fails the build rather than reaching a reviewer.

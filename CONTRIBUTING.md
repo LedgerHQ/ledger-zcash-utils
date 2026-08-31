@@ -69,7 +69,12 @@ cargo test --package zcash-cli
 
 # Type-check everything
 cargo check --workspace
+
+# Check markdown formatting (CI runs this too)
+pnpm format:check
 ```
+
+`pnpm format` rewrites the markdown in place. `.prettierrc` holds the style, `.prettierignore` the exclusions.
 
 ## Documentation
 
