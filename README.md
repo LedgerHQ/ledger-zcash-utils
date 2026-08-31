@@ -203,4 +203,4 @@ Ironwood notes on the scanning path are complete and not gated by `orchardOnly`:
 
 ## License
 
-MIT
+[Apache-2.0](LICENSE.md), as the rest of the Ledger device stack.

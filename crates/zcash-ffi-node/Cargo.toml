@@ -3,7 +3,7 @@ name = "zcash-ffi-node"
 version = "0.1.0"
 edition = "2021"
 description = "Node.js / Electron native addon (napi-rs) for Zcash key derivation and shielded block scanning"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]

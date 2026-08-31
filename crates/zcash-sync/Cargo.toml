@@ -3,7 +3,7 @@ name = "zcash-sync"
 version = "0.1.0"
 edition = "2021"
 description = "Async sync engine for Zcash: streams compact blocks from lightwalletd and decrypts matching transactions"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [lib]
 name = "zcash_sync"

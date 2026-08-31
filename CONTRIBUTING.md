@@ -154,4 +154,4 @@ CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are no
 
 ## License
 
-MIT OR Apache-2.0
+[Apache-2.0](LICENSE.md). Declared once in `[workspace.package]` of the root `Cargo.toml`, which the crates inherit, and mirrored in `package.json` for the npm package.

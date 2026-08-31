@@ -3,7 +3,7 @@ name = "zcash-crypto"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Zcash cryptographic operations: key derivation, trial decryption, transaction decryption"
-license = "MIT OR Apache-2.0"
+license.workspace = true
 
 [lib]
 name = "zcash_crypto"
