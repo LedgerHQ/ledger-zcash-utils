@@ -1,5 +1,19 @@
 # @ledgerhq/zcash-utils
 
+## 2.3.0
+
+### Minor Changes
+
+- 9defc44: Relicense to `Apache-2.0`, aligning with the Ledger device stack this package belongs to: the Device Management Kit, the Zcash device signer kit and the Zcash device app are all `Apache-2.0`. Nothing in the repository stated a license authoritatively before — `package.json` declared `MIT`, the four Rust crates declared `MIT OR Apache-2.0`, and no LICENSE file existed at all.
+
+  The declaration now lives in `[workspace.package]` of the root `Cargo.toml`, inherited by every crate, and is mirrored in `package.json`. The full Apache 2.0 text ships as `LICENSE.md`, which npm includes in the tarball even though the `files` field does not name it, so the published package now carries its own license text.
+
+### Patch Changes
+
+- 57b3588: Document the whole published API in the README, which had drifted to covering three of the eleven exports. Everything the send path is made of — `buildTransaction`, `buildIronwoodTransaction`, `parsePczt`, `finalizeTransaction`, `broadcastTransaction` — plus `findBlockHeight`, `transactionDetails` and `orchardAddressFromUfvk` were absent, as were the note fields that make a note spendable (`nullifier`, `rho`, `rseed`, `cmx`, `position`, `recipient`, `isSpent`), `knownNullifiers` / `spentKnownNullifiers`, and `transparentOut` / `hasTransparentInputs`.
+
+  The README now walks the send round trip through the device rather than listing functions, and states the two encoding conventions a caller has to get right: zatoshis are JS numbers on the scanning path but decimal strings on the crafting path, and txids come in display order everywhere except `TransparentInputJs.txid`, which is internal order. Its install step names the Artifactory registry the package actually publishes to.
+
 ## 2.2.0
 
 ### Minor Changes
