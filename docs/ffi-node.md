@@ -20,7 +20,7 @@ pnpm run build
 pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 ```
 
-> **Note:** Key derivation (`derive_keys`) is available in the CLI (`zcash-cli derive`) and in the `zcash-crypto` Rust crate, but is not exported by the Node.js binding. Exported functions: `startSync`, `getChainTip`, `findBlockHeight`, `buildTransaction`, `parsePczt`, `finalizeTransaction`, `broadcastTransaction`, and the `TransactionStream` class.
+> **Note:** Key derivation (`derive_keys`) is available in the CLI (`zcash-cli derive`) and in the `zcash-crypto` Rust crate, but is not exported by the Node.js binding. Exported functions: `startSync`, `getChainTip`, `findBlockHeight`, `transactionDetails`, `buildTransaction`, `buildIronwoodTransaction`, `parsePczt`, `finalizeTransaction`, `broadcastTransaction`, `orchardAddressFromUfvk`, and the `TransactionStream` class.
 
 ### Block scanning
 
@@ -35,20 +35,26 @@ const stream: TransactionStream = await startSync({
   startHeight: 280000,
   endHeight: tip,
   network: "testnet",
+  // Nullifiers of notes received in previous scans that are still unspent, so
+  // a note spent in this range is detected across the sync boundary.
+  knownNullifiers: [],
 });
 
 let tx: ShieldedTransaction | null;
 while ((tx = await stream.next()) !== null) {
   // tx.txid, tx.blockHeight, tx.blockTime, tx.fee (zatoshis)
+  // tx.transparentOut, tx.hasTransparentInputs — what tells a
+  //   shielded→transparent send apart from a self-transfer
   // tx.saplingNotes, tx.orchardNotes, tx.ironwoodNotes — each note has:
   //   amount, transferType, memo, pool ("sapling" | "orchard" | "ironwood")
-  //   nullifier, rseed, cmx, position, recipient (hex | null)
+  //   nullifier, rho, rseed, cmx, position, recipient (hex | null)
   //   isSpent (boolean)
   console.log(tx);
 }
 
 const stats: SyncStats = await stream.stats();
 // stats.blocksScanned, stats.elapsedMs
+// stats.spentKnownNullifiers — entries from knownNullifiers spent in the range
 ```
 
 ### Building a transaction
@@ -84,6 +90,8 @@ const result: BuildTransactionResult = await buildTransaction({
       position: note.position!, // decimal u64 string
     },
   ],
+  // Not optional: pass an empty array for a shielded-only send.
+  transparentInputs: [],
   outputs: [
     {
       // Destination: t-addr (P2PKH/P2SH) or u-addr (Orchard receiver).
@@ -136,15 +144,19 @@ import { buildTransaction, parsePczt, PcztTransaction } from "./index.js";
 
 const { pcztHex } = await buildTransaction(/* ... */);
 
-// Byte fields are Uint8Array; zatoshi values are bigint; signing paths are
-// strings without the `m/` prefix and with `'` on hardened indices.
+// Byte fields are Uint8Array; zatoshi values are decimal strings (lossless for
+// u64/i128, unlike an f64 round-trip); signing paths are strings without the
+// `m/` prefix and with `'` on hardened indices.
 const pczt: PcztTransaction = parsePczt(pcztHex);
 
 // pczt.global               — txVersion, coinType, expiryHeight, ...
-// pczt.transparentInputs[]  — prevoutTxid, value (bigint), derivation, ...
-// pczt.transparentOutputs[] — value (bigint), scriptPubKey, derivation?
-// pczt.orchardBundle        — actions[], flags, valueBalance (bigint), anchor
+// pczt.transparentInputs[]  — prevoutTxid, value (string), derivation, ...
+// pczt.transparentOutputs[] — value (string), scriptPubKey, derivation?
+// pczt.orchardBundle        — actions[], flags, valueBalance (string), anchor
 //                             (null when there are no Orchard actions)
+// pczt.ironwoodBundle       — same shape, plus each action's
+//                             notePlaintextVersion. Always null below tx
+//                             version 6 — the Ironwood pool is V6-only.
 const sigs = await signer.signPcztTransaction(pczt);
 ```
 
