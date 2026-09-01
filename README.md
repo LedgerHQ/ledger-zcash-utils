@@ -185,6 +185,20 @@ The same quantity is not spelled the same way everywhere in this API. Read this 
 
 **`scriptPubKey`** keeps its canonical Bitcoin/Zcash casing, rather than napi's default camelCasing of the Rust field name (`scriptPubkey`).
 
+## Errors
+
+Every failure surfaces as a plain JavaScript `Error` whose message is the whole signal — there is no `code` property, no error subclass, and no numeric status. [`index.d.ts`](index.d.ts) documents, per function, what each one can fail on; the paragraphs below are what holds across all of them.
+
+**The categories are stable, the wording is not.** Matching on message text is the only way to tell failures apart programmatically today, and it is a fragile contract: treat the distinctions documented per function as durable and the exact strings as not.
+
+**Bad input fails before any work.** Every hex field, decimal-string amount and address is validated up front, so a malformed request costs no gRPC round trip and no proving time. Overflow on value totals is checked rather than wrapped.
+
+**A finished scan is not a successful scan.** `startSync` never throws — it spawns the scan and returns — and `stream.next()` never throws either. It returns `null` both when the range is fully scanned and when the scan died part-way, and those two are indistinguishable from `next()` alone. The failure is reported by `stream.stats()`, and nowhere else, so a caller that persists notes must call `stats()` before treating the results as complete. Calling `stats()` twice, or after `cancel()`, is itself an error.
+
+**A failed broadcast does not mean nothing was sent.** `SendTransaction rejected (code N)` is definitive: the node saw the transaction and refused it. `SendTransaction failed` is not — the request may have been accepted before the connection broke. The txid is derived from the transaction bytes, so it is known before broadcasting: look it up before retrying, rather than assuming the send did not happen.
+
+**Nothing before `broadcastTransaction` leaves a trace.** Crafting and finalizing touch neither the chain nor the device, so any failure in them is safe to retry with the same inputs once corrected.
+
 ## Ironwood (NU6.3)
 
 Ironwood is supported on both halves of the wallet, and the crates it rests on are on their stable releases.

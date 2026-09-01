@@ -19,7 +19,9 @@ Several entries are pinned exactly, and each states its reason as an inline comm
 
 The napi-rs outputs at the repository root — the JS loader and its TypeScript declarations — are tracked, because they ship in the published package (see the `files` field in `package.json`). Never hand-edit them: the next build overwrites the edit, and the published types then disagree with the addon.
 
-To change the TypeScript surface, edit the signatures and doc comments in the napi crate and rebuild. Those Rust doc comments become the published declarations verbatim, which makes them user-facing documentation rather than internal notes — a stale one ships to consumers.
+To change the TypeScript surface, edit the signatures and doc comments in the napi crate and rebuild. Those Rust doc comments become the published declarations verbatim, which makes them user-facing documentation rather than internal notes — a stale one ships to consumers, and so does an internal reference no reader outside Ledger can resolve.
+
+An exported function documents what it throws, in an `# Errors` section. Every failure reaches JavaScript as a plain `Error` carrying only a message: no code, no subclass, nothing to switch on, so that section is the entire contract a caller has. State the categories rather than transcribing the strings, and say whether a retry is safe — for anything that touches the network, whether a failure means the operation did not happen.
 
 ## No spending key material in this layer
 
