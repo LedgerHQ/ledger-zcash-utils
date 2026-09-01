@@ -576,7 +576,7 @@ fn convert_ironwood_transparent_inputs(
 /// Build, prove, and serialize a redacted V6 PCZT for an Ironwood send.
 ///
 /// The Ironwood counterpart of `buildTransaction`, taking Ironwood notes in
-/// place of Orchard ones and emitting a V6 (ZIP-230) PCZT.
+/// place of Orchard ones and emitting a V6 (ZIP-229) PCZT.
 ///
 /// Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
 /// happens here for the Ironwood bundle (~2-5 s first call against the
@@ -667,7 +667,7 @@ pub struct FinalizeTransactionParams {
 #[derive(Debug)]
 pub struct FinalizeTransactionResult {
     /// Hex-encoded signed transaction bytes (ready for `broadcastTransaction`).
-    /// V5 (ZIP-225) or V6 (ZIP-230), depending on the input PCZT's shielded bundle.
+    /// V5 (ZIP-225) or V6 (ZIP-229), depending on the input PCZT's shielded bundle.
     pub tx_hex: String,
     /// 64-char hex transaction id, big-endian *display* order (matches the sync
     /// path's `ShieldedTransaction.txid` and the Ledger Live operation hash).

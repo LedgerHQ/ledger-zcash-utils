@@ -61,7 +61,7 @@ A send is a round trip through the device. This package owns every step except t
 1. **Craft** — `buildTransaction` (Orchard and/or transparent source) or `buildIronwoodTransaction` (Ironwood source) selects change, computes Merkle witnesses against an anchor, generates the Halo 2 proof, and returns canonical PCZT bytes as hex. The spend inputs are notes found by a previous scan; the fee is chosen by the caller and validated against ZIP-317.
 2. **Parse** — `parsePczt` decodes those bytes into the structured `PcztTransaction` the device signer consumes. The PCZT postcard format is not trivially parseable in TypeScript, which is why this exists.
 3. **Sign** — `signPcztTransaction` from [`@ledgerhq/device-signer-kit-zcash`](https://github.com/LedgerHQ/device-sdk-ts/tree/develop/packages/signer/signer-zcash) streams the PCZT to the device over APDUs and returns one RedPallas `spendAuthSig` per _real_ shielded spend, plus one secp256k1 signature per transparent input. Dummy padding spends are not signed on device; they are self-signed host-side, which is why the counts line up with the unsigned actions this package expects back.
-4. **Finalize** — `finalizeTransaction` injects those signatures, computes the binding signature host-side, and extracts the signed V5 (ZIP-225) or V6 (ZIP-230) transaction.
+4. **Finalize** — `finalizeTransaction` injects those signatures, computes the binding signature host-side, and extracts the signed V5 (ZIP-225) or V6 (ZIP-229) transaction.
 5. **Broadcast** — `broadcastTransaction` submits it and returns the txid.
 
 ```typescript
@@ -189,7 +189,7 @@ The same quantity is not spelled the same way everywhere in this API. Read this 
 
 Ironwood is supported on both halves of the wallet, and the crates it rests on are on their stable releases.
 
-Scanning is not gated by `orchardOnly`: `ShieldedTransaction.ironwoodNotes` is populated alongside `orchardNotes`, and `ShieldedNote.pool` tells the two apart. Crafting goes through `buildIronwoodTransaction`, which emits a V6 (ZIP-230) PCZT; `finalizeTransaction` and `broadcastTransaction` accept V6 as they do V5.
+Scanning is not gated by `orchardOnly`: `ShieldedTransaction.ironwoodNotes` is populated alongside `orchardNotes`, and `ShieldedNote.pool` tells the two apart. Crafting goes through `buildIronwoodTransaction`, which emits a V6 (ZIP-229) PCZT; `finalizeTransaction` and `broadcastTransaction` accept V6 as they do V5.
 
 What that support is tested against is worth knowing, since the pool is young. Witness computation is checked offline against a real Ironwood anchor captured from a public testnet node, scanning from the NU6.3 testnet activation height. Trial decryption is exercised against a synthetic Ironwood action built from the `orchard` note-encryption API — genuine cryptography, but not a real on-chain transaction, because no Ironwood transaction addressed to a key we hold has been available to capture as a fixture.
 
