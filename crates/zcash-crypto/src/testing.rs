@@ -683,6 +683,105 @@ mod tests {
         (pczt_bytes, t_sk)
     }
 
+    /// Build a proven mixed **V6/Ironwood** PCZT (one real Ironwood spend + one
+    /// transparent P2PKH input controlled by a key derived from `TEST_MNEMONIC`
+    /// at `m/44'/133'/0'/0/{address_index}` → one Ironwood output). Mirrors
+    /// `build_mixed_pczt` above, but through `build_ironwood_transaction` --
+    /// every call site in this crate that builds a mixed transparent+shielded
+    /// PCZT for signing tests otherwise only exercises the V5/Orchard builder,
+    /// even though `coin-zcash` routes exactly this shape (an Ironwood bundle
+    /// alongside a transparent bundle) through the t→z and z→t flows.
+    fn build_mixed_ironwood_pczt(address_index: u32) -> (Vec<u8>, secp256k1::SecretKey) {
+        use crate::craft::{
+            build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
+            IronwoodOutputRequest, IronwoodSpendInput,
+        };
+
+        let secp = Secp256k1::new();
+        let seed = Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let path = DerivationPath::from(vec![
+            ChildNumber::from_hardened_idx(44).unwrap(),
+            ChildNumber::from_hardened_idx(133).unwrap(),
+            ChildNumber::from_hardened_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(0).unwrap(),
+            ChildNumber::from_normal_idx(address_index).unwrap(),
+        ]);
+        let root = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
+        let leaf = root.derive_priv(&secp, &path).unwrap();
+        let t_sk = leaf.private_key;
+        let t_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk).serialize();
+
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let change = fvk.address_at(0u32, Scope::Internal);
+        let ovk = Some(fvk.to_ovk(Scope::External));
+
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let spend_value: u64 = 20_000;
+        let note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(spend_value),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .unwrap();
+        let leaf_hash = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+        let (anchor, merkle_path) = synthetic_anchor_and_path(leaf_hash);
+
+        let transparent_value: u64 = 15_000;
+        // 1 Ironwood spend, 1 Ironwood output, 1 transparent input, 0 transparent
+        // output: ironwood_actions = max(2, max(1, 1)) = 2, transparent_actions =
+        // max(1, 0) = 1 → fee = 5_000 × (2 + 1) = 15_000.
+        let fee = 15_000u64;
+        let out_value = 20_000u64;
+
+        let inputs = IronwoodBuildInputs {
+            network: zcash_protocol::consensus::Network::MainNetwork.into(),
+            target_height: nu6_3_height(),
+            ironwood_fvk: Some(fvk),
+            ovk,
+            change_address: Some(change),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![IronwoodSpendInput {
+                recipient: note.recipient().to_raw_address_bytes(),
+                value: spend_value,
+                rho: rho.to_bytes(),
+                rseed: *rseed.as_bytes(),
+                merkle_path,
+            }],
+            transparent_inputs: vec![TransparentInput {
+                pubkey: t_pubkey,
+                txid: [0x09u8; 32],
+                vout: 0,
+                script_pubkey: make_p2pkh_script(pubkey_hash160(&t_pubkey)),
+                value: transparent_value,
+                derivation_scope: 0,
+                derivation_address_index: address_index,
+            }],
+            outputs: vec![IronwoodOutputRequest {
+                destination: IronwoodDestination::Ironwood(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let pczt_bytes = build_ironwood_transaction(inputs)
+            .expect("build_mixed_ironwood_pczt: build must succeed")
+            .pczt_bytes;
+        (pczt_bytes, t_sk)
+    }
+
     // ── derive_ufvk_and_xpub ───────────────────────────────────────────────────
 
     /// The test-only derivation wrapper produces the same UFVK and xpub,
@@ -860,6 +959,96 @@ mod tests {
         assert!(
             tx.ironwood_bundle().is_some(),
             "V6 tx must carry an Ironwood bundle"
+        );
+    }
+
+    /// Full mixed-path finalize on a **V6/Ironwood** PCZT: build a PCZT with one
+    /// real Ironwood spend and one transparent P2PKH input, sign both legs
+    /// through the same two public functions the coin-tester actually calls
+    /// (`sign_pczt_ironwood_actions` + `sign_pczt_transparent_inputs`), and run
+    /// the complete finalize pipeline. This is the shape `coin-zcash` routes
+    /// t→z and z→t through in production (an Ironwood bundle alongside a
+    /// transparent bundle) -- until this test, nothing in this crate signed and
+    /// finalized that combination together; only the V5/Orchard equivalent
+    /// (`mixed_transparent_and_orchard_finalize_produces_valid_v5_tx` in
+    /// `finalize.rs`) was covered, and the existing mixed Ironwood coverage
+    /// (`sign_pczt_transparent_inputs_signature_verifies_against_derived_pubkey`
+    /// above) only checks the transparent signature in isolation, never calling
+    /// `finalize_transaction` on the combined result.
+    #[test]
+    fn sign_pczt_ironwood_and_transparent_finalize_produces_valid_v6_tx() {
+        let address_index = 5;
+        let (pczt_bytes, t_sk) = build_mixed_ironwood_pczt(address_index);
+
+        let ask = make_ask();
+        let ironwood_signatures = sign_pczt_ironwood_actions(&pczt_bytes, &ask)
+            .expect("signing the mixed PCZT's Ironwood spend must succeed");
+        assert_eq!(
+            ironwood_signatures.len(),
+            1,
+            "the fixture has exactly one real (unsigned) Ironwood spend"
+        );
+
+        let seed = Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let transparent_signatures =
+            sign_pczt_transparent_inputs(&pczt_bytes, &seed, ZcashNetwork::Mainnet)
+                .expect("signing the mixed PCZT's transparent input must succeed");
+        assert_eq!(
+            transparent_signatures.len(),
+            1,
+            "the fixture has exactly one transparent input"
+        );
+
+        // Independently re-derive the expected pubkey and verify the produced
+        // transparent signature against it, exactly like
+        // `sign_pczt_transparent_inputs_signature_verifies_against_derived_pubkey`
+        // -- proving the transparent leg is correct on its own, not just that
+        // `finalize_transaction` happens to accept it.
+        let secp = Secp256k1::new();
+        let expected_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk);
+        let pczt_for_sighash = Pczt::parse(&pczt_bytes).unwrap();
+        let signer_for_sighash = PcztSigner::new(pczt_for_sighash).unwrap();
+        let sighash = signer_for_sighash.transparent_sighash(0).unwrap();
+        let der_sig = secp256k1::ecdsa::Signature::from_der(&transparent_signatures[0])
+            .expect("produced signature must be valid DER");
+        secp.verify_ecdsa(&Message::from_digest(sighash), &der_sig, &expected_pubkey)
+            .expect("transparent signature must verify against the pubkey derived at the input's own path");
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures,
+            transparent_signatures,
+        })
+        .expect(
+            "finalize must accept the signatures produced by sign_pczt_ironwood_actions \
+             and sign_pczt_transparent_inputs together",
+        );
+
+        assert!(!out.tx_bytes.is_empty(), "tx_bytes must be non-empty");
+        assert_eq!(out.txid.len(), 32, "txid must be 32 bytes");
+
+        let tx = zcash_primitives::transaction::Transaction::read(
+            &out.tx_bytes[..],
+            zcash_protocol::consensus::BranchId::Nu6_3,
+        )
+        .expect("Transaction::read must succeed on V6 tx bytes");
+        assert_eq!(
+            *tx.txid().as_ref(),
+            out.txid,
+            "txid from read must match finalize output"
+        );
+        assert!(
+            tx.ironwood_bundle().is_some(),
+            "V6 tx must carry an Ironwood bundle"
+        );
+        assert!(
+            tx.transparent_bundle().is_some(),
+            "V6 tx must also carry the transparent bundle"
+        );
+        assert!(
+            !tx.transparent_bundle().unwrap().vin[0].script_sig().0 .0.is_empty(),
+            "the transparent input's script_sig must be populated after finalize"
         );
     }
 
