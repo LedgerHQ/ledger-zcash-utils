@@ -46,7 +46,8 @@ fn pipeline_depth() -> usize {
 /// Parameters for a shielded block range sync.
 #[derive(Clone)]
 pub struct SyncParams {
-    /// gRPC endpoint URL (e.g. `"https://zaino-zec-testnet.nodes.stg.ledger-test.com/"`).
+    /// gRPC endpoint URL of a lightwalletd or Zaino server (e.g. the public
+    /// `"https://testnet.zec.rocks:443"`).
     pub grpc_url: String,
     /// Unified Full Viewing Key (UFVK) for the account to scan.
     pub viewing_key: String,

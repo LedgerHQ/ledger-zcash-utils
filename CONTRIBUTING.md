@@ -30,11 +30,11 @@ See [`docs/architecture.md`](docs/architecture.md) for the dependency graph and 
 ledger-zcash-cli derive --mnemonic "abandon abandon ... about" --format json
 
 # Query chain tip
-ledger-zcash-cli tip --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/
+ledger-zcash-cli tip --grpc-url https://testnet.zec.rocks:443
 
 # Scan a block range
 ledger-zcash-cli sync \
-    --grpc-url https://zaino-zec-testnet.nodes.stg.ledger-test.com/ \
+    --grpc-url https://testnet.zec.rocks:443 \
     --viewing-key uviewtest1... \
     --start-height 280000 \
     --end-height 285000 \
@@ -133,24 +133,24 @@ git push
 
 ### Artifacts produced per release
 
-| Artifact                           | Distribution       | Platforms                   |
-| ---------------------------------- | ------------------ | --------------------------- |
-| `@ledgerhq/zcash-utils`            | Ledger JFrog (npm) | All (bundled `.node` files) |
-| `ledger-zcash-cli-macos-universal` | GitHub Release     | macOS arm64 + x64           |
-| `ledger-zcash-cli-linux-x86_64`    | GitHub Release     | Linux x64 (static musl)     |
+| Artifact                           | Distribution        | Platforms                   |
+| ---------------------------------- | ------------------- | --------------------------- |
+| `@ledgerhq/zcash-utils`            | Public npm registry | All (bundled `.node` files) |
+| `ledger-zcash-cli-macos-universal` | GitHub Release      | macOS arm64 + x64           |
+| `ledger-zcash-cli-linux-x86_64`    | GitHub Release      | Linux x64 (static musl)     |
 
 The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
 
-The npm package is published to the internal Ledger JFrog Artifactory registry. The CI authenticates via OIDC (`LedgerHQ/actions-security/actions/jfrog-login`) and configures `.npmrc` to route `@ledgerhq` scoped packages to the Artifactory URL.
+The package is published on the **public npm registry**, so consumers need no registry configuration. The publish job authenticates through Ledger's release infrastructure via OIDC rather than a long-lived token, which is why no npm credential appears among the secrets below.
 
 CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are not part of the npm package.
 
 ### Required secrets and variables
 
-| Secret / Variable              | Purpose                                             |
-| ------------------------------ | --------------------------------------------------- |
-| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions            |
-| `vars.ARTIFACTORY_PUBLISH_URL` | JFrog Artifactory registry URL (without `https://`) |
+| Secret / Variable              | Purpose                                                    |
+| ------------------------------ | ---------------------------------------------------------- |
+| `GITHUB_TOKEN`                 | Automatically provided by GitHub Actions                   |
+| `vars.ARTIFACTORY_PUBLISH_URL` | Registry host the publish step targets, without `https://` |
 
 ## License
 

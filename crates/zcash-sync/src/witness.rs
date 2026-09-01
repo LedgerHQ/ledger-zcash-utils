@@ -106,7 +106,8 @@ pub struct NoteRef {
 
 /// Input parameters for [`compute_witnesses`].
 pub struct WitnessRequest {
-    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`).
+    /// gRPC endpoint URL of a lightwalletd or Zaino server (e.g. the public
+    /// `https://testnet.zec.rocks:443`).
     pub grpc_url: String,
     /// Explicit anchor height. When `None`, falls back to `tip - anchor_depth_blocks`.
     pub anchor_height: Option<u32>,

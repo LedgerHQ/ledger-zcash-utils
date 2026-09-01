@@ -8,25 +8,24 @@ Spending key material never enters this layer. It reads a Unified Full Viewing K
 
 ## Installation
 
-The package is published to Ledger's internal JFrog Artifactory, not to public npm, so the `@ledgerhq` scope must be routed there:
-
 ```sh
-# ~/.npmrc
-@ledgerhq:registry=https://<artifactory-host>/
+npm install @ledgerhq/zcash-utils
 ```
 
-```sh
-pnpm add @ledgerhq/zcash-utils
-```
+Published on the public npm registry under the `@ledgerhq` scope; no registry configuration is needed.
 
-Prebuilt `.node` binaries are bundled in the package for six targets: `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc`. On any other platform, build from source — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Prebuilt `.node` binaries are bundled for six targets — `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc` — so there is no compilation step and no Rust toolchain to install. On any other platform, build from source: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+Node.js 20 or later. The addon is a native module, so it runs in Node and in the Electron main process, not in a browser or a renderer without `nodeIntegration`.
 
 ## Quick start — scanning
 
 ```typescript
 import { startSync, getChainTip } from "@ledgerhq/zcash-utils";
 
-const grpcUrl = "https://zaino-zec-testnet.nodes.stg.ledger-test.com/";
+// Any lightwalletd or Zaino endpoint. This one is public; Ledger Live points
+// at its own infrastructure.
+const grpcUrl = "https://testnet.zec.rocks:443";
 const tip = await getChainTip(grpcUrl);
 
 const stream = await startSync({
@@ -157,7 +156,7 @@ Full signatures, every field, and its constraints are in [`index.d.ts`](index.d.
 | Export | Purpose |
 | --- | --- |
 | `buildTransaction(params)` | Builds, proves, and serializes a V5 PCZT from Orchard notes, transparent UTXOs, or both. Bears the Halo 2 proving cost inline (~2–5 s cold, ~hundreds of ms after, via a process-global proving-key cache). |
-| `buildIronwoodTransaction(params)` | Same, for an Ironwood (NU6.3) source — a redacted V6 PCZT. See the status note below. |
+| `buildIronwoodTransaction(params)` | Same, for an Ironwood (NU6.3) source — a redacted V6 PCZT. See [Ironwood (NU6.3)](#ironwood-nu63) below. |
 | `parsePczt(pcztHex)` | Decodes canonical PCZT bytes into the `PcztTransaction` the device signer consumes. Fails if a field the device needs to sign is missing. |
 | `finalizeTransaction(params)` | Injects device signatures, computes the binding signature, extracts the signed transaction and its txid. CPU-bound (proof verification), dispatched to a blocking thread. |
 | `broadcastTransaction(grpcUrl, txHex)` | Submits a signed transaction to a lightwalletd / Zaino endpoint; returns the txid. |
@@ -186,11 +185,13 @@ The same quantity is not spelled the same way everywhere in this API. Read this 
 
 **`scriptPubKey`** keeps its canonical Bitcoin/Zcash casing, rather than napi's default camelCasing of the Rust field name (`scriptPubkey`).
 
-## Ironwood (NU6.3) status
+## Ironwood (NU6.3)
 
-`buildIronwoodTransaction` is exposed so the JS side can be wired up in parallel, but Rust-side Ironwood crafting is still a dry run: the wallet-side crates it depends on (`pczt`, `zcash_client_backend`) are release candidates for NU6.3. Those pins are re-confirmed and bumped to the stable releases before the mainnet build cut. See [`docs/architecture.md`](docs/architecture.md).
+Ironwood is supported on both halves of the wallet, and the crates it rests on are on their stable releases.
 
-Ironwood notes on the scanning path are complete and not gated by `orchardOnly`: `ShieldedTransaction.ironwoodNotes` is populated alongside `orchardNotes`, and `ShieldedNote.pool` distinguishes them.
+Scanning is not gated by `orchardOnly`: `ShieldedTransaction.ironwoodNotes` is populated alongside `orchardNotes`, and `ShieldedNote.pool` tells the two apart. Crafting goes through `buildIronwoodTransaction`, which emits a V6 (ZIP-230) PCZT; `finalizeTransaction` and `broadcastTransaction` accept V6 as they do V5.
+
+What that support is tested against is worth knowing, since the pool is young. Witness computation is checked offline against a real Ironwood anchor captured from a public testnet node, scanning from the NU6.3 testnet activation height. Trial decryption is exercised against a synthetic Ironwood action built from the `orchard` note-encryption API — genuine cryptography, but not a real on-chain transaction, because no Ironwood transaction addressed to a key we hold has been available to capture as a fixture.
 
 ## Documentation
 
@@ -203,4 +204,4 @@ Ironwood notes on the scanning path are complete and not gated by `orchardOnly`:
 
 ## License
 
-[Apache-2.0](LICENSE.md), as the rest of the Ledger device stack.
+[Apache-2.0](LICENSE.md)

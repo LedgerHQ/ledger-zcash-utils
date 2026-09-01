@@ -11,7 +11,7 @@
  *
  * Options:
  *   --network <mainnet|testnet>   [default: testnet]
- *   --grpc-url <URL>              [default: https://zaino-zec-testnet.nodes.stg.ledger-test.com/]
+ *   --grpc-url <URL>              [default: https://testnet.zec.rocks:443]
  *   --start-height <N>            [default: Sapling activation height]
  *   --end-height <N>              [default: chain tip]
  *   --chunk-size <N>              Blocks per gRPC call [default: 50000]
@@ -31,9 +31,11 @@ const ALICE_UFVK =
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const SAPLING_ACTIVATION: Record<string, number> = { testnet: 280_000, mainnet: 419_200 };
+// Public endpoints, so this example runs for anyone. Ledger Live points at its
+// own infrastructure; override with --grpc-url.
 const DEFAULT_GRPC: Record<string, string> = {
-  testnet: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
-  mainnet: "https://zaino-zec-mainnet-zebra.nodes.stg.ledger-test.com/",
+  testnet: "https://testnet.zec.rocks:443",
+  mainnet: "https://zec.rocks:443",
 };
 
 const { values } = parseArgs({

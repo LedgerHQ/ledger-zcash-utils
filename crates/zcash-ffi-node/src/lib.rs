@@ -15,7 +15,8 @@ use zcash_sync::sync::{
 /// a seed phrase directly in this layer.
 #[napi(object)]
 pub struct SyncParams {
-    /// gRPC endpoint URL (e.g. `"https://zaino-zec-testnet.nodes.stg.ledger-test.com/"`).
+    /// gRPC endpoint URL of a lightwalletd or Zaino server (e.g. the public
+    /// `"https://testnet.zec.rocks:443"`).
     pub grpc_url: String,
     /// Unified Full Viewing Key (UFVK) for the account to scan.
     pub viewing_key: String,
@@ -574,10 +575,8 @@ fn convert_ironwood_transparent_inputs(
 
 /// Build, prove, and serialize a redacted V6 PCZT for an Ironwood send.
 ///
-/// Rust-only crafting is dry-run pending the NU6.3 wallet-side crates
-/// stabilizing (`pczt`, `zcash_client_backend` are release candidates); this
-/// NAPI wrapper is exposed now so the JS side can be wired up in parallel and
-/// re-pinned when those crates stabilize (see `docs/architecture.md`).
+/// The Ironwood counterpart of `buildTransaction`, taking Ironwood notes in
+/// place of Orchard ones and emitting a V6 (ZIP-230) PCZT.
 ///
 /// Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
 /// happens here for the Ironwood bundle (~2-5 s first call against the

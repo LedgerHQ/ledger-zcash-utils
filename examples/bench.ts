@@ -7,7 +7,7 @@
  *
  * Options:
  *   --viewing-key <UFVK>   Unified Full Viewing Key  [default: Alice testnet UFVK]
- *   --grpc-url <URL>       gRPC endpoint             [default: https://zaino-zec-testnet.nodes.stg.ledger-test.com/]
+ *   --grpc-url <URL>       gRPC endpoint             [default: https://testnet.zec.rocks:443]
  *   --start-height <N>     First block (inclusive)   [default: 280000]
  *   --end-height <N>       Last block (inclusive)    [default: 285000]
  *   --verbose              Emit Rust diagnostics to stderr every 10s
@@ -22,7 +22,7 @@ const ALICE_UFVK =
 const { values } = parseArgs({
   options: {
     "viewing-key":  { type: "string",  default: ALICE_UFVK },
-    "grpc-url":     { type: "string",  default: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/" },
+    "grpc-url":     { type: "string",  default: "https://testnet.zec.rocks:443" },
     "start-height": { type: "string",  default: "280000" },
     "end-height":   { type: "string",  default: "285000" },
     "verbose":      { type: "boolean", default: false },
