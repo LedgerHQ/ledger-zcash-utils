@@ -448,7 +448,7 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         let inputs = BuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork,
+            network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
             orchard_fvk: Some(fvk),
             ovk,
@@ -514,7 +514,7 @@ mod tests {
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
         let inputs = IronwoodBuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork,
+            network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu6_3_height(),
             ironwood_fvk: Some(fvk),
             ovk,
@@ -559,7 +559,7 @@ mod tests {
         let out_value = in_value - fee;
 
         let inputs = BuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork,
+            network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
             orchard_fvk: None,
             ovk: None,
@@ -642,7 +642,7 @@ mod tests {
         let out_value = 10_000u64;
 
         let inputs = BuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork,
+            network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
             orchard_fvk: Some(fvk.clone()),
             ovk,

@@ -171,7 +171,7 @@ fn build_ironwood_transaction_with_real_testnet_anchor_produces_valid_v6_pczt() 
     let fee = 15_000u64;
 
     let inputs = IronwoodBuildInputs {
-        network: Network::TestNetwork,
+        network: Network::TestNetwork.into(),
         target_height: ANCHOR_HEIGHT + zcash_crypto::craft::DEFAULT_TX_EXPIRY_DELTA,
         ironwood_fvk: None, // no real Ironwood spends
         ovk,
