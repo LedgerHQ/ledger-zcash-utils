@@ -9,6 +9,13 @@ members = [
 default-members = ["crates/zcash-crypto"]
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Shared package metadata. Declared once here so the crates, the npm package
+# and LICENSE.md cannot drift apart; crates inherit it with `.workspace = true`.
+# ──────────────────────────────────────────────────────────────────────────────
+[workspace.package]
+license = "Apache-2.0"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Shared dependency versions — all crates inherit from here.
 # Individual crates may add extra features on top (e.g. lightwalletd-tonic).
 # ──────────────────────────────────────────────────────────────────────────────

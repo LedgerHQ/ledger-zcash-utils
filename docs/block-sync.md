@@ -2,9 +2,7 @@
 
 ## Overview
 
-`zcash-sync` implements a two-phase scan algorithm to efficiently find and
-decrypt shielded transactions in a block range without fetching every full
-transaction from the server.
+`zcash-sync` implements a two-phase scan algorithm to efficiently find and decrypt shielded transactions in a block range without fetching every full transaction from the server.
 
 ## Algorithm
 
@@ -61,17 +59,11 @@ transaction from the server.
 
 ## Why compact blocks?
 
-Compact blocks contain only the data needed for trial decryption (commitment,
-ephemeral public key, compact ciphertext). For a block with N outputs, only
-N × 170 bytes are transferred, vs. tens of kilobytes for full transactions.
-The `GetBlockRange` RPC streams all blocks in a single connection, minimising
-latency.
+Compact blocks contain only the data needed for trial decryption (commitment, ephemeral public key, compact ciphertext). For a block with N outputs, only N × 170 bytes are transferred, vs. tens of kilobytes for full transactions. The `GetBlockRange` RPC streams all blocks in a single connection, minimising latency.
 
 ## Byte order
 
-lightwalletd uses **internal (little-endian)** byte order for transaction IDs
-in its proto types. Display (explorer) format is big-endian. The sync engine
-converts accordingly:
+lightwalletd uses **internal (little-endian)** byte order for transaction IDs in its proto types. Display (explorer) format is big-endian. The sync engine converts accordingly:
 
 ```rust
 // proto CompactTx.hash → display (big-endian) hex for our txid field:
@@ -83,9 +75,7 @@ let txid_bytes_le: Vec<u8> = hex::decode(&txid_hex)?.into_iter().rev().collect()
 
 ## IVK preparation
 
-IVKs are derived from the UFVK once before the scan loop. This is important
-because `PreparedIncomingViewingKey::new()` performs pre-computation that
-accelerates each `try_compact_note_decryption` call:
+IVKs are derived from the UFVK once before the scan loop. This is important because `PreparedIncomingViewingKey::new()` performs pre-computation that accelerates each `try_compact_note_decryption` call:
 
 ```rust
 let ivks = decrypt::prepare_ivks(&params.viewing_key)?;

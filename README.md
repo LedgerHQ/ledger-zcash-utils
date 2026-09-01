@@ -1,129 +1,206 @@
 # @ledgerhq/zcash-utils
 
-Native Node.js (NAPI) addon for Zcash shielded transaction scanning — built in Rust via [napi-rs](https://napi.rs).
+Native Node.js (NAPI) addon for Zcash wallet operations — built in Rust via [napi-rs](https://napi.rs).
+
+It covers the two halves of a shielded wallet that cannot be done in TypeScript: **scanning** the chain for notes belonging to an account (trial decryption of every compact block), and **crafting** a send as a PCZT for a Ledger device to sign, then reassembling and broadcasting the signed transaction. Halo 2 proving, PCZT (postcard) serialization, and the binding signature all happen here, in Rust.
+
+Spending key material never enters this layer. It reads a Unified Full Viewing Key and an account-level transparent pubkey; every signature comes from the device.
 
 ## Installation
 
+The package is published to Ledger's internal JFrog Artifactory, not to public npm, so the `@ledgerhq` scope must be routed there:
+
 ```sh
-npm install @ledgerhq/zcash-utils
-# or
+# ~/.npmrc
+@ledgerhq:registry=https://<artifactory-host>/
+```
+
+```sh
 pnpm add @ledgerhq/zcash-utils
 ```
 
-## Quick start
+Prebuilt `.node` binaries are bundled in the package for six targets: `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc`. On any other platform, build from source — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Quick start — scanning
 
 ```typescript
 import { startSync, getChainTip } from "@ledgerhq/zcash-utils";
 
-const tip = await getChainTip(
-  "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
-);
+const grpcUrl = "https://zaino-zec-testnet.nodes.stg.ledger-test.com/";
+const tip = await getChainTip(grpcUrl);
 
 const stream = await startSync({
-  grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  grpcUrl,
   viewingKey: "uviewtest1...",
   startHeight: tip - 1000,
   endHeight: tip,
   network: "testnet",
+  // Skips all Sapling crypto work. Ledger wallets are Orchard-only, but the
+  // default is false. Ironwood notes are decrypted regardless of this flag.
   orchardOnly: true,
+  // Nullifiers of still-unspent notes from previous scans, so a note spent
+  // in this range is detected across the incremental sync boundary.
+  knownNullifiers: [],
 });
 
 let tx;
 while ((tx = await stream.next()) !== null) {
-  console.log(tx.txid, tx.orchardNotes);
+  // Each note carries its spending fields (nullifier, rho, rseed, cmx,
+  // position, recipient) — persist them, they are the inputs to a later send.
+  console.log(tx.txid, tx.orchardNotes, tx.ironwoodNotes);
 }
 
 const stats = await stream.stats();
+// stats.spentKnownNullifiers — previously-stored notes to mark as spent.
 console.log(`Scanned ${stats.blocksScanned} blocks in ${stats.elapsedMs}ms`);
 ```
 
+## Sending: the full flow
+
+A send is a round trip through the device. This package owns every step except the signing itself.
+
+1. **Craft** — `buildTransaction` (Orchard and/or transparent source) or `buildIronwoodTransaction` (Ironwood source) selects change, computes Merkle witnesses against an anchor, generates the Halo 2 proof, and returns canonical PCZT bytes as hex. The spend inputs are notes found by a previous scan; the fee is chosen by the caller and validated against ZIP-317.
+2. **Parse** — `parsePczt` decodes those bytes into the structured `PcztTransaction` the device signer consumes. The PCZT postcard format is not trivially parseable in TypeScript, which is why this exists.
+3. **Sign** — `signPcztTransaction` from [`@ledgerhq/device-signer-kit-zcash`](https://github.com/LedgerHQ/device-sdk-ts/tree/develop/packages/signer/signer-zcash) streams the PCZT to the device over APDUs and returns one RedPallas `spendAuthSig` per _real_ shielded spend, plus one secp256k1 signature per transparent input. Dummy padding spends are not signed on device; they are self-signed host-side, which is why the counts line up with the unsigned actions this package expects back.
+4. **Finalize** — `finalizeTransaction` injects those signatures, computes the binding signature host-side, and extracts the signed V5 (ZIP-225) or V6 (ZIP-230) transaction.
+5. **Broadcast** — `broadcastTransaction` submits it and returns the txid.
+
+```typescript
+import {
+  buildTransaction,
+  parsePczt,
+  finalizeTransaction,
+  broadcastTransaction,
+  type PcztTransaction,
+  type ShieldedNote,
+} from "@ledgerhq/zcash-utils";
+
+// A note found by a previous scan — its spending fields are what make it
+// spendable (see Quick start above).
+declare const note: ShieldedNote;
+
+// Your wrapper around the signer kit's device action. It answers in bytes —
+// `{ orchard: [{ spendAuthSig }], ironwood: [...], transparentInputSigs: [] }`
+// — so hex-encoding the result is the caller's step. See the signer kit's own
+// documentation for its exact shape.
+declare function signOnDevice(pczt: PcztTransaction): Promise<{
+  orchardSignatures: string[];
+  transparentSignatures: string[];
+}>;
+
+const { pcztHex } = await buildTransaction({
+  grpcUrl,
+  // Required by any flow carrying an Orchard bundle. A fully transparent send
+  // omits it and passes `transparentAccountPubkey` instead — spending public
+  // funds must not require a viewing-key export from the device.
+  ufvk: "uviewtest1...",
+  network: "testnet",
+  // Both read from the device: they let it confirm the PCZT is its own seed's.
+  seedFingerprint: "<64-char hex>",
+  accountIndex: 0,
+  // Caller-owned, decimal zatoshis. Validated against ZIP-317, and change is
+  // derived from it — this crate does not compute a fee.
+  feeZat: "15000",
+  spends: [
+    {
+      recipient: note.recipient!, // 86-char hex
+      valueZat: String(note.amount),
+      rho: note.rho!, // 64-char hex
+      rseed: note.rseed!, // 64-char hex
+      cmx: note.cmx!, // 64-char hex
+      position: note.position!, // decimal u64 string
+    },
+  ],
+  // Always present, empty for a shielded-only send.
+  transparentInputs: [],
+  outputs: [{ address: "u1...", valueZat: "85000", memo: "thanks!" }],
+});
+
+const { orchardSignatures, transparentSignatures } = await signOnDevice(parsePczt(pcztHex));
+
+const { txHex, txid } = await finalizeTransaction({
+  pczt: pcztHex,
+  orchardSignatures, // one 128-hex-char RedPallas sig per real Orchard spend
+  // Supply the list matching the PCZT's shielded bundle; the other may be
+  // empty or omitted. Each is length-checked against the PCZT's unsigned
+  // actions, so signatures for a pool the PCZT does not spend fail closed.
+  ironwoodSignatures: [],
+  transparentSignatures, // one DER-hex secp256k1 sig per transparent input
+});
+
+await broadcastTransaction(grpcUrl, txHex);
+```
+
+Only t-addresses (P2PKH/P2SH) and u-addresses with an Orchard receiver are accepted as destinations. Sapling z-addresses and TEX (ZIP-320) addresses are rejected.
+
 ## API
 
-### `startSync(params: SyncParams): Promise<TransactionStream>`
+Full signatures, every field, and its constraints are in [`index.d.ts`](index.d.ts), generated by napi-rs from the Rust doc comments — that file is the reference, not this table.
 
-Starts scanning a range of compact blocks and returns a transaction stream. The scan runs in the background immediately in Rust — no JS event loop blocking. `GetTransaction` is called only for matched transactions.
+### Chain queries
 
-### `getChainTip(grpcUrl: string): Promise<number>`
+| Export | Purpose |
+| --- | --- |
+| `getChainTip(grpcUrl)` | Current chain tip height. |
+| `findBlockHeight(grpcUrl, timestamp)` | Height of the latest block at or before a Unix timestamp, by interpolation search. Clamps to genesis / tip. |
 
-Returns the current chain tip height from the gRPC endpoint.
+### Scanning
 
-### `TransactionStream`
+| Export | Purpose |
+| --- | --- |
+| `startSync(params)` | Starts scanning a block range in the background and returns a `TransactionStream`. Trial decryption runs entirely in Rust; `GetTransaction` is called only for matched transactions. |
+| `TransactionStream` | Async iterator: `next()` yields the next match or `null` at end of scan, `cancel()` aborts the background task, `stats()` returns scan statistics once exhausted. |
+| `transactionDetails(grpcUrl, requests, network?, ufvk?)` | Reads from raw transaction bytes what an explorer cannot: the true cross-pool fee, and — with a `ufvk` — the payees of shielded outputs. A transaction that cannot be fetched, parsed, or fully priced yields a `null` fee rather than an approximation. |
 
-Async iterator over matched shielded transactions.
+### Sending
 
-| Method                                         | Description                                                                                       |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `next(): Promise<ShieldedTransaction \| null>` | Returns the next matched transaction, or `null` when the scan is complete.                        |
-| `cancel(): void`                               | Cancels the background scan immediately. Buffered transactions are still consumable via `next()`. |
-| `stats(): Promise<SyncStats>`                  | Returns scan statistics once the stream is exhausted.                                             |
+| Export | Purpose |
+| --- | --- |
+| `buildTransaction(params)` | Builds, proves, and serializes a V5 PCZT from Orchard notes, transparent UTXOs, or both. Bears the Halo 2 proving cost inline (~2–5 s cold, ~hundreds of ms after, via a process-global proving-key cache). |
+| `buildIronwoodTransaction(params)` | Same, for an Ironwood (NU6.3) source — a redacted V6 PCZT. See the status note below. |
+| `parsePczt(pcztHex)` | Decodes canonical PCZT bytes into the `PcztTransaction` the device signer consumes. Fails if a field the device needs to sign is missing. |
+| `finalizeTransaction(params)` | Injects device signatures, computes the binding signature, extracts the signed transaction and its txid. CPU-bound (proof verification), dispatched to a blocking thread. |
+| `broadcastTransaction(grpcUrl, txHex)` | Submits a signed transaction to a lightwalletd / Zaino endpoint; returns the txid. |
 
-## Types
+### Receiving
 
-### `SyncParams`
+| Export | Purpose |
+| --- | --- |
+| `orchardAddressFromUfvk(ufvk)` | The Orchard-only unified address, derived exactly as the device derives it (external scope, diversifier index 0, single receiver) — so it passes on-device verification. Use this for the Receive flow. |
 
-```typescript
-interface SyncParams {
-  /** gRPC endpoint URL */
-  grpcUrl: string;
-  /** Unified Full Viewing Key (UFVK) for the account to scan */
-  viewingKey: string;
-  /** First block height to scan (inclusive) */
-  startHeight: number;
-  /** Last block height to scan (inclusive) */
-  endHeight: number;
-  /** "mainnet" or "testnet" (default: "testnet") */
-  network?: string;
-  /**
-   * When true, only Orchard actions are processed — eliminates all Sapling
-   * crypto work. Set to true for Ledger wallets (Orchard-only support).
-   */
-  orchardOnly?: boolean;
-  /**
-   * Maximum retry attempts per range on transient errors.
-   * The failing range is split in half on each retry. Defaults to 3.
-   */
-  maxRetries?: number;
-  /** Emit per-phase timing diagnostics to stderr every 10 seconds */
-  verbose?: boolean;
-}
-```
+Key derivation is deliberately **not** exported here: it lives in the `zcash-crypto` crate and the `ledger-zcash-cli` binary. A wallet gets its keys from the device.
 
-### `ShieldedTransaction`
+## Value encoding
 
-```typescript
-interface ShieldedTransaction {
-  txid: string; // Transaction ID (big-endian hex)
-  hex: string; // Raw transaction bytes (hex)
-  blockHeight: number;
-  blockHash: string; // Block hash (big-endian hex)
-  blockTime: number; // Unix timestamp (seconds)
-  fee: number; // Fee in zatoshis
-  saplingNotes: ShieldedNote[];
-  orchardNotes: ShieldedNote[];
-  ironwoodNotes: ShieldedNote[]; // Ironwood (NU6.3) pool notes
-}
-```
+The same quantity is not spelled the same way everywhere in this API. Read this before wiring anything up.
 
-### `ShieldedNote`
+**Zatoshi amounts.** The scanning path returns them as JS numbers (`ShieldedNote.amount`, `ShieldedTransaction.fee`, `transparentOut`). Every crafting and PCZT field instead uses a **decimal string** (`valueZat`, `feeZat`, `value`, `spendValue`, `valueBalance`), which avoids the precision loss of a `u64`/`i128` round-tripping through an f64.
 
-```typescript
-interface ShieldedNote {
-  amount: number; // Amount in zatoshis
-  transferType: string; // "incoming", "outgoing", or "internal"
-  memo: string;
-  pool: string; // "sapling", "orchard", or "ironwood" — the shielded pool this note belongs to
-}
-```
+**Txid byte order.** Three fields, three conventions:
 
-### `SyncStats`
+| Field | Order |
+| --- | --- |
+| `ShieldedTransaction.txid`, `FinalizeTransactionResult.txid`, `TransactionDetailsRequest.txid`, `TransparentPrevout.txid` | Big-endian _display_ order — matches explorers and the Ledger Live operation hash. |
+| `TransparentInputJs.txid` | Little-endian _internal_ order. Ledger Live surfaces txids in display order, so callers must reverse before passing. |
+| `PcztTransparentInput.prevoutTxid` | Internal byte order, as stored in the PCZT. |
 
-```typescript
-interface SyncStats {
-  blocksScanned: number;
-  elapsedMs: number;
-}
-```
+**`scriptPubKey`** keeps its canonical Bitcoin/Zcash casing, rather than napi's default camelCasing of the Rust field name (`scriptPubkey`).
+
+## Ironwood (NU6.3) status
+
+`buildIronwoodTransaction` is exposed so the JS side can be wired up in parallel, but Rust-side Ironwood crafting is still a dry run: the wallet-side crates it depends on (`pczt`, `zcash_client_backend`) are release candidates for NU6.3. Those pins are re-confirmed and bumped to the stable releases before the mainnet build cut. See [`docs/architecture.md`](docs/architecture.md).
+
+Ironwood notes on the scanning path are complete and not gated by `orchardOnly`: `ShieldedTransaction.ironwoodNotes` is populated alongside `orchardNotes`, and `ShieldedNote.pool` distinguishes them.
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — crate layout, dependency graph, design decisions
+- [`docs/key-derivation.md`](docs/key-derivation.md) — BIP-39 → ZIP-32 → UFVK pipeline
+- [`docs/block-sync.md`](docs/block-sync.md) — gRPC trial + full decryption
+- [`docs/ffi-node.md`](docs/ffi-node.md) — this addon in depth, with worked examples
+- [`docs/build-targets.md`](docs/build-targets.md) — build scripts and prerequisites
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — building, testing, CLI usage, release process
 
 ## License
 
-MIT OR Apache-2.0
+[Apache-2.0](LICENSE.md), as the rest of the Ledger device stack.
