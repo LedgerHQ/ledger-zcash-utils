@@ -22,9 +22,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 
 # Zcash ecosystem
-# RC pin: swap to the 0.24.0 stable release when published, re-run tests,
-# before the mainnet release cut.
-zcash_client_backend  = { version = "=0.24.0-rc.7", default-features = false }
+zcash_client_backend  = { version = "0.24", default-features = false }
 zcash_keys            = { version = "0.16", features = ["orchard", "sapling"] }
 # Note: `transparent-inputs` is now a default feature of zcash-crypto.
 zcash_address         = "0.13"
