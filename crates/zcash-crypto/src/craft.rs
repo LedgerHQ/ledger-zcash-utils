@@ -1556,7 +1556,7 @@ fn zip317_fee_ironwood(
 /// and #2593 (optional Orchard `cmx`).
 ///
 /// Why not call `zcash_client_backend::data_api::wallet::redact_pczt_for_batch_signer`
-/// directly: it *is* available (`zcash_client_backend 0.24.0-rc.7`) and does strip
+/// directly: it *is* available (`zcash_client_backend 0.24`) and does strip
 /// `spend_fvk` symmetrically from both the Orchard and Ironwood bundles. But its own
 /// documentation states that its output "cannot be signed with the high level
 /// `pczt::roles::signer::Signer` because that role expects full viewing keys" — it

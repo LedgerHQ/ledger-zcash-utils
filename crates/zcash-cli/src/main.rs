@@ -89,7 +89,7 @@ struct DeriveArgs {
 
 #[derive(Parser, Debug)]
 struct TipArgs {
-    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
+    /// gRPC endpoint URL of a lightwalletd or Zaino server (e.g. `https://testnet.zec.rocks:443`)
     #[arg(long)]
     grpc_url: String,
 }
@@ -98,7 +98,7 @@ struct TipArgs {
 
 #[derive(Parser, Debug)]
 struct HeightAtArgs {
-    /// gRPC endpoint URL (e.g. `https://zaino-zec-testnet.nodes.stg.ledger-test.com/`)
+    /// gRPC endpoint URL of a lightwalletd or Zaino server (e.g. `https://testnet.zec.rocks:443`)
     #[arg(long)]
     grpc_url: String,
 

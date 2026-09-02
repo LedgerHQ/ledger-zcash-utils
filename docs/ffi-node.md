@@ -27,10 +27,10 @@ pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 ```typescript
 import { startSync, getChainTip, TransactionStream, ShieldedTransaction, SyncStats } from "./index.js";
 
-const tip = await getChainTip("https://zaino-zec-testnet.nodes.stg.ledger-test.com/");
+const tip = await getChainTip("https://testnet.zec.rocks:443");
 
 const stream: TransactionStream = await startSync({
-  grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  grpcUrl: "https://testnet.zec.rocks:443",
   viewingKey: "uviewtest1...",
   startHeight: 280000,
   endHeight: tip,
@@ -71,7 +71,7 @@ import { buildTransaction, BuildTransactionResult, ShieldedNote } from "./index.
 declare const note: ShieldedNote;
 
 const result: BuildTransactionResult = await buildTransaction({
-  grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  grpcUrl: "https://testnet.zec.rocks:443",
   ufvk: "uviewtest1...",
   network: "testnet",
   // 32-byte ZIP-32 seed fingerprint read from the device (64-char hex).
@@ -120,7 +120,7 @@ Pass those 65 bytes (32-byte chain code ‖ 33-byte compressed pubkey, the paylo
 
 ```typescript
 const result = await buildTransaction({
-  grpcUrl: "https://zaino-zec-testnet.nodes.stg.ledger-test.com/",
+  grpcUrl: "https://testnet.zec.rocks:443",
   // No `ufvk` — this send has no shielded bundle.
   transparentAccountPubkey: "<130-char hex: chainCode ‖ compressed pubkey>",
   network: "testnet",
