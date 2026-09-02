@@ -801,6 +801,16 @@ export interface TestDerivedKeys {
  * device would report, without a physical Ledger. Never call this from
  * production wallet code: it holds the mnemonic (spending-key material) in
  * process memory, which the production host must never do.
+ *
+ * # Errors
+ *
+ * When `mnemonic` is not a valid BIP-39 phrase (unknown word, bad checksum),
+ * when derivation itself fails, or when `network` is neither `"mainnet"` nor
+ * `"testnet"`. Note that `"regtest"` is rejected here even though the
+ * builders accept it: this surface derives regtest keys under the mainnet
+ * convention, so pass `"mainnet"` for a regtest chain.
+ *
+ * Synchronous and pure — no network, no device.
  */
 export declare function testDeriveKeys(mnemonic: string, account: number, network: string): TestDerivedKeys
 /** TEST-ONLY. Result of [`test_sign_pczt`]. */
@@ -836,6 +846,17 @@ export interface TestSignPcztResult {
  *
  * CPU-bound (Orchard/Ironwood proving-key-adjacent signing work): dispatched
  * to `tokio::task::spawn_blocking`, mirroring `finalize_transaction`.
+ *
+ * # Errors
+ *
+ * On the same `network` and `mnemonic` conditions as `testDeriveKeys`, on a
+ * `pcztHex` that is not hex ("pczt_hex decode: …") or not a PCZT this crate
+ * can parse, and when a bundle the PCZT does carry cannot be signed with the
+ * derived key — a spend whose key is not the one that owns it, for instance.
+ * A bundle the PCZT does not carry is not an error: that leg comes back empty.
+ *
+ * Should the blocking task die, the message says so ("… panicked", "… was
+ * cancelled"); treat that as a bug report rather than a condition to handle.
  */
 export declare function testSignPczt(mnemonic: string, account: number, network: string, pcztHex: string): Promise<TestSignPcztResult>
 /**

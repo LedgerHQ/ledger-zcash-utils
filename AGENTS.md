@@ -23,11 +23,11 @@ To change the TypeScript surface, edit the signatures and doc comments in the na
 
 An exported function documents what it throws, in an `# Errors` section. Every failure reaches JavaScript as a plain `Error` carrying only a message: no code, no subclass, nothing to switch on, so that section is the entire contract a caller has. State the categories rather than transcribing the strings, and say whether a retry is safe — for anything that touches the network, whether a failure means the operation did not happen.
 
-## No spending key material in this layer
+## No spending key material on the production surface
 
-This workspace reads a Unified Full Viewing Key and an account-level transparent pubkey; every signature comes from the Ledger device. Never derive spending keys from a seed here, and never add an API that would need them.
+The production surface reads a Unified Full Viewing Key and an account-level transparent pubkey; every signature comes from the Ledger device. Never derive spending keys from a seed there, and never add a production export that would need them.
 
-Key derivation does exist, for development, in the core crypto crate and behind a CLI subcommand, and is deliberately absent from the NAPI surface. Keep it that way: a wallet takes its keys from the device.
+One exception exists, and it is bounded rather than an oversight: the exports prefixed `test` take a mnemonic so that a consumer can run its send flow without a physical device. They are a device stand-in for automated testing, they say so in their own doc comments, and they are the only place a seed may appear. Do not remove them, and do not generalise them either — extend that surface only for the same reason, keep the prefix, and leave development-time key derivation where it already lives, in the core crypto crate and behind a CLI subcommand.
 
 ## One crate carries a coverage floor
 
