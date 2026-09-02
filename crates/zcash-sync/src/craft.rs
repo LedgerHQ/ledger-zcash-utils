@@ -27,7 +27,7 @@ use zcash_crypto::{
         IronwoodBuildInputs, IronwoodDestination, IronwoodOutputRequest, IronwoodSpendInput,
         OrchardSpendInput, OutputRequest, TransparentInput, DEFAULT_TX_EXPIRY_DELTA,
     },
-    network::parse_network,
+    network::{parse_any_network, AnyZcashNetwork},
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 use zcash_transparent::keys::AccountPubKey;
@@ -112,7 +112,9 @@ pub struct CraftRequest {
     /// One of the two must be supplied — see the guard at the top of
     /// [`craft_transaction`] for why the rule is checked rather than typed.
     pub transparent_account_pubkey_hex: Option<String>,
-    /// `"mainnet"` / `"testnet"`. `None` ⇒ testnet (matches sync default).
+    /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
+    /// sync default). `"regtest"` targets a local node whose activation
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
     pub network: Option<String>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
@@ -161,7 +163,7 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
         ));
     }
 
-    let network = parse_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
@@ -440,7 +442,7 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
 /// Orchard or transparent receiver. Sapling z-addresses and ZIP-320 TEX
 /// addresses are rejected.
 fn decode_destination(
-    network: &zcash_protocol::consensus::Network,
+    network: &AnyZcashNetwork,
     address: &str,
 ) -> Result<Destination> {
     let addr = Address::decode(network, address)
@@ -535,7 +537,9 @@ pub struct IronwoodOutputRequestDto {
 pub struct IronwoodCraftRequest {
     pub grpc_url: String,
     pub ufvk: String,
-    /// `"mainnet"` / `"testnet"`. `None` ⇒ testnet (matches sync default).
+    /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
+    /// sync default). `"regtest"` targets a local node whose activation
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
     pub network: Option<String>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
@@ -570,7 +574,7 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
         return Err(anyhow!("craft: outputs list is empty"));
     }
 
-    let network = parse_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
@@ -788,7 +792,7 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
 /// called with the decoded address, not by its encoding. Sapling z-addresses
 /// and ZIP-320 TEX addresses are rejected.
 fn decode_ironwood_destination(
-    network: &zcash_protocol::consensus::Network,
+    network: &AnyZcashNetwork,
     address: &str,
 ) -> Result<IronwoodDestination> {
     let addr = Address::decode(network, address)

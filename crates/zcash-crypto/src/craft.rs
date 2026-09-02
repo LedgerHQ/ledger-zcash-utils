@@ -111,10 +111,12 @@ use zcash_primitives::transaction::{
     TxVersion,
 };
 use zcash_protocol::{
-    consensus::{BlockHeight, BranchId, Network, NetworkConstants, NetworkUpgrade, Parameters},
+    consensus::{BlockHeight, BranchId, NetworkConstants, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::Zatoshis,
 };
+#[cfg(test)]
+use zcash_protocol::consensus::Network;
 use zcash_transparent::{
     address::TransparentAddress, pczt::Bip32Derivation as TransparentBip32Derivation,
 };
@@ -122,10 +124,55 @@ use zip32::ChildIndex;
 
 use crate::circuit::orchard_circuit_version_for;
 use crate::error::Error;
+use crate::network::AnyZcashNetwork;
+#[cfg(test)]
+use crate::network::ZCASH_REGTEST;
 
 /// Default expiry delta in blocks. Matches `DEFAULT_TX_EXPIRY_DELTA` in
 /// `zcash_primitives::transaction::builder`.
 pub const DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
+
+/// Coin type used when stamping a ZIP-32/BIP-44 derivation path into a PCZT.
+///
+/// Deliberately diverges from `network.coin_type()` for
+/// [`AnyZcashNetwork::Local`] (regtest): `zcash_protocol`'s own `NetworkType`
+/// maps `Regtest` to coin type 1 (the shared SLIP-44 "test networks" value,
+/// same as `Testnet`), but this crate's key-derivation surface
+/// (`parse_test_network`, backing `testDeriveKeys`/`testSignPczt`) never
+/// accepts `"regtest"` and always derives under the *mainnet* convention
+/// (coin type 133) -- there is no regtest-specific key hierarchy anywhere
+/// else in this crate. Stamping a regtest build's PCZT with coin type 1 would
+/// therefore record a signing path no caller derives from, since every
+/// caller re-deriving from raw seed material for a regtest build still does
+/// so under mainnet's path. Named/testnet builds are unaffected: `Testnet`
+/// still stamps its own coin type 1, matching `parse_test_network`'s
+/// unchanged testnet support.
+///
+/// This narrow override intentionally does *not* extend to
+/// [`AnyZcashNetwork::network_type`] itself (which stays `Regtest` for
+/// `Local`, see that method's own comment) -- widening it there breaks
+/// address-string decoding, which needs `Regtest`'s (testnet-shared) version
+/// bytes to accept the encoding every regtest address in this crate's callers
+/// actually uses (empirically confirmed: switching `network_type` to `Main`
+/// made every transparent destination decode fail with "invalid destination
+/// address"). One known, accepted consequence of keeping the two narrow:
+/// the PCZT's own `global.coin_type` header field -- set independently by
+/// `pczt::roles::creator::Creator::build_from_parts` from
+/// `network_type().coin_type()`, with no public accessor this crate could
+/// patch afterwards (`pczt::common::Global`'s `coin_type` field is
+/// `pub(crate)` to the `pczt` crate, with no getter or setter at all) --
+/// still carries regtest's SLIP-44 value (1), inconsistent with the mainnet
+/// coin type (133) this function stamps into the derivation paths inside the
+/// same PCZT. This does not affect this crate's own device-free signing (the
+/// header field has no reader anywhere in this codebase); it would affect a
+/// real device, which checks it -- out of scope for this crate's regtest
+/// support, which has no real-device consumer.
+fn stamped_coin_type(network: &AnyZcashNetwork) -> u32 {
+    match network {
+        AnyZcashNetwork::Local(_) => zcash_protocol::consensus::Network::MainNetwork.coin_type(),
+        AnyZcashNetwork::Named(named) => named.coin_type(),
+    }
+}
 
 /// One Orchard note to spend.
 #[derive(Clone, Debug)]
@@ -199,7 +246,7 @@ pub struct OutputRequest {
 
 /// Inputs to [`build_transaction`].
 pub struct BuildInputs {
-    pub network: Network,
+    pub network: AnyZcashNetwork,
     /// Target block height. Builder uses `target + DEFAULT_TX_EXPIRY_DELTA` for
     /// the expiry. Branch ID is derived from this height.
     pub target_height: u32,
@@ -292,7 +339,7 @@ pub(crate) fn proving_key() -> &'static ProvingKey {
 /// Proving a `orchard_v3` bundle with the NU6.2 key fails as `InvalidInstances`.
 /// The NU6.3 generation is the same key the Ironwood path uses, which is why a V6
 /// transaction can prove both of its bundles with it.
-fn orchard_proving_key_for(network: &Network, target: BlockHeight) -> &'static ProvingKey {
+fn orchard_proving_key_for(network: &AnyZcashNetwork, target: BlockHeight) -> &'static ProvingKey {
     match orchard_circuit_version_for(BranchId::for_height(network, target)) {
         OrchardCircuitVersion::PostNu6_3 => ironwood_proving_key(),
         _ => proving_key(),
@@ -629,7 +676,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
 /// single-account transaction share the same path.
 fn stamp_spend_derivations(
     pczt: Pczt,
-    network: &Network,
+    network: &AnyZcashNetwork,
     seed_fingerprint: [u8; 32],
     account_index: u32,
 ) -> Result<Pczt, Error> {
@@ -642,7 +689,7 @@ fn stamp_spend_derivations(
     // All indices are hardened (high bit set), as required by Orchard ZIP-32.
     let derivation_path: Vec<u32> = vec![
         ChildIndex::hardened(32).index(),
-        ChildIndex::hardened(network.coin_type()).index(),
+        ChildIndex::hardened(stamped_coin_type(network)).index(),
         ChildIndex::hardened(account_index).index(),
     ];
 
@@ -730,13 +777,13 @@ fn bip44_transparent_path(
 /// the transparent `UpdaterError` (invalid index).
 fn stamp_transparent_derivations(
     pczt: Pczt,
-    network: &Network,
+    network: &AnyZcashNetwork,
     seed_fingerprint: [u8; 32],
     account_index: u32,
     transparent_inputs: &[TransparentInput],
     change: Option<(usize, [u8; 33], u32)>,
 ) -> Result<Pczt, Error> {
-    let coin_type = network.coin_type();
+    let coin_type = stamped_coin_type(network);
 
     let mut input_derivations: Vec<([u8; 33], TransparentBip32Derivation)> =
         Vec::with_capacity(transparent_inputs.len());
@@ -788,7 +835,7 @@ fn stamp_transparent_derivations(
 }
 
 fn add_spend(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     fvk: &OrchardFvk,
     spend: &OrchardSpendInput,
 ) -> Result<(), Error> {
@@ -831,7 +878,7 @@ fn add_spend(
 /// CompactSize varint before calling it (the inner `script::Code` type is private
 /// in `zcash_transparent` and cannot be named from outside the crate).
 fn add_transparent_input(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     tin: &TransparentInput,
 ) -> Result<(), Error> {
     use zcash_transparent::{address::Script, bundle::TxOut};
@@ -873,7 +920,7 @@ fn add_transparent_input(
 }
 
 fn add_output(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     ovk: Option<&OutgoingViewingKey>,
     out: &OutputRequest,
 ) -> Result<(), Error> {
@@ -906,7 +953,7 @@ fn add_output(
 /// behaves like `add_output` plus an ownership check on `fvk`, so no epoch branch is
 /// needed here.
 fn add_orchard_change(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     fvk: &OrchardFvk,
     ovk: Option<&OutgoingViewingKey>,
     recipient: OrchardAddress,
@@ -1035,7 +1082,7 @@ pub struct IronwoodOutputRequest {
 
 /// Inputs to [`build_ironwood_transaction`].
 pub struct IronwoodBuildInputs {
-    pub network: Network,
+    pub network: AnyZcashNetwork,
     /// Target block height. Builder uses `target + DEFAULT_TX_EXPIRY_DELTA` for
     /// the expiry. Branch ID is derived from this height and must resolve to
     /// `Nu6_3` (or later) for the Ironwood bundle to be available.
@@ -1387,7 +1434,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
 /// too, since the device requires a path on every action).
 fn stamp_ironwood_spend_derivations(
     pczt: Pczt,
-    network: &Network,
+    network: &AnyZcashNetwork,
     seed_fingerprint: [u8; 32],
     account_index: u32,
 ) -> Result<Pczt, Error> {
@@ -1399,7 +1446,7 @@ fn stamp_ironwood_spend_derivations(
     }
     let derivation_path: Vec<u32> = vec![
         ChildIndex::hardened(32).index(),
-        ChildIndex::hardened(network.coin_type()).index(),
+        ChildIndex::hardened(stamped_coin_type(network)).index(),
         ChildIndex::hardened(account_index).index(),
     ];
 
@@ -1423,7 +1470,7 @@ fn stamp_ironwood_spend_derivations(
 }
 
 fn add_ironwood_spend(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     fvk: &OrchardFvk,
     spend: &IronwoodSpendInput,
 ) -> Result<(), Error> {
@@ -1458,7 +1505,7 @@ fn add_ironwood_spend(
 }
 
 fn add_ironwood_output(
-    builder: &mut Builder<Network, ()>,
+    builder: &mut Builder<AnyZcashNetwork, ()>,
     ovk: Option<&OutgoingViewingKey>,
     out: &IronwoodOutputRequest,
 ) -> Result<(), Error> {
@@ -1722,7 +1769,7 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: Some(fvk),
             ovk,
@@ -1783,7 +1830,7 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk),
             ovk,
@@ -1880,7 +1927,7 @@ mod tests {
             &ExtractedNoteCommitment::from(dummy_note.commitment()),
         ));
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -1938,7 +1985,7 @@ mod tests {
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (_anchor, path) = synthetic_anchor_and_path(leaf);
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -1978,7 +2025,7 @@ mod tests {
         let fvk = make_fvk();
         let change = fvk.address_at(0u32, Scope::Internal);
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2026,7 +2073,7 @@ mod tests {
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2060,7 +2107,7 @@ mod tests {
         let fvk = make_fvk();
         let change = fvk.address_at(0u32, Scope::Internal);
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: 100,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2223,7 +2270,7 @@ mod tests {
         let fee = zip317_fee(0, 0, 1, 1);
         let out_value = 10_000u64;
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2267,7 +2314,7 @@ mod tests {
         let t_dest = TransparentAddress::PublicKeyHash([0x11u8; 20]);
         let fee = zip317_fee(0, 0, 1, 1); // 10_000
         let inputs = BuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2491,7 +2538,7 @@ mod tests {
             .collect();
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -2553,7 +2600,7 @@ mod tests {
         // absorb.
         let fee = 10_000u64; // == zip317_fee(1, 2, 0, 0)
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2619,7 +2666,7 @@ mod tests {
 
         // out 10_000 + fee 5_000 = 15_000 > total_in 10_000 → insufficient funds.
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2679,7 +2726,7 @@ mod tests {
         let total_in = out_value + change_value + fee;
 
         BuildInputs {
-            network,
+            network: network.into(),
             target_height,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2778,7 +2825,7 @@ mod tests {
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -2905,7 +2952,7 @@ mod tests {
         let input_pubkey = make_test_pubkey();
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -2976,7 +3023,7 @@ mod tests {
         let seed_fingerprint = [0x42u8; 32];
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -3084,7 +3131,7 @@ mod tests {
         let total_in = out_value + fee;
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
@@ -3156,7 +3203,7 @@ mod tests {
         let total_in = out_value + fee;
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3237,7 +3284,7 @@ mod tests {
         let total_in = out_value + change_value + fee;
 
         let inputs = BuildInputs {
-            network,
+            network: network.into(),
             target_height: nu5_activation_height(network) + 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3503,7 +3550,7 @@ mod tests {
             .collect();
 
         let inputs = IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3571,7 +3618,7 @@ mod tests {
         );
 
         let inputs = IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: None,
@@ -3643,7 +3690,7 @@ mod tests {
         let total_in = out_value + fee;
 
         let inputs = IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3707,7 +3754,7 @@ mod tests {
         let total_in = out_value + change_value + fee;
 
         let inputs = IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3831,7 +3878,7 @@ mod tests {
             orchard_padding: BundlePadding::DEFAULT,
             ironwood_padding: BundlePadding::DEFAULT,
         };
-        let mut builder = Builder::new(network, target, build_config);
+        let mut builder = Builder::new(network.into(), target, build_config);
         // Fund the two 1_000-zat outputs plus the ZIP-317 fee for the resulting
         // layout: 1 transparent input (1 logical action) + 2 orchard actions
         // (the change, padded to MIN_ACTIONS) + 2 ironwood actions (the output,
@@ -3904,7 +3951,7 @@ mod tests {
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
         IronwoodBuildInputs {
-            network,
+            network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -4076,7 +4123,7 @@ mod tests {
     fn no_ironwood_bundle_returns_craft_error() {
         let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
         let inputs = IronwoodBuildInputs {
-            network: Network::MainNetwork,
+            network: Network::MainNetwork.into(),
             target_height: nu6_3_activation_height(Network::MainNetwork) + 1,
             ironwood_fvk: None,
             ovk: None,
@@ -4117,6 +4164,176 @@ mod tests {
         assert!(
             matches!(&err, Error::Craft(s) if s.contains("NU6.3 is not active")),
             "got: {err}"
+        );
+    }
+
+    // ── Regtest (LocalNetwork) ──────────────────────────────────────────────────
+    //
+    // A fresh regtest chain's tip height never reaches the real mainnet/testnet
+    // NU5/NU6.3 activation heights `nu5_activation_height`/`nu6_3_activation_height`
+    // return above, so every build against `Network::MainNetwork`/`TestNetwork`
+    // rejects at a realistic regtest target height. `ZCASH_REGTEST` (NU5/NU6.3
+    // both at height 2) is what lets these same builders succeed against a local
+    // node. These tests build at height 3 — past both activations — mirroring
+    // the task's low-target-height regtest scenario.
+
+    #[test]
+    fn build_transaction_succeeds_on_regtest_at_low_target_height() {
+        let t_recv = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        // 1 t_in + 1 t_out, no change → grace-bound ZIP-317 fee.
+        let fee = zip317_fee(0, 0, 1, 1);
+        assert_eq!(fee, 10_000);
+        let out_value = 10_000u64;
+        let total_in = out_value + fee;
+
+        let inputs = BuildInputs {
+            network: AnyZcashNetwork::Local(ZCASH_REGTEST),
+            target_height: 3,
+            orchard_fvk: None,
+            ovk: None,
+            change_address: None,
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_transaction(inputs).expect(
+            "target_height 3 is past ZCASH_REGTEST's NU5 activation height (2); a fresh \
+             regtest chain must be able to build a V5 transaction",
+        );
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(
+            out.n_transparent_outputs, 1,
+            "exact balance leaves no transparent change"
+        );
+        assert_eq!(out.n_actions_orchard, 0, "Public→Public has no Orchard bundle");
+        assert_eq!(out.fee, fee);
+    }
+
+    #[test]
+    fn build_transaction_still_rejects_regtest_before_nu5_activation() {
+        let t_recv = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let inputs = BuildInputs {
+            network: AnyZcashNetwork::Local(ZCASH_REGTEST),
+            // ZCASH_REGTEST.nu5 == Some(2), so height 1 is one block before activation.
+            target_height: 1,
+            orchard_fvk: None,
+            ovk: None,
+            change_address: None,
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(20_000)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: 10_000,
+                memo: None,
+            }],
+        };
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("NU5 is not active")),
+            "the regtest gate must still reject a target_height below its own NU5 \
+             activation height instead of accepting every height unconditionally; got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_ironwood_transaction_succeeds_on_regtest_at_low_target_height() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+
+        // A validly-encoded Ironwood anchor from a synthetic one-leaf tree (only
+        // value-0 dummy spends reference it, so its exact content is irrelevant
+        // beyond decoding via `orchard::Anchor::from_bytes`).
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let anchor_note =
+            Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V3)
+                .into_option()
+                .unwrap();
+        let leaf =
+            MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
+        let (anchor, _path) = synthetic_anchor_and_path(leaf);
+
+        // 1 transparent input, 1 Ironwood output, no change (exact balance).
+        // ironwood_actions = max(MIN=2, max(0,1)) = 2; transparent = max(1,0) = 1;
+        // logical = 3 → 15_000.
+        let fee = zip317_fee_ironwood(0, 1, 1, 0);
+        assert_eq!(fee, 15_000);
+        let out_value = 10_000u64;
+        let total_in = out_value + fee;
+
+        let inputs = IronwoodBuildInputs {
+            network: AnyZcashNetwork::Local(ZCASH_REGTEST),
+            target_height: 3,
+            ironwood_fvk: None,
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs: vec![IronwoodOutputRequest {
+                destination: IronwoodDestination::Ironwood(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        };
+
+        let out = build_ironwood_transaction(inputs).expect(
+            "target_height 3 is past ZCASH_REGTEST's NU6.3 activation height (2); a fresh \
+             regtest chain must be able to build a V6/Ironwood transaction",
+        );
+        assert_eq!(&out.pczt_bytes[..4], b"PCZT");
+        assert!(
+            out.n_actions_ironwood >= 1,
+            "Public→Ironwood must carry an Ironwood bundle"
+        );
+        assert_eq!(out.n_transparent_inputs, 1);
+        assert_eq!(out.fee, fee);
+    }
+
+    #[test]
+    fn build_ironwood_transaction_still_rejects_regtest_before_nu6_3_activation() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let mut inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        inputs.network = AnyZcashNetwork::Local(ZCASH_REGTEST);
+        // ZCASH_REGTEST.nu6_3 == Some(2), so height 1 is one block before activation.
+        inputs.target_height = 1;
+        let err = build_ironwood_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("NU6.3 is not active")),
+            "the regtest gate must still reject a target_height below its own NU6.3 \
+             activation height instead of accepting every height unconditionally; got: {err}"
         );
     }
 }

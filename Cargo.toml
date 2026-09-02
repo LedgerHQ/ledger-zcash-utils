@@ -33,7 +33,7 @@ zcash_primitives      = { version = "0.30", default-features = false }
 # Transparent-pool address + script types; pulled by zcash_primitives internally
 # under the local alias `transparent`. We depend on it directly to avoid that alias.
 zcash_transparent     = "0.10"
-zcash_protocol        = "0.10"
+zcash_protocol        = { version = "0.10", features = ["local-consensus"] }
 zip32                 = "0.2"
 orchard               = { version = "0.15", default-features = false }
 sapling-crypto        = { version = "0.7", default-features = false }
