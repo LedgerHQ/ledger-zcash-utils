@@ -147,6 +147,13 @@ pub struct TransactionStream {
 impl TransactionStream {
     /// Returns the next matched transaction, or `null` when the scan is complete.
     ///
+    /// # Errors
+    ///
+    /// Never. A failed scan is not reported here — the channel just closes — so
+    /// `null` means "no more transactions", not "the scan succeeded". Only
+    /// `stats()` distinguishes the two, which is why a caller that persists
+    /// results has to call it.
+    ///
     /// # Safety
     ///
     /// napi-rs requires `unsafe` for `&mut self` in async methods.
@@ -174,6 +181,17 @@ impl TransactionStream {
     /// Returns scan statistics once the stream is exhausted (i.e. after `next()`
     /// returns `null`). Calling this before the stream is done will wait until
     /// the background sync task finishes.
+    ///
+    /// # Errors
+    ///
+    /// This is where a scan reports its failure, and the only place it does:
+    /// an unreachable endpoint, a malformed viewing key or a gRPC error part-way
+    /// through the range all arrive here, carrying the underlying message.
+    ///
+    /// It also fails when there are no statistics to give: after `cancel()`, or
+    /// if the background task was dropped ("sync task was dropped before
+    /// completing"), and on any call after the first ("stats() called more than
+    /// once") — the result is moved out, not copied.
     ///
     /// # Safety
     ///
@@ -208,6 +226,13 @@ impl TransactionStream {
 ///
 /// Trial decryption runs entirely in Rust (no JS event loop blocking).
 /// `GetTransaction` is called only for matched transactions.
+///
+/// # Errors
+///
+/// Never at call time. The scan is spawned and this returns as soon as the
+/// stream object exists, so nothing is validated here: an unreachable
+/// `grpcUrl`, a malformed `viewingKey` or an inverted height range are all
+/// reported later, by `stats()`.
 #[napi]
 pub async fn start_sync(params: SyncParams) -> napi::Result<TransactionStream> {
     let (tx_sender, tx_receiver) = mpsc::unbounded_channel::<GrpcTx>();
@@ -247,6 +272,11 @@ pub async fn start_sync(params: SyncParams) -> napi::Result<TransactionStream> {
 }
 
 /// Returns the current chain tip height from the gRPC endpoint.
+///
+/// # Errors
+///
+/// Only on transport trouble: the endpoint cannot be reached, refuses the
+/// connection, or the call times out. Retrying is safe — the call reads.
 #[napi]
 pub async fn get_chain_tip(grpc_url: String) -> napi::Result<u32> {
     zcash_sync::client::chain_tip(grpc_url)
@@ -259,6 +289,11 @@ pub async fn get_chain_tip(grpc_url: String) -> napi::Result<u32> {
 /// Returns the height of the latest block whose timestamp is ≤ the target.
 /// If the timestamp is before genesis, returns the genesis height.
 /// If the timestamp is after the chain tip, returns the tip height.
+///
+/// # Errors
+///
+/// Only on transport trouble, as with `getChainTip`; an out-of-range timestamp
+/// clamps instead of failing. Retrying is safe — the call reads.
 #[napi]
 pub async fn find_block_height(grpc_url: String, timestamp: u32) -> napi::Result<u32> {
     zcash_sync::client::find_block_height(grpc_url, timestamp)
@@ -398,6 +433,26 @@ pub struct BuildTransactionResult {
 /// `spawn_blocking`), this is an async orchestrator that interleaves gRPC
 /// witness fetches with the CPU-bound proving step, so it cannot be wrapped in a
 /// single `spawn_blocking` call — the proving cost is borne inline.
+///
+/// # Errors
+///
+/// Malformed input fails before any network or proving work: a decimal string
+/// that is not a `u64` ("invalid fee_zat: …"), a hex field that does not decode
+/// or has the wrong length ("… hex decode: …", "…: expected 32 bytes, got 31"),
+/// an empty `outputs` list, a `ufvk` that does not parse or carries no Orchard
+/// component, a `transparentAccountPubkey` that is not account-level.
+///
+/// A destination this package will not pay fails the same way, by design rather
+/// than by omission: Sapling z-addresses and ZIP-320 TEX addresses are rejected,
+/// as is a u-address with no Orchard receiver.
+///
+/// Then the work itself: gRPC failures while fetching the tree state and
+/// witnesses, an anchor whose checkpoint is missing, a witness whose recomputed
+/// root disagrees, arithmetic overflow on the output or fee totals, and finally
+/// a proving or serialization failure ("build_transaction: …").
+///
+/// Nothing is broadcast and no device is touched, so any failure here is safe to
+/// retry once the input is fixed.
 #[napi]
 pub async fn build_transaction(
     params: BuildTransactionParams,
@@ -582,6 +637,11 @@ fn convert_ironwood_transparent_inputs(
 /// happens here for the Ironwood bundle (~2-5 s first call against the
 /// `PostNu6_3` circuit, ~hundreds of ms thereafter via the process-global
 /// proving-key cache).
+///
+/// # Errors
+///
+/// The same set as `buildTransaction`, on the same inputs and in the same order,
+/// with the build-stage message reading "build_ironwood_transaction: …".
 #[napi]
 pub async fn build_ironwood_transaction(
     params: BuildIronwoodTransactionParams,
@@ -688,6 +748,27 @@ pub struct FinalizeTransactionResult {
 ///
 /// CPU-bound (Halo 2 proof verification runs here): the pure call is dispatched
 /// to `tokio::task::spawn_blocking` so the async executor is not starved.
+///
+/// # Errors
+///
+/// Each signature is decoded and measured before anything else, and the message
+/// names the offending index: "orchard_signatures[2] hex decode: …",
+/// "ironwood_signatures[0] must be 64 bytes (got 63 bytes)",
+/// "transparent_signatures[1] hex decode: …".
+///
+/// Then finalization proper fails when the signatures do not fit the PCZT: a
+/// list whose length does not match that pool's unsigned actions — including a
+/// non-empty list for a pool the PCZT does not spend, which fails rather than
+/// being ignored — a signature that does not verify against its action, or a
+/// nullifier the high-level signer role finds inconsistent. A malformed or
+/// truncated `pczt` fails here too ("pczt hex decode: …", or a parse error).
+///
+/// Should the blocking task die, the message says so ("finalization task
+/// panicked: …", "finalization task was cancelled: …"); treat that as a bug
+/// report rather than a condition to handle.
+///
+/// Nothing is broadcast, so a failure leaves no on-chain trace: fix the
+/// signatures and call again with the same PCZT.
 #[napi]
 pub async fn finalize_transaction(
     params: FinalizeTransactionParams,
@@ -772,8 +853,25 @@ pub async fn finalize_transaction(
 ///
 /// Returns the txid (64-char hex, big-endian display order — matches the sync
 /// path and the Ledger Live operation hash) on success (`errorCode == 0`).
-/// Returns a descriptive error on a non-zero `errorCode` (carrying the server's
-/// `errorMessage`) or on a gRPC transport failure.
+///
+/// # Errors
+///
+/// Three failures, and the difference between them decides whether a retry is
+/// safe.
+///
+/// The transaction never left: `tx_hex` is not hex ("tx_hex decode: …") or the
+/// bytes are not a transaction a txid can be derived from. Retrying identical
+/// bytes will fail identically.
+///
+/// The node rejected it, definitively: "SendTransaction rejected (code N): …",
+/// carrying the node's own `errorCode` and `errorMessage`. The transaction was
+/// seen and refused, so retrying it unchanged is pointless.
+///
+/// The transport failed: "SendTransaction failed: …". This one is **ambiguous** —
+/// the request may have reached the node and been accepted before the connection
+/// broke. Do not assume the send did not happen: look the txid up (it is derived
+/// from the bytes, so it is known before broadcasting) before retrying or
+/// re-crafting, or the same funds may be spent twice.
 #[napi]
 pub async fn broadcast_transaction(grpc_url: String, tx_hex: String) -> napi::Result<String> {
     let tx_bytes = hex::decode(&tx_hex)
@@ -837,6 +935,14 @@ pub struct TransactionDetailsResult {
 /// Both answers come from the same fetched transaction. One that cannot be
 /// fetched, parsed, or fully priced yields a `null` fee and no payees, rather
 /// than an approximation.
+///
+/// # Errors
+///
+/// A single unreadable transaction does not throw — that is what the `null` fee
+/// is for. What throws is a request the whole batch cannot proceed on: an
+/// unrecognised `network`, a `prevouts` value that is not a decimal `u64`
+/// ("prevout value 1e5: …"), a `ufvk` that does not parse, or a transport
+/// failure reaching the endpoint. Retrying is safe — the call reads.
 #[napi]
 pub async fn transaction_details(
     grpc_url: String,
@@ -1064,8 +1170,17 @@ pub struct PcztTransaction {
 ///
 /// The PCZT binary format (postcard) is not trivially parseable in TypeScript;
 /// this decodes it in Rust and breaks out the transparent inputs/outputs and
-/// each Orchard action field-by-field. Fails if the input is not a valid PCZT,
-/// or if a field the device requires to sign is missing from it.
+/// each Orchard action field-by-field.
+///
+/// # Errors
+///
+/// When the input is not hex ("pczt hex decode: …"), not a PCZT (wrong magic,
+/// unsupported version, malformed postcard payload), or when a field the device
+/// needs in order to sign is absent from it. That last check is the point of
+/// parsing here rather than on the device: an incomplete PCZT is caught on the
+/// host, before a user is asked to confirm anything.
+///
+/// Synchronous and pure — no network, no device.
 #[napi]
 pub fn parse_pczt(pczt_hex: String) -> napi::Result<PcztTransaction> {
     let bytes = hex::decode(&pczt_hex)
@@ -1083,6 +1198,14 @@ pub fn parse_pczt(pczt_hex: String) -> napi::Result<PcztTransaction> {
 ///
 /// Do not confuse with `deriveKeys().multiReceiverUnifiedAddress`, which bundles
 /// all available receivers and does NOT match the device address.
+///
+/// # Errors
+///
+/// When the string is not a decodable UFVK, when it carries no Orchard component
+/// (there is then no address to derive), or when its network is not one this
+/// package supports.
+///
+/// Synchronous and pure — no network, no device.
 #[napi]
 pub fn orchard_address_from_ufvk(ufvk: String) -> napi::Result<String> {
     zcash_crypto::keys::orchard_address_from_ufvk(&ufvk)
@@ -1338,6 +1461,16 @@ pub struct TestDerivedKeys {
 /// device would report, without a physical Ledger. Never call this from
 /// production wallet code: it holds the mnemonic (spending-key material) in
 /// process memory, which the production host must never do.
+///
+/// # Errors
+///
+/// When `mnemonic` is not a valid BIP-39 phrase (unknown word, bad checksum),
+/// when derivation itself fails, or when `network` is neither `"mainnet"` nor
+/// `"testnet"`. Note that `"regtest"` is rejected here even though the
+/// builders accept it: this surface derives regtest keys under the mainnet
+/// convention, so pass `"mainnet"` for a regtest chain.
+///
+/// Synchronous and pure — no network, no device.
 #[napi]
 pub fn test_derive_keys(
     mnemonic: String,
@@ -1378,6 +1511,17 @@ pub struct TestSignPcztResult {
 ///
 /// CPU-bound (Orchard/Ironwood proving-key-adjacent signing work): dispatched
 /// to `tokio::task::spawn_blocking`, mirroring `finalize_transaction`.
+///
+/// # Errors
+///
+/// On the same `network` and `mnemonic` conditions as `testDeriveKeys`, on a
+/// `pcztHex` that is not hex ("pczt_hex decode: …") or not a PCZT this crate
+/// can parse, and when a bundle the PCZT does carry cannot be signed with the
+/// derived key — a spend whose key is not the one that owns it, for instance.
+/// A bundle the PCZT does not carry is not an error: that leg comes back empty.
+///
+/// Should the blocking task die, the message says so ("… panicked", "… was
+/// cancelled"); treat that as a bug report rather than a condition to handle.
 #[napi]
 pub async fn test_sign_pczt(
     mnemonic: String,
