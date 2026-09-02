@@ -1,5 +1,39 @@
 # @ledgerhq/zcash-utils
 
+## 2.4.0
+
+### Minor Changes
+
+- 6350264: Add `"regtest"` as a valid `network` value for `buildTransaction`/`buildIronwoodTransaction`. A fresh regtest chain's tip height never reaches the real mainnet/testnet NU5/NU6.3 activation heights, so both builders previously rejected every send against a local node. `network: "regtest"` now resolves to a `LocalNetwork` whose Overwinter-through-Canopy upgrades activate at height 1 and NU5/NU6/NU6.1/NU6.2/NU6.3 at height 2, matching the canonical zebra/zaino/librustzcash regtest defaults.
+
+  A regtest build now stamps derivation paths with mainnet's coin type (133), not regtest's own SLIP-44 value (1, shared with testnet) — this crate's key-derivation surface always derives regtest keys under the mainnet convention, so stamping the SLIP-44 value produced a path no caller actually derives from.
+
+  Known limitation: the PCZT's own `global.coin_type` header field (set independently by the `pczt` crate's `Creator` role from the network's type, with no accessor this crate can override afterwards) still carries regtest's SLIP-44 value (1), inconsistent with the mainnet coin type stamped into the derivation paths above. This has no effect on this crate's own device-free signing surface, which never reads that field; it would matter only to a real device, which is out of scope for regtest support.
+
+### Patch Changes
+
+- 8c851fc: Document what every export throws. The published declarations described no failure at all, so the only ways to learn what rejects a promise were to read the Rust or to hit each case in production. Each export now carries an `# Errors` section, which napi-rs propagates into `index.d.ts`, and the README states what holds across all of them.
+
+  Two behaviours are documented well beyond the rest, because a caller who does not know them writes code that is wrong while appearing to work. A scan reports its failure only through `stats()`: `startSync` validates nothing and `next()` cannot fail, so `null` means either "range fully scanned" or "the scan died part-way" and nothing distinguishes them — a caller that persists notes without calling `stats()` treats a truncated scan as a complete one. And a failed broadcast does not mean nothing was sent: `SendTransaction rejected (code N)` is a node refusing a transaction it saw, but `SendTransaction failed` is a transport error that may have been accepted before the connection broke, so the txid — known before broadcasting, since it is derived from the bytes — should be looked up rather than assumed absent.
+
+  The sections give categories and retry safety rather than transcribing message strings, because every failure crosses into JavaScript as a plain `Error` carrying only a message: no `code`, no subclass, nothing to switch on. Text matching is therefore a caller's only means of telling failures apart today, and the README says plainly that the categories are stable while the wording is not.
+
+- e008fed: Correct the two security claims the test-only signer surface invalidated. The README opened with "spending key material never enters this layer" and stated that key derivation is deliberately not exported — both untrue once `testDeriveKeys` and `testSignPczt` shipped, since each takes a mnemonic and derives spending-key material in process. The claims now describe the production surface, which is still device-only, and name the exception rather than contradicting it.
+
+  Document that surface where a consumer will meet it. It is published rather than gated behind a build flag, because the test harness needing it installs the same npm package as production code, so the `test` prefix and a warning are the only guardrail there is — a reader who finds these exports in `index.d.ts` with no explanation is the case worth avoiding. The README now carries a section stating what they are for, what they must never be used for, and that they accept only `"mainnet"` and `"testnet"`: a regtest chain passes `"mainnet"`, because this surface derives regtest keys under the mainnet convention even though the builders take `"regtest"` as a network of its own.
+
+  Both new exports also gained the `# Errors` documentation every other export carries, and the README now states that `network` accepts `"regtest"` on the builders at all.
+
+- 7b40d6d: Move `zcash_client_backend` to its `0.24.0` stable release. The exact pin on `0.24.0-rc.7` carried a comment instructing exactly this once the stable release existed; it was published on 2026-08-19 and the pin had not followed. Nothing in the dependency tree is a release candidate any more, and the full workspace suite passes on the stable release.
+
+  Retire the claims that pin had left behind, three of which were false rather than merely stale. `buildIronwoodTransaction` was documented — in the shipped `index.d.ts`, so every consumer read it — as "dry-run pending the NU6.3 wallet-side crates stabilizing (`pczt`, `zcash_client_backend` are release candidates)". `pczt` was never a release candidate: it is pinned exactly at `0.9.3`, a stable release, because it defines the byte stream the firmware parses. And the crafting path is not a dry run: it is implemented, and its witness computation is tested offline against a real Ironwood anchor captured from a public testnet node. The README now says what the support is actually tested against instead.
+
+  Fix the two things the README got wrong about the package itself. It told readers to route the `@ledgerhq` scope to an internal registry, when the package is published on the public npm registry and `npm install` works unconfigured with no `.npmrc` entry at all. It also declared its license with a trailing editorial flourish rather than naming it plainly.
+
+  Replace the Ledger staging gRPC endpoint used as the example value throughout the public surface — `index.d.ts`, the CLI's `--grpc-url` help, `docs/ffi-node.md`, the runnable examples — with the public `https://testnet.zec.rocks:443`. The former host does not resolve outside Ledger's network, so every published example was unusable by anyone outside it. Ledger's own nodes remain the defaults in the integration tests, which are Ledger's to run.
+
+- 013e2cf: Add a test-only NAPI signing surface (`testDeriveKeys`, `testSignPczt`) so the `ledger-live` coin-tester can derive keys and sign a PCZT's Orchard actions, Ironwood (V6) actions, and transparent inputs from a seed, acting as a device stand-in in CI. Never call this from production wallet code.
+
 ## 2.3.0
 
 ### Minor Changes
