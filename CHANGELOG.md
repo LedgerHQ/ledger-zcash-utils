@@ -1,5 +1,33 @@
 # @ledgerhq/zcash-utils
 
+## 2.5.0
+
+### Minor Changes
+
+- 6350264: Add `"regtest"` as a valid `network` value for `buildTransaction`/`buildIronwoodTransaction`. A fresh regtest chain's tip height never reaches the real mainnet/testnet NU5/NU6.3 activation heights, so both builders previously rejected every send against a local node. `network: "regtest"` now resolves to a `LocalNetwork` whose Overwinter-through-Canopy upgrades activate at height 1 and NU5/NU6/NU6.1/NU6.2/NU6.3 at height 2, matching the canonical zebra/zaino/librustzcash regtest defaults.
+
+  A regtest build now stamps derivation paths with mainnet's coin type (133), not regtest's own SLIP-44 value (1, shared with testnet) — this crate's key-derivation surface always derives regtest keys under the mainnet convention, so stamping the SLIP-44 value produced a path no caller actually derives from.
+
+  Known limitation: the PCZT's own `global.coin_type` header field (set independently by the `pczt` crate's `Creator` role from the network's type, with no accessor this crate can override afterwards) still carries regtest's SLIP-44 value (1), inconsistent with the mainnet coin type stamped into the derivation paths above. This has no effect on this crate's own device-free signing surface, which never reads that field; it would matter only to a real device, which is out of scope for regtest support.
+
+### Patch Changes
+
+- ab5930f: Compute Ironwood witnesses from the server's `GetSubtreeRoots` instead of deriving shard roots locally, and fix a shard-0 scan that could hang on either pool.
+
+  Ironwood sends previously rescanned the pool's whole history on every spend and recomputed each completed shard root from scratch, because the deployed indexer rejected `GetSubtreeRoots` for Ironwood. It now serves it, so both pools take the same route: the cost is the spend's own shard footprint rather than the pool's lifetime, and the leaf ceiling that would have failed every shielded send as the pool grew is gone. Measured on mainnet against real shard-0 notes, witness computation drops from roughly 26s to 11s, and no longer degrades as the pool fills.
+
+  Also fixes a latent hang affecting Orchard as well as Ironwood: the scan for a note in commitment-tree shard 0 started at block 1, and since both pools begin millions of blocks after genesis, `GetBlockRange` — which has no per-request timeout — streamed most of the chain instead of failing. The scan now starts at the pool's first leaf.
+
+- 7b40d6d: Move `zcash_client_backend` to its `0.24.0` stable release. The exact pin on `0.24.0-rc.7` carried a comment instructing exactly this once the stable release existed; it was published on 2026-08-19 and the pin had not followed. Nothing in the dependency tree is a release candidate any more, and the full workspace suite passes on the stable release.
+
+  Retire the claims that pin had left behind, three of which were false rather than merely stale. `buildIronwoodTransaction` was documented — in the shipped `index.d.ts`, so every consumer read it — as "dry-run pending the NU6.3 wallet-side crates stabilizing (`pczt`, `zcash_client_backend` are release candidates)". `pczt` was never a release candidate: it is pinned exactly at `0.9.3`, a stable release, because it defines the byte stream the firmware parses. And the crafting path is not a dry run: it is implemented, and its witness computation is tested offline against a real Ironwood anchor captured from a public testnet node. The README now says what the support is actually tested against instead.
+
+  Fix the two things the README got wrong about the package itself. It told readers to route the `@ledgerhq` scope to an internal registry, when the package is published on the public npm registry and `npm install` works unconfigured with no `.npmrc` entry at all. It also declared its license with a trailing editorial flourish rather than naming it plainly.
+
+  Replace the Ledger staging gRPC endpoint used as the example value throughout the public surface — `index.d.ts`, the CLI's `--grpc-url` help, `docs/ffi-node.md`, the runnable examples — with the public `https://testnet.zec.rocks:443`. The former host does not resolve outside Ledger's network, so every published example was unusable by anyone outside it. Ledger's own nodes remain the defaults in the integration tests, which are Ledger's to run.
+
+- 013e2cf: Add a test-only NAPI signing surface (`testDeriveKeys`, `testSignPczt`) so the `ledger-live` coin-tester can derive keys and sign a PCZT's Orchard actions, Ironwood (V6) actions, and transparent inputs from a seed, acting as a device stand-in in CI. Never call this from production wallet code.
+
 ## 2.3.0
 
 ### Minor Changes
