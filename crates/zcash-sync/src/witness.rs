@@ -1,4 +1,4 @@
-//! Orchard witness orchestrator.
+//! Shielded-pool witness orchestrator (Orchard and Ironwood).
 //!
 //! Fetches cap roots, frontier, and shard cmx leaves from a lightwalletd /
 //! Zaino endpoint, then delegates to `zcash_crypto::tree::build_witnesses`
@@ -11,8 +11,8 @@ use zcash_client_backend::proto::{
     service::{compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange},
 };
 use zcash_crypto::tree::{
-    build_witnesses, compute_shard_root, frontier_anchor, frontier_leaf_count, ShardLeaves,
-    WitnessInputs, WitnessOutput, ORCHARD_SHARD_HEIGHT,
+    build_witnesses, frontier_anchor, frontier_leaf_count, ShardLeaves, WitnessInputs,
+    WitnessOutput, ORCHARD_SHARD_HEIGHT,
 };
 
 use crate::client::{
@@ -200,8 +200,10 @@ async fn fetch_anchor_for_pool(
 /// empty* frontier, which is non-empty as a string but still zero leaves. Reading
 /// the leaf count keeps the predicate independent of that choice.
 ///
-/// This is used by [`compute_ironwood_witnesses_from_blocks`] to bound the
-/// `GetBlockRange` scan that collects all of the pool's cmx leaves.
+/// This is used by [`fetch_shard_leaves`] as the scan floor for shard 0, which has
+/// no preceding completing block to start from. Its invariant is what makes that
+/// floor safe: the pool has no leaves strictly before the returned height, so the
+/// `base_offset` computed just below it is 0.
 ///
 /// # Errors
 ///
@@ -238,212 +240,83 @@ async fn find_pool_activation_height(
     Ok(low)
 }
 
-/// Largest Ironwood pool this local strategy will process, in leaves.
+/// Runaway stop on a shard-0 leaf scan, in blocks.
 ///
-/// This is the cost driver: the scan streams every leaf and reduces each completed
-/// shard with ~2^17 Sinsemilla hashes, all inline in a user-facing send. 2^18 is
-/// four completed shards — comfortably above the pool's present size (well under
-/// one shard) and far below where the hashing stops being interactive.
+/// Not the correctness check. If [`find_pool_activation_height`] ever resolved far
+/// from the pool's true first leaf, the exact detector is the `base_offset` that
+/// [`fetch_shard_leaves`] already computes: the search's invariant makes
+/// `tree_size_at(floor - 1) == 0`, so any non-zero value means the floor is wrong,
+/// and [`shard_leaf_bounds`] rejects it by name. That check is precise and costs a
+/// call we make anyway.
 ///
-/// Exceeding it is not a malfunction, it is the signal that this strategy has
-/// outlived its purpose: switch back to `compute_witnesses_for_pool(Pool::Ironwood, …)`
-/// once the server serves `GetSubtreeRoots` for Ironwood.
-const MAX_IRONWOOD_LOCAL_LEAVES: u64 = 1 << 18;
+/// This bound only stops an absurdly long scan from running inline in a send, since
+/// `GetBlockRange` carries no per-request timeout and would hang rather than fail.
+/// It deliberately cannot separate "wrong floor" from "slow-filling shard": a genesis
+/// clamp on mainnet Orchard spans ~1.7M blocks, while testnet Orchard's *legitimate*
+/// shard 0 spans ~1.52M (NU5 at 1,842,420 → completed at 3,364,755). Those overlap,
+/// so a block count cannot tell them apart — hence a generous ceiling here and the
+/// precise check elsewhere.
+const MAX_FIRST_LEAF_SCAN_BLOCKS: u32 = 2_000_000;
 
-/// Widest block range the local Ironwood scan will attempt.
-///
-/// Unlike [`MAX_IRONWOOD_LOCAL_LEAVES`] this is not a cost budget — it is a
-/// sanity guard on [`find_pool_activation_height`]. If that probe ever resolves
-/// far from the true activation height (worst case: down to genesis), the scan
-/// would stream a large share of the chain through `GetBlockRange`, which carries
-/// no per-request timeout. Failing fast with a legible error beats hanging.
-///
-/// Deliberately generous — it must not fire as the chain grows normally. At
-/// Zcash's 75-second target spacing this is roughly 2.4 years of blocks after
-/// NU6.3 activation, while the genuine pathology is off by ~4 million blocks.
-const MAX_IRONWOOD_SCAN_BLOCKS: u32 = 1_000_000;
-
-/// Reject a pool too large for the local strategy, before any block is fetched.
-fn check_pool_size(anchor_total_leaves: u64) -> Result<()> {
-    if anchor_total_leaves > MAX_IRONWOOD_LOCAL_LEAVES {
+/// Reject an implausibly wide first-leaf scan range before any block is fetched.
+fn check_first_leaf_scan_width(pool: Pool, first_leaf: u32, end_height: u32) -> Result<()> {
+    let width = end_height.saturating_sub(first_leaf);
+    if width > MAX_FIRST_LEAF_SCAN_BLOCKS {
         return Err(anyhow!(
-            "Ironwood pool holds {} leaves, past the {} this local shard-root \
-             strategy supports; switch to GetSubtreeRoots for Ironwood",
-            anchor_total_leaves,
-            MAX_IRONWOOD_LOCAL_LEAVES
-        ));
-    }
-    Ok(())
-}
-
-/// Reject an implausibly wide scan range before any block is fetched.
-fn check_scan_width(activation_height: u32, anchor_height: u32) -> Result<()> {
-    let width = anchor_height.saturating_sub(activation_height);
-    if width > MAX_IRONWOOD_SCAN_BLOCKS {
-        return Err(anyhow!(
-            "Ironwood scan range {}..{} spans {} blocks (limit {}); the resolved \
-             activation height is implausible — the server may report a non-empty \
-             frontier for pre-activation heights",
-            activation_height,
-            anchor_height,
+            "{:?} shard-0 scan range {}..{} spans {} blocks (limit {}); too wide to \
+             stream inline in a send — if the floor itself is wrong, the base-offset \
+             check in shard_leaf_bounds names it precisely",
+            pool,
+            first_leaf,
+            end_height,
             width,
-            MAX_IRONWOOD_SCAN_BLOCKS
+            MAX_FIRST_LEAF_SCAN_BLOCKS
         ));
     }
     Ok(())
 }
 
-/// Ironwood-specific witness computation that derives shard roots locally from
-/// compact-block cmx leaves instead of calling `GetSubtreeRoots`.
+/// Reject a pool with no leaves at the anchor, before any block is fetched.
 ///
-/// # Strategy
-///
-/// 1. Resolve anchor height and fetch the Ironwood tree-state frontier to learn
-///    `anchor_total_leaves` and the frontier bytes needed by [`build_witnesses`].
-/// 2. Binary-search for the first block with any Ironwood leaves
-///    ([`find_pool_activation_height`]) to bound the scan range.
-/// 3. Stream **all** Ironwood cmx leaves from activation → anchor via
-///    `GetBlockRange` (`collect_cmxs`).  The leaf count must match the
-///    frontier; a mismatch surfaces an error rather than producing a silently
-///    wrong witness.
-/// 4. For each completed shard (leaf range `[i·2^16, (i+1)·2^16)`): call
-///    [`compute_shard_root`] to get the 32-byte root hash that would normally
-///    come from `GetSubtreeRoots`.
-/// 5. For each shard that contains a requested note, slice the corresponding
-///    leaves out of the full list and pass them as [`ShardLeaves`].
-/// 6. Call [`build_witnesses`] with the locally-assembled inputs.
-///
-/// # Complexity
-///
-/// Fetches O(anchor_total_leaves) cmx bytes via `GetBlockRange` and performs
-/// O(completed_shards × 65 536) Sinsemilla hash operations for step 4.  Both
-/// costs are proportional to the Ironwood pool size, which is small while the
-/// pool is young (NU6.3 is brand-new).  When Zaino deploys `GetSubtreeRoots`
-/// support for Ironwood, callers should switch back to
-/// `compute_witnesses_for_pool(Pool::Ironwood, …)`.
-///
-/// # Errors
-///
-/// Returns an error if the notes list is empty, if any gRPC call fails, if the
-/// collected leaf count disagrees with the frontier, or if [`build_witnesses`]
-/// reports an anchor/witness mismatch.
-async fn compute_ironwood_witnesses_from_blocks(req: WitnessRequest) -> Result<WitnessOutput> {
-    if req.notes.is_empty() {
-        return Err(anyhow!("compute_ironwood_witnesses: notes list is empty"));
-    }
-
-    let channel = connect(&req.grpc_url).await?;
-    let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
-
-    // 1. Resolve anchor height.
-    let anchor_height = match req.anchor_height {
-        Some(h) => h,
-        None => {
-            let tip = chain_tip_with_client(&mut client).await?;
-            anchor_height_from_tip(tip, req.anchor_depth_blocks)
-        }
-    };
-
-    // 2. Fetch Ironwood tree state at the anchor.
-    let tree_state = get_tree_state_at(&mut client, anchor_height).await?;
-    let frontier_bytes = hex::decode(Pool::Ironwood.tree_state_hex(&tree_state))
-        .map_err(|e| anyhow!("Ironwood frontier hex decode failed: {}", e))?;
-
-    let anchor_total_leaves = frontier_leaf_count(&frontier_bytes)
-        .map_err(|e| anyhow!("Ironwood frontier leaf count: {}", e))?;
-
+/// This is the documented precondition of [`find_pool_activation_height`], which the
+/// shard-0 floor in [`fetch_shard_leaves`] depends on: without it, an empty pool
+/// reaches the binary search and surfaces the search's internal error instead of a
+/// caller-legible one.
+fn check_pool_nonempty(pool: Pool, anchor_total_leaves: u64, anchor_height: u32) -> Result<()> {
     if anchor_total_leaves == 0 {
         return Err(anyhow!(
-            "compute_ironwood_witnesses: Ironwood pool has no leaves at anchor height {anchor_height}"
+            "compute_witnesses: pool {:?} has no leaves at anchor height {}",
+            pool,
+            anchor_height
         ));
     }
-    check_pool_size(anchor_total_leaves)?;
+    Ok(())
+}
 
-    // Reject a note that cannot exist in the tree at this anchor, before any
-    // slicing: an out-of-range position would otherwise yield an empty
-    // `ShardLeaves` and surface downstream as a confusing "witness not found".
-    if let Some(bad) = req.notes.iter().find(|n| n.position >= anchor_total_leaves) {
+/// Reject a note that cannot exist in the tree at this anchor, before any slicing.
+///
+/// An out-of-range position would otherwise yield an empty `ShardLeaves` and surface
+/// downstream as `shard_leaf_bounds`' "leaf slice out of range" or a `build_witnesses`
+/// anchor mismatch — neither of which names the actual problem.
+fn check_note_positions(
+    pool: Pool,
+    notes: &[NoteRef],
+    anchor_total_leaves: u64,
+    anchor_height: u32,
+) -> Result<()> {
+    if let Some(bad) = notes.iter().find(|n| n.position >= anchor_total_leaves) {
         return Err(anyhow!(
-            "compute_ironwood_witnesses: note position {} is at or past anchor_total_leaves {} \
-             at anchor height {}",
+            "compute_witnesses: pool {:?} note position {} is at or past \
+             anchor_total_leaves {} at anchor height {}",
+            pool,
             bad.position,
             anchor_total_leaves,
             anchor_height
         ));
     }
-
-    // 3. Find the first block with any Ironwood leaves, then stream all cmxs.
-    let activation_height =
-        find_pool_activation_height(&mut client, Pool::Ironwood, anchor_height).await?;
-    check_scan_width(activation_height, anchor_height)?;
-    let all_cmxs = collect_cmxs(
-        &mut client,
-        Pool::Ironwood,
-        activation_height,
-        anchor_height,
-    )
-    .await?;
-
-    if all_cmxs.len() as u64 != anchor_total_leaves {
-        return Err(anyhow!(
-            "compute_ironwood_witnesses: collected {} Ironwood cmxs but frontier reports {} \
-             leaves at anchor height {} (activation height {})",
-            all_cmxs.len(),
-            anchor_total_leaves,
-            anchor_height,
-            activation_height,
-        ));
-    }
-
-    // 4. Compute completed-shard roots locally (replaces GetSubtreeRoots).
-    let shard_size = 1usize << ORCHARD_SHARD_HEIGHT;
-    let num_complete_shards = (anchor_total_leaves as usize) / shard_size;
-
-    let cap_roots: Vec<(u32, [u8; 32])> = (0..num_complete_shards)
-        .map(|i| {
-            let shard_cmxs = &all_cmxs[i * shard_size..(i + 1) * shard_size];
-            let root = compute_shard_root(shard_cmxs)
-                .map_err(|e| anyhow!("compute_shard_root(shard {}): {}", i, e))?;
-            Ok((i as u32, root))
-        })
-        .collect::<Result<_>>()?;
-
-    // 5. Build ShardLeaves for every shard that contains a requested note.
-    let needed_shards: std::collections::BTreeSet<u32> = req
-        .notes
-        .iter()
-        .map(|n| (n.position >> ORCHARD_SHARD_HEIGHT) as u32)
-        .collect();
-
-    let mut shard_leaves = Vec::with_capacity(needed_shards.len());
-    for &shard_idx in &needed_shards {
-        // `all_cmxs` begins at the pool's very first leaf — the leaf-count check
-        // above proves `all_cmxs.len() == anchor_total_leaves` — so the scan base
-        // offset is 0, and the frontier (partial) shard is `num_complete_shards`.
-        let (lo, hi) = shard_leaf_bounds(
-            shard_idx,
-            num_complete_shards as u32,
-            anchor_total_leaves,
-            0,
-            all_cmxs.len(),
-        )?;
-        shard_leaves.push(ShardLeaves {
-            shard_index: shard_idx,
-            cmxs: all_cmxs[lo..hi].to_vec(),
-        });
-    }
-
-    // 6. Assemble and delegate to the pool-agnostic witness builder.
-    let notes: Vec<(u64, [u8; 32])> = req.notes.iter().map(|n| (n.position, n.cmx)).collect();
-    let inputs = WitnessInputs {
-        cap_roots,
-        frontier_bytes,
-        anchor_height,
-        shard_leaves,
-        notes,
-    };
-    build_witnesses(&inputs).map_err(|e| anyhow!("build_witnesses (Ironwood local): {}", e))
+    Ok(())
 }
+
 
 /// Compute Merkle witnesses for every requested note against a single anchor.
 ///
@@ -460,27 +333,28 @@ pub async fn compute_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
 /// assembly (`zcash_crypto::tree::build_witnesses` is pool-agnostic — spec
 /// constraint "same cryptography as Orchard — reuse, do not reimplement").
 ///
-/// Unlike the Orchard path, this function does **not** call `GetSubtreeRoots`
-/// because the deployed Zaino server does not yet serve that RPC for the
-/// Ironwood pool (it returns `INVALID_ARGUMENT: Invalid shielded protocol value`
-/// for `ShieldedProtocol::Ironwood = 2`).  Instead, shard roots are derived
-/// locally from the cmx leaves streamed via `GetBlockRange`, which is always
-/// available.
+/// Both pools take the same server-backed route: completed shard roots come from
+/// `GetSubtreeRoots`, and only the shard(s) holding a spent note are streamed.
 ///
-/// See [`compute_ironwood_witnesses_from_blocks`] for the implementation.
+/// This previously derived Ironwood shard roots locally, because the deployed Zaino
+/// rejected `GetSubtreeRoots` for `ShieldedProtocol::Ironwood = 2`. That strategy
+/// re-scanned the pool's entire history on every send — O(pool lifetime), recomputed
+/// from zero each time, and hard-capped at a leaf count the growing pool was about to
+/// cross. The server now serves the RPC, so the cost is back to O(the spend's own
+/// shard footprint), independent of how large the pool grows.
 ///
 /// # Errors
 ///
 /// Returns an error if the notes list is empty, if the gRPC connection fails,
 /// or if the pure witness assembly fails (e.g. anchor mismatch).
 pub async fn compute_ironwood_witnesses(req: WitnessRequest) -> Result<WitnessOutput> {
-    compute_ironwood_witnesses_from_blocks(req).await
+    compute_witnesses_for_pool(Pool::Ironwood, req).await
 }
 
 /// Shared implementation behind [`compute_witnesses`] / [`compute_ironwood_witnesses`].
 async fn compute_witnesses_for_pool(pool: Pool, req: WitnessRequest) -> Result<WitnessOutput> {
     if req.notes.is_empty() {
-        return Err(anyhow!("compute_witnesses: notes list is empty"));
+        return Err(anyhow!("compute_witnesses({pool:?}): notes list is empty"));
     }
 
     let channel = connect(&req.grpc_url).await?;
@@ -504,6 +378,11 @@ async fn compute_witnesses_for_pool(pool: Pool, req: WitnessRequest) -> Result<W
     // trim per-shard fetches by absolute position.
     let anchor_total_leaves =
         frontier_leaf_count(&frontier_bytes).map_err(|e| anyhow!("frontier leaf count: {}", e))?;
+
+    // Both guards run before any block is fetched, and before the shard-0 floor
+    // search they are the precondition for.
+    check_pool_nonempty(pool, anchor_total_leaves, anchor_height)?;
+    check_note_positions(pool, &req.notes, anchor_total_leaves, anchor_height)?;
 
     // 3. Fetch every completed shard root for this pool.
     let subtree_roots = get_subtree_roots(&mut client, pool, 0).await?;
@@ -550,7 +429,7 @@ async fn compute_witnesses_for_pool(pool: Pool, req: WitnessRequest) -> Result<W
         shard_leaves,
         notes,
     };
-    build_witnesses(&inputs).map_err(|e| anyhow!("build_witnesses: {}", e))
+    build_witnesses(&inputs).map_err(|e| anyhow!("build_witnesses ({pool:?}): {}", e))
 }
 
 /// Fetch the cmx leaves for each needed shard, trimmed to that shard's exact
@@ -576,11 +455,32 @@ async fn fetch_shard_leaves(
     let mut out = Vec::with_capacity(needed_shards.len());
     let frontier_shard_index = subtree_roots.len() as u32;
     for &shard_idx in needed_shards {
+        // Computed before `start_height`: it bounds the shard-0 floor search below.
+        let end_height = if shard_idx < frontier_shard_index {
+            subtree_roots[shard_idx as usize].completing_block_height as u32
+        } else {
+            anchor_height
+        };
+
         // Scan range: from the previous shard's completing block (inclusive) so
         // any of this shard's leaves that spilled into that block are captured.
         let start_height = if shard_idx == 0 {
-            // Pool activation is enforced server-side; clamp to 1.
-            1u32
+            // Shard 0 has no preceding completing block to anchor the scan to.
+            // Clamping to 1 would stream the entire chain: `GetBlockRange` carries
+            // no per-request timeout (see `client.rs`, deliberate), so it hangs
+            // rather than fails. Both pools start far from genesis — Ironwood at
+            // NU6.3, Orchard at NU5 — so the clamp is millions of blocks too low.
+            //
+            // Locate the pool's first leaf instead: it is the tightest valid floor,
+            // and the search's invariant gives `tree_size_at(floor - 1) == 0`, which
+            // is exactly the precondition `shard_leaf_bounds` checks below.
+            //
+            // Bounded by this shard's own `end_height`, not `anchor_height`: when
+            // shard 0 is completed the pool provably has leaves there, which is what
+            // `find_pool_activation_height`'s own guard asserts against.
+            let first_leaf = find_pool_activation_height(client, pool, end_height).await?;
+            check_first_leaf_scan_width(pool, first_leaf, end_height)?;
+            first_leaf
         } else {
             let prev = subtree_roots.get((shard_idx - 1) as usize).ok_or_else(|| {
                 anyhow!(
@@ -590,11 +490,6 @@ async fn fetch_shard_leaves(
                 )
             })?;
             prev.completing_block_height as u32
-        };
-        let end_height = if shard_idx < frontier_shard_index {
-            subtree_roots[shard_idx as usize].completing_block_height as u32
-        } else {
-            anchor_height
         };
 
         // Absolute position of the first commitment in `start_height` = number of
@@ -1092,11 +987,12 @@ mod tests {
         );
     }
 
-    // ── compute_ironwood_witnesses — block-based path (no GetSubtreeRoots) ────
+    // ── compute_ironwood_witnesses — the server-backed path ───────────────────
     //
-    // These tests exercise the new `compute_ironwood_witnesses_from_blocks` path
-    // that replaced the server-dependent `compute_witnesses_for_pool(Pool::Ironwood)`.
-    // They mirror the equivalent Orchard tests above.
+    // These mirror the equivalent Orchard tests above: the two pools now share
+    // `compute_witnesses_for_pool`, so they also share this error surface. That is
+    // what these assert — the Ironwood wrapper still surfaces the same failures
+    // after being pointed at the generic path.
 
     #[tokio::test]
     async fn compute_ironwood_witnesses_rejects_empty_notes() {
@@ -1138,69 +1034,152 @@ mod tests {
         );
     }
 
-    // ── check_scan_width — the fail-fast bound on the local Ironwood scan ──────
+    // ── shard_leaf_bounds — completed shard 0, the branch mainnet now takes ────
 
-    /// An activation height resolved down to genesis must be rejected before any
-    /// block is fetched, rather than streaming most of the chain inline in a send.
+    /// Shard 0 as a *completed* shard, with the frontier two shards along. Neither
+    /// existing case covers this: one uses `frontier_shard_index = 1`, the other
+    /// treats shard 0 as the frontier shard itself. Mainnet Ironwood is here now —
+    /// two completed shards and a partial third — so a shard-0 spend takes this
+    /// branch, and it is the branch the new floor feeds.
     #[test]
-    fn check_scan_width_rejects_full_chain_scan() {
-        let err = check_scan_width(1, 4_193_460).unwrap_err();
+    fn shard_leaf_bounds_completed_shard_zero_with_later_frontier() {
+        // 179,474 leaves = two completed shards + a partial third (measured at
+        // mainnet height 3,470,852).
+        let (lo, hi) = shard_leaf_bounds(0, 2, 179_474, 0, 65_536).unwrap();
+        assert_eq!((lo, hi), (0, 65_536));
+    }
+
+    /// The fail-safe when the floor resolves too late: a scan that starts after the
+    /// shard's first leaf cannot be sliced, and must say so rather than silently
+    /// returning a mis-aligned window. This is what turns a bad floor into a legible
+    /// error instead of a wrong witness.
+    #[test]
+    fn shard_leaf_bounds_rejects_base_offset_past_shard_zero_start() {
+        let err = shard_leaf_bounds(0, 2, 179_474, 1, 65_536).unwrap_err();
         assert!(
-            err.to_string().contains("implausible"),
+            err.to_string()
+                .contains("scan base offset 1 is past shard start 0"),
             "unexpected error: {err}"
         );
     }
 
-    /// A realistic NU6.3 testnet range (activation 4,134,000 → anchor 4,193,460,
-    /// ~59k blocks) stays well inside the bound.
+    // ── check_pool_nonempty / check_note_positions — ported guards ─────────────
+
+    /// An empty pool is rejected before the shard-0 floor search it would otherwise
+    /// reach — that search documents a non-empty pool as its precondition.
     #[test]
-    fn check_scan_width_admits_realistic_ironwood_range() {
-        assert!(check_scan_width(4_134_000, 4_193_460).is_ok());
+    fn check_pool_nonempty_rejects_empty_pool_naming_it() {
+        for pool in [Pool::Orchard, Pool::Ironwood] {
+            let err = check_pool_nonempty(pool, 0, 3_470_000).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("no leaves"), "unexpected error: {msg}");
+            assert!(
+                msg.contains(&format!("{pool:?}")),
+                "error does not name the pool: {msg}"
+            );
+        }
+        assert!(check_pool_nonempty(Pool::Ironwood, 1, 3_470_000).is_ok());
+    }
+
+    /// A note at or past the anchor's leaf count cannot exist in that tree, and is
+    /// rejected by position rather than surfacing later as an opaque slice error.
+    #[test]
+    fn check_note_positions_rejects_out_of_range_naming_the_pool() {
+        let notes = vec![
+            NoteRef {
+                position: 0,
+                cmx: [0u8; 32],
+            },
+            NoteRef {
+                position: 100,
+                cmx: [1u8; 32],
+            },
+        ];
+        let err = check_note_positions(Pool::Ironwood, &notes, 100, 3_470_000).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("position 100"), "unexpected error: {msg}");
+        assert!(msg.contains("Ironwood"), "error does not name the pool: {msg}");
+
+        assert!(check_note_positions(Pool::Ironwood, &notes, 101, 3_470_000).is_ok());
+    }
+
+
+    // ── check_first_leaf_scan_width — the fail-fast bound on the shard-0 floor ──
+
+    /// The exact pathology this guard exists for: a first-leaf height resolved down
+    /// to genesis. This is what the old `start_height = 1` clamp did on every shard-0
+    /// spend — it must be rejected before a block is fetched, not streamed inline.
+    #[test]
+    fn check_first_leaf_scan_width_rejects_genesis_clamp() {
+        // Mainnet Ironwood shard 0 completes at 3,451,206. Clamped to 1 that is the
+        // whole chain; floored at the real first leaf it is ~23k blocks.
+        let err = check_first_leaf_scan_width(Pool::Ironwood, 1, 3_451_206).unwrap_err();
+        assert!(
+            err.to_string().contains("too wide"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The bound is a runaway stop, not a correctness check, and must not reject a
+    /// pool whose first shard genuinely took a long time to fill. Testnet Orchard is
+    /// the real case: NU5 at 1,842,420, shard 0 completed at 3,364,755 — 1.52M blocks.
+    /// That overlaps a mainnet-Orchard genesis clamp (~1.7M), which is exactly why the
+    /// precise detector is the base-offset check rather than this width.
+    #[test]
+    fn check_first_leaf_scan_width_admits_a_slow_filling_shard_zero() {
+        assert!(check_first_leaf_scan_width(Pool::Orchard, 1_842_420, 3_364_755).is_ok());
+    }
+
+    /// Both real mainnet shard-0 windows are admitted. Measured from the chain:
+    /// Ironwood first leaf 3,428,144 → shard 0 completes 3,451,206 (~23k blocks);
+    /// Orchard first leaf 1,687,107 → shard 0 completes 1,707,429 (~20k blocks).
+    #[test]
+    fn check_first_leaf_scan_width_admits_real_shard_zero_windows() {
+        assert!(check_first_leaf_scan_width(Pool::Ironwood, 3_428_144, 3_451_206).is_ok());
+        assert!(check_first_leaf_scan_width(Pool::Orchard, 1_687_107, 1_707_429).is_ok());
     }
 
     /// The guard must not fire as the chain grows normally. Two years of blocks
-    /// past activation at Zcash's 75-second spacing (~841k) must still pass —
+    /// past a first leaf at Zcash's 75-second spacing (~841k) must still pass —
     /// this bound is a malfunction guard, not a freshness policy.
     #[test]
-    fn check_scan_width_admits_years_of_chain_growth() {
-        let activation = 4_134_000u32;
+    fn check_first_leaf_scan_width_admits_years_of_chain_growth() {
+        let first_leaf = 3_428_144u32;
         let two_years_of_blocks = 2 * 365 * 24 * 60 * 60 / 75;
-        assert!(check_scan_width(activation, activation + two_years_of_blocks).is_ok());
+        assert!(
+            check_first_leaf_scan_width(
+                Pool::Ironwood,
+                first_leaf,
+                first_leaf + two_years_of_blocks
+            )
+            .is_ok()
+        );
     }
 
     /// Exactly at the bound is allowed; one block wider is not.
     #[test]
-    fn check_scan_width_boundary_is_inclusive() {
-        let anchor = 5_000_000u32;
-        assert!(check_scan_width(anchor - MAX_IRONWOOD_SCAN_BLOCKS, anchor).is_ok());
-        assert!(check_scan_width(anchor - MAX_IRONWOOD_SCAN_BLOCKS - 1, anchor).is_err());
-    }
-
-    // ── check_pool_size — the cost budget for the local strategy ───────────────
-
-    /// The pool's present size (well under one completed shard) is admitted.
-    #[test]
-    fn check_pool_size_admits_current_ironwood_pool() {
-        assert!(check_pool_size(9_800).is_ok());
-    }
-
-    /// Exactly at the budget is allowed; one leaf more is not.
-    #[test]
-    fn check_pool_size_boundary_is_inclusive() {
-        assert!(check_pool_size(MAX_IRONWOOD_LOCAL_LEAVES).is_ok());
-        assert!(check_pool_size(MAX_IRONWOOD_LOCAL_LEAVES + 1).is_err());
-    }
-
-    /// Exceeding the budget must point the reader at the server-side replacement
-    /// rather than reading as a failure.
-    #[test]
-    fn check_pool_size_error_names_the_replacement() {
-        let err = check_pool_size(MAX_IRONWOOD_LOCAL_LEAVES + 1).unwrap_err();
+    fn check_first_leaf_scan_width_boundary_is_inclusive() {
+        let end = 5_000_000u32;
         assert!(
-            err.to_string().contains("GetSubtreeRoots"),
+            check_first_leaf_scan_width(Pool::Ironwood, end - MAX_FIRST_LEAF_SCAN_BLOCKS, end)
+                .is_ok()
+        );
+        assert!(
+            check_first_leaf_scan_width(Pool::Ironwood, end - MAX_FIRST_LEAF_SCAN_BLOCKS - 1, end)
+                .is_err()
+        );
+    }
+
+    /// The error names the pool, so an Ironwood failure does not read as an Orchard one.
+    #[test]
+    fn check_first_leaf_scan_width_error_names_the_pool() {
+        let err = check_first_leaf_scan_width(Pool::Ironwood, 1, 3_451_206).unwrap_err();
+        assert!(
+            err.to_string().contains("Ironwood"),
             "unexpected error: {err}"
         );
     }
+
 
     // ── shard_leaf_bounds — the branch the live Ironwood path actually takes ───
 

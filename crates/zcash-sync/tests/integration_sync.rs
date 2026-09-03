@@ -43,6 +43,20 @@ fn testnet_grpc_url() -> String {
 }
 const TESTNET_UFVK: &str = "uviewtest1eacc7lytmvgp0sshwjjv4qsg9fnewq00s6zye8hqwndpdsg0tum2ft4k96t86eapddpq56exfycnxnlds75vvpydv8fgj4cecczkmt3rjat8qjfqrk2cdlm9alep2z04785sx6yekqjk6wywkttlthld4c3xmg8fvneg4p97vzxwu9xtuh0xrgfy90p6uuxf8cwl8nxfq6hlte0nnylk59xceldrkx9vge3k4utkue2txu5kpp60aw07q0f0jgp0pv2c0gr7jdm6273uxyskt72jehte5jf2dg94d84le08h2t5rhd93j2d98ja59h46est69f3a7rav7k6744p2u8dxasc7nr9p2k95x7uaknahj0kw7mu5zq9nllj7x2qswq3jswsuzwms7shv7dhxz9s4yudatwu3u3v3wqznkhu6jt7xt8whjh3dkzvsf28p6mj8tya009gwzgszz2at8alquu8y0fmqt7klayrjx7n3ulml5q00fgdr";
 
+// ── Ironwood (NU6.3, mainnet) ─────────────────────────────────────────────────
+//
+// Deliberately a third endpoint. `MAINNET_GRPC_URL_DEFAULT` above does not serve
+// `GetSubtreeRoots` for `ShieldedProtocol::Ironwood`; this host (Zaino 0.9.0) does.
+// Verified by probe, and by `get_subtree_roots_ironwood_mainnet` below.
+const IRONWOOD_GRPC_URL_DEFAULT: &str = "https://zec-indexer.coin.ledger-test.com";
+
+/// Resolves the Ironwood-capable mainnet endpoint, overridable via
+/// `ZCASH_IRONWOOD_GRPC_URL`.
+fn ironwood_grpc_url() -> String {
+    std::env::var("ZCASH_IRONWOOD_GRPC_URL")
+        .unwrap_or_else(|_| IRONWOOD_GRPC_URL_DEFAULT.to_string())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn params_for_block(height: u32) -> SyncParams {
@@ -825,3 +839,161 @@ async fn anchor_only_fetch_matches_known_vector() {
         "anchor-only fetch returned the all-zero anchor"
     );
 }
+
+
+// ── Shard 0: the floor that replaced the genesis clamp ────────────────────────
+//
+// `fetch_shard_leaves` used to clamp shard 0's scan start to block 1. Both pools
+// start millions of blocks after genesis, so a shard-0 spend streamed most of the
+// chain through `GetBlockRange`, which has no per-request timeout — it hung rather
+// than failed. The tests below are the live proof that it no longer does.
+
+/// Mainnet Ironwood leaves 0 and 1, both in block 3,428,144 — the first block after
+/// NU6.3 activation (3,428,143, where the tree is provably empty). Read from
+/// `GetBlock`'s `ironwoodActions`.
+const IRONWOOD_LEAF_0_CMX: &str = "6c92564c58eb9e7c3bed41bc4b06aa5c870c721355eb3cf89edd5c4f1e789d3a";
+const IRONWOOD_LEAF_1_CMX: &str = "176e50816d91436081db8617c5e05a13e13dbf858faa63d4daf8b8fbdb11a20c";
+
+/// Pinned past shard 1's completing block (3,468,125), so shard 0 is a *completed*
+/// shard — the branch a mainnet shard-0 spend actually takes.
+const IRONWOOD_SHARD_0_ANCHOR: u32 = 3_470_000;
+
+/// Anchor produced at `IRONWOOD_SHARD_0_ANCHOR` for the two notes above.
+///
+/// Not hand-written: captured from a run in which the server-backed path and the
+/// local shard-root derivation it replaced were executed against the same live data
+/// and asserted byte-identical. That A/B check could only exist while both paths were
+/// in the tree; freezing its output is what carries the evidence forward.
+const IRONWOOD_SHARD_0_ANCHOR_HEX: &str =
+    "a13802f56a462bbe503107b757c39545af987d98ebb06690d22db38c8964e922";
+
+fn h32(s: &str) -> [u8; 32] {
+    hex::decode(s).unwrap().try_into().unwrap()
+}
+
+/// The canary on the single external dependency this whole path rests on.
+///
+/// Before Zaino 0.9.0 the deployed server answered `InvalidArgument: Invalid shielded
+/// protocol value` here, which is why shard roots were derived locally at all. If a
+/// deployment ever regresses below that version, this test says so directly instead
+/// of leaving the witness tests to fail obscurely.
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn get_subtree_roots_ironwood_mainnet() {
+    let mut client = grpc_client(&ironwood_grpc_url()).await;
+
+    let mut req = tonic::Request::new(GetSubtreeRootsArg {
+        start_index: 0,
+        shielded_protocol: ShieldedProtocol::Ironwood as i32,
+        max_entries: 0,
+    });
+    req.set_timeout(UNARY_TIMEOUT);
+
+    let stream = client
+        .get_subtree_roots(req)
+        .await
+        .expect("GetSubtreeRoots(Ironwood) rejected — is the endpoint on Zaino >= 0.9.0?");
+
+    let mut stream = stream.into_inner();
+    let mut heights = Vec::new();
+    while let Some(root) = stream.message().await.expect("stream error") {
+        assert_eq!(
+            root.root_hash.len(),
+            32,
+            "subtree root is not 32 bytes: {} bytes",
+            root.root_hash.len()
+        );
+        heights.push(root.completing_block_height);
+    }
+
+    eprintln!("GetSubtreeRoots(Ironwood, mainnet): {heights:?}");
+    assert!(
+        !heights.is_empty(),
+        "expected at least one completed Ironwood shard root"
+    );
+    assert!(
+        heights.windows(2).all(|w| w[0] < w[1]),
+        "completing block heights must be strictly increasing: {heights:?}"
+    );
+}
+
+/// Ironwood shard 0: the witness must match the frozen anchor, and stay fast.
+///
+/// Correctness and efficacy in one test, because for this change they are the same
+/// property. The floor bounds the scan to shard 0's own ~23k-block window; without it
+/// the same call streams from block 1 — roughly 150x the blocks — and does not return.
+/// So a wrong or missing floor shows up here as either a wrong anchor or a timeout.
+#[tokio::test]
+#[ignore = "requires network access"]
+async fn witness_ironwood_shard_zero_matches_frozen_anchor_under_30s() {
+    use std::time::Instant;
+    use zcash_sync::witness::{compute_ironwood_witnesses, NoteRef, WitnessRequest};
+
+    let budget = std::time::Duration::from_secs(30);
+    let started = Instant::now();
+    let out = compute_ironwood_witnesses(WitnessRequest {
+        grpc_url: ironwood_grpc_url(),
+        anchor_height: Some(IRONWOOD_SHARD_0_ANCHOR),
+        anchor_depth_blocks: None,
+        notes: vec![
+            NoteRef {
+                position: 0,
+                cmx: h32(IRONWOOD_LEAF_0_CMX),
+            },
+            NoteRef {
+                position: 1,
+                cmx: h32(IRONWOOD_LEAF_1_CMX),
+            },
+        ],
+    })
+    .await
+    .expect("compute_ironwood_witnesses failed on shard 0");
+    let elapsed = started.elapsed();
+
+    assert_eq!(out.anchor_height, IRONWOOD_SHARD_0_ANCHOR);
+    assert_eq!(
+        hex::encode(out.anchor),
+        IRONWOOD_SHARD_0_ANCHOR_HEX,
+        "anchor differs from the frozen A/B-verified value"
+    );
+    assert_eq!(out.witnesses.len(), 2, "expected one witness per note");
+    assert_eq!(u64::from(out.witnesses[0].position()), 0);
+    assert_eq!(u64::from(out.witnesses[1].position()), 1);
+
+    // Leaves 0 and 1 are siblings, so each one's depth-0 path element is the other's
+    // cmx. A cheap structural check that these are real paths, not zero-filled ones.
+    assert_eq!(
+        hex::encode(out.witnesses[0].path_elems()[0].to_bytes()),
+        IRONWOOD_LEAF_1_CMX
+    );
+    assert_eq!(
+        hex::encode(out.witnesses[1].path_elems()[0].to_bytes()),
+        IRONWOOD_LEAF_0_CMX
+    );
+
+    eprintln!("Ironwood shard-0 witness took {elapsed:?} (budget {budget:?})");
+    assert!(
+        elapsed < budget,
+        "shard-0 witness took {elapsed:?}, over the {budget:?} budget — is the scan \
+         floor still bounding the range to shard 0?"
+    );
+}
+
+// No live Orchard shard-0 test, deliberately.
+//
+// The floor is pool-generic, so the Orchard shard-0 hang is closed by the same code
+// the Ironwood test above exercises — but neither network offers a way to demonstrate
+// it end to end:
+//
+//   * mainnet — `GetSubtreeRoots(Orchard, max_entries: 0)` does not return. Orchard
+//     has ~770 completed shards there and the request exceeds the server's deadline
+//     ("Deadline expired before operation could complete"), reproducible with grpcurl
+//     independently of this client. That is a pre-existing limit of the Orchard path,
+//     upstream of the floor, and unrelated to this change.
+//   * testnet — Orchard shard 0 legitimately spans ~1.52M blocks (NU5 at 1,842,420,
+//     completed at 3,364,755), far too slow to stream in a test.
+//
+// What is covered offline: `check_first_leaf_scan_width_admits_real_shard_zero_windows`
+// asserts the real mainnet Orchard window (1,687,107 -> 1,707,429) is admitted, and the
+// `shard_leaf_bounds` cases cover the slicing the floor feeds.
+
