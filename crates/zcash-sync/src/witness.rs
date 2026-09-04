@@ -177,9 +177,10 @@ async fn fetch_anchor_for_pool(
     let frontier_bytes = hex::decode(pool.tree_state_hex(&tree_state))
         .map_err(|e| anyhow!("TreeState frontier hex decode failed: {}", e))?;
 
-    // The frontier alone determines the root, so no shard data is fetched here.
-    // That also keeps this path working against a server that does not serve the
-    // pool's `GetSubtreeRoots` yet, which is the case for Ironwood on Zaino.
+    // The frontier alone determines the root, so no shard data is fetched here —
+    // no `GetSubtreeRoots`, no per-shard `GetBlockRange`. That is what keeps the
+    // anchor-only flows (Public→Private, and any bundle with outputs but no real
+    // spends) independent of the per-shard machinery the witness path relies on.
     let anchor = frontier_anchor(&frontier_bytes)
         .map_err(|e| anyhow!("frontier_anchor (anchor-only): {}", e))?;
 
