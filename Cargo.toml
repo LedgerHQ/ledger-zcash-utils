@@ -4,6 +4,7 @@ members = [
     "crates/zcash-crypto",
     "crates/zcash-sync",
     "crates/zcash-ffi-node",
+    "crates/zcash-ffi-mobile",
     "crates/zcash-cli",
 ]
 default-members = ["crates/zcash-crypto"]
@@ -98,3 +99,21 @@ assert_cmd = "2"
 strip = true
 lto = true
 codegen-units = 1
+
+# Mobile static/shared libraries MUST NOT use LTO.
+#
+# With `lto = true` rustc emits LLVM bitcode into the archive instead of native
+# object code. Rust 1.97's LLVM 22 bitcode is unreadable by Xcode's toolchain,
+# which fails with:
+#   Unknown attribute kind (105)
+#   (Producer: 'LLVM22.1.6-rust-1.97.1-stable' Reader: 'LLVM APPLE_1_2100.1.1.101_0')
+# `nm` cannot list the exported symbols and the iOS link step cannot consume the
+# archive. Verified 2026-09-08: with lto=true the `.a` exports nothing; with
+# lto=false it exports `_zcash_orchard_address_from_ufvk` and `_zcash_string_free`
+# (and shrinks 74M -> 29M, an archive of native objects rather than bitcode).
+#
+# Kept as a separate profile so the Node/Electron and CLI release builds keep LTO.
+# Build mobile artifacts with: cargo build --profile mobile --target <ios|android>
+[profile.mobile]
+inherits = "release"
+lto = false

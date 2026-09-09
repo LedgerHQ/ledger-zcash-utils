@@ -3310,6 +3310,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcash-ffi-mobile"
+version = "0.1.0"
+dependencies = [
+ "zcash-crypto",
+ "zcash-sync",
+]
+
+[[package]]
 name = "zcash-ffi-node"
 version = "0.1.0"
 dependencies = [

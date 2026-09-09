@@ -1,0 +1,31 @@
+[package]
+name = "zcash-ffi-mobile"
+version = "0.1.0"
+edition = "2021"
+description = "iOS / Android C-ABI binding for Zcash key derivation (React Native via JSI)"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "zcash_ffi_mobile"
+# `lib` is deliberate and load-bearing, not redundant with the other two:
+#   - staticlib -> libzcash_ffi_mobile.a, linked into the iOS .xcframework
+#   - cdylib    -> libzcash_ffi_mobile.so, packaged per Android ABI
+#   - lib       -> the rlib `cargo test` needs to link a test harness against.
+# Without `lib`, this crate would be untestable the same way `zcash-ffi-node` is
+# (see its Cargo.toml: `test = false`, because napi symbols come from the Node
+# host at runtime). A pure C ABI has no host-supplied symbols, so unit tests DO
+# run here — that is a concrete advantage of this binding over the NAPI one.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = []
+# Opt-in only. The default build depends on `zcash-crypto` alone, which pulls
+# ZERO tokio/tonic/hyper/rustls crates (verified: `cargo tree -p zcash-crypto`
+# = 0 matches, vs 31 for zcash-sync). Shielded *receive* therefore ships with no
+# async runtime linked into the app at all. Enable `sync` only when the block-scan
+# surface is bound.
+sync = ["dep:zcash-sync"]
+
+[dependencies]
+zcash-crypto = { path = "../zcash-crypto" }
+zcash-sync = { path = "../zcash-sync", optional = true }
