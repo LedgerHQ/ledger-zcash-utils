@@ -26,6 +26,11 @@ extern "C" {
  * NOT the multi-receiver unified address. */
 int zcash_orchard_address_from_ufvk(const char *ufvk, char **out);
 
+/* Diagnostic: measure whether Rayon gives real parallelism on this device.
+ * Not part of the wallet surface. On ZCASH_OK, *out is JSON:
+ * {"threads":N,"iterations":N,"serial_ms":N,"parallel_ms":N,"speedup":N.NN} */
+int zcash_ffi_thread_probe(const char *ufvk, unsigned int iterations, char **out);
+
 /* Release a string returned through an out parameter. NULL is a no-op. */
 void zcash_string_free(char *s);
 

@@ -29,3 +29,8 @@ sync = ["dep:zcash-sync"]
 [dependencies]
 zcash-crypto = { path = "../zcash-crypto" }
 zcash-sync = { path = "../zcash-sync", optional = true }
+# Used only by the threading probe below. `zcash-crypto` already depends on
+# rayon for batch trial decryption, but the linker strips it from this crate's
+# artifacts while nothing reachable from an exported symbol uses it -- which is
+# exactly what the probe exists to change and measure.
+rayon = { workspace = true }

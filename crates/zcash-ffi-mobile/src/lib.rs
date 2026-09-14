@@ -106,6 +106,90 @@ pub unsafe extern "C" fn zcash_orchard_address_from_ufvk(
     }
 }
 
+/// Measure whether Rayon actually gives us parallelism on this device.
+///
+/// **Diagnostic only — not part of the wallet surface.** It answers the
+/// question blocking a decision on mobile shielded sync: threads are assumed to
+/// work on iOS and Android, but nothing in this crate has ever spawned one. The
+/// shipped artifact imports no `pthread_create` at all, because the linker
+/// strips Rayon while no exported symbol reaches it.
+///
+/// The workload is `orchard_address_from_ufvk` repeated `iterations` times —
+/// real elliptic-curve work already proven correct on device, rather than a
+/// synthetic loop the optimiser might elide. It is *not* trial decryption, so
+/// read the result as "does threading work here, and how well does it scale",
+/// not as a sync-throughput figure.
+///
+/// On success `*out` is JSON:
+/// `{"threads":N,"iterations":N,"serial_ms":N,"parallel_ms":N,"speedup":N.N}`
+///
+/// # Safety
+/// Same contract as [`zcash_orchard_address_from_ufvk`].
+#[no_mangle]
+pub unsafe extern "C" fn zcash_ffi_thread_probe(
+    ufvk: *const c_char,
+    iterations: u32,
+    out: *mut *mut c_char,
+) -> i32 {
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    if ufvk.is_null() || out.is_null() {
+        return ZCASH_ERR_NULL_ARG;
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ufvk_str = match CStr::from_ptr(ufvk).to_str() {
+            Ok(s) => s,
+            Err(_) => return Err((ZCASH_ERR_INVALID_UTF8, "ufvk is not valid UTF-8".to_string())),
+        };
+
+        let n = iterations.max(1);
+
+        // Fail fast on a bad key, so the timings below cannot be an error path
+        // being measured instead of the real work.
+        zcash_crypto::keys::orchard_address_from_ufvk(ufvk_str)
+            .map_err(|e| (ZCASH_ERR_CRYPTO, e.to_string()))?;
+
+        let serial_start = Instant::now();
+        for _ in 0..n {
+            let _ = zcash_crypto::keys::orchard_address_from_ufvk(ufvk_str);
+        }
+        let serial_ms = serial_start.elapsed().as_millis();
+
+        let parallel_start = Instant::now();
+        (0..n).into_par_iter().for_each(|_| {
+            let _ = zcash_crypto::keys::orchard_address_from_ufvk(ufvk_str);
+        });
+        let parallel_ms = parallel_start.elapsed().as_millis();
+
+        let speedup = if parallel_ms > 0 {
+            serial_ms as f64 / parallel_ms as f64
+        } else {
+            0.0
+        };
+
+        Ok(format!(
+            "{{\"threads\":{},\"iterations\":{},\"serial_ms\":{},\"parallel_ms\":{},\"speedup\":{:.2}}}",
+            rayon::current_num_threads(),
+            n,
+            serial_ms,
+            parallel_ms,
+            speedup
+        ))
+    }));
+
+    match result {
+        Ok(Ok(json)) => write_out(out, json, ZCASH_OK),
+        Ok(Err((code, message))) => write_out(out, message, code),
+        Err(_) => write_out(
+            out,
+            "panic caught at FFI boundary".to_string(),
+            ZCASH_ERR_PANIC,
+        ),
+    }
+}
+
 /// Release a string previously returned through an `out` parameter.
 ///
 /// Passing null is a no-op. Passing any pointer not produced by this crate, or

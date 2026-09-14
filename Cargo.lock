@@ -3313,6 +3313,7 @@ dependencies = [
 name = "zcash-ffi-mobile"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "zcash-crypto",
  "zcash-sync",
 ]
