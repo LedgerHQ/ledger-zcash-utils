@@ -527,6 +527,9 @@ async fn cmd_sync(args: SyncArgs) {
         trial_decrypt_ms: 0,
         get_transaction_ms: 0,
         full_decrypt_ms: 0,
+        // The CLI aggregates its own per-chunk results rather than reading the
+        // per-range figures, so the timing and size counters stay zero here.
+        bytes_downloaded: 0,
         spent_known_nullifiers: vec![],
     };
 

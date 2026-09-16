@@ -3341,6 +3341,7 @@ dependencies = [
  "incrementalmerkletree",
  "orchard",
  "pczt",
+ "prost",
  "tokio",
  "tonic",
  "tonic-prost",

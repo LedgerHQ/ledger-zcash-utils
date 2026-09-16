@@ -123,6 +123,25 @@ export interface SyncStats {
   blocksScanned: number
   elapsedMs: number
   /**
+   * Aggregate time spent in trial decryption, summed across the concurrently
+   * decrypted blocks — so it exceeds wall clock when the pipeline is wide, and is
+   * a measure of *work*, not of elapsed time. Divided by `blocks_scanned` it gives
+   * the per-block CPU cost, which is the figure that carries across devices.
+   */
+  trialDecryptMs: number
+  /**
+   * Time spent on full decryption of matched transactions. Zero when the scanned
+   * range contained none of this account's notes.
+   */
+  fullDecryptMs: number
+  /** Time spent on `GetTransaction` RPCs for matched transactions. */
+  getTransactionMs: number
+  /**
+   * Wire size of the compact blocks received, protobuf payload only (no TLS or
+   * HTTP/2 framing). Answers what a first sync costs in mobile data.
+   */
+  bytesDownloaded: number
+  /**
    * Hex-encoded nullifiers from `knownNullifiers` that were spent in the scanned range.
    * JS uses this to mark previously-stored notes as spent.
    */

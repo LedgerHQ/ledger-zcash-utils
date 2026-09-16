@@ -24,6 +24,10 @@ tonic   = { workspace = true }
 anyhow  = { workspace = true }
 hex     = { workspace = true }
 futures = { workspace = true }
+# Only for `Message::encoded_len()`, to measure the wire size of the compact blocks
+# we receive. Must stay on the same version zcash_client_backend generates its proto
+# types with (one `prost` in the lock today, 0.14), or the trait will not apply to them.
+prost   = "0.14"
 # Orchestrator decodes addresses + UFVK and forwards to zcash-crypto.
 orchard           = { workspace = true }
 zcash_primitives  = { workspace = true }

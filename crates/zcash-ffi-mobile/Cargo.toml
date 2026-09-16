@@ -2,7 +2,7 @@
 name = "zcash-ffi-mobile"
 version = "0.1.0"
 edition = "2021"
-description = "iOS / Android C-ABI binding for Zcash key derivation (React Native via JSI)"
+description = "iOS / Android C-ABI binding for Zcash key derivation (consumed from React Native over the native-module bridge)"
 license = "MIT OR Apache-2.0"
 
 [lib]

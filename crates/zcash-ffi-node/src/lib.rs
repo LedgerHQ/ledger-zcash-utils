@@ -117,6 +117,19 @@ pub struct ShieldedTransaction {
 pub struct SyncStats {
     pub blocks_scanned: u32,
     pub elapsed_ms: f64,
+    /// Aggregate time spent in trial decryption, summed across the concurrently
+    /// decrypted blocks — so it exceeds wall clock when the pipeline is wide, and is
+    /// a measure of *work*, not of elapsed time. Divided by `blocks_scanned` it gives
+    /// the per-block CPU cost, which is the figure that carries across devices.
+    pub trial_decrypt_ms: f64,
+    /// Time spent on full decryption of matched transactions. Zero when the scanned
+    /// range contained none of this account's notes.
+    pub full_decrypt_ms: f64,
+    /// Time spent on `GetTransaction` RPCs for matched transactions.
+    pub get_transaction_ms: f64,
+    /// Wire size of the compact blocks received, protobuf payload only (no TLS or
+    /// HTTP/2 framing). Answers what a first sync costs in mobile data.
+    pub bytes_downloaded: f64,
     /// Hex-encoded nullifiers from `knownNullifiers` that were spent in the scanned range.
     /// JS uses this to mark previously-stored notes as spent.
     pub spent_known_nullifiers: Vec<String>,
@@ -192,6 +205,10 @@ impl TransactionStream {
         Ok(SyncStats {
             blocks_scanned: grpc_result.blocks_scanned,
             elapsed_ms: grpc_result.elapsed_ms as f64,
+            trial_decrypt_ms: grpc_result.trial_decrypt_ms as f64,
+            full_decrypt_ms: grpc_result.full_decrypt_ms as f64,
+            get_transaction_ms: grpc_result.get_transaction_ms as f64,
+            bytes_downloaded: grpc_result.bytes_downloaded as f64,
             spent_known_nullifiers: grpc_result.spent_known_nullifiers,
         })
     }

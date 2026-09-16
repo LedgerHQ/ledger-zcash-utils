@@ -189,6 +189,13 @@ pub struct SyncResult {
     pub get_transaction_ms: u64,
     /// Total time (ms) spent on full transaction decryption.
     pub full_decrypt_ms: u64,
+    /// Total wire size (bytes) of the compact blocks received from the stream.
+    ///
+    /// Measured as the sum of each `CompactBlock`'s encoded protobuf length, so it
+    /// counts payload only — not TLS or HTTP/2 framing overhead. It exists to answer
+    /// "how much mobile data does a first sync cost", which is a product question
+    /// before it is an engineering one.
+    pub bytes_downloaded: u64,
     /// Hex-encoded nullifiers from `known_nullifiers` that were observed as spent
     /// inputs in the scanned range. The JS layer uses this to mark previously-stored
     /// notes as spent (notes not in `transactions` because they were received in
@@ -255,6 +262,7 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
         trial_decrypt_ms: 0,
         get_transaction_ms: 0,
         full_decrypt_ms: 0,
+        bytes_downloaded: 0,
         spent_known_nullifiers: Vec::new(),
     };
 
@@ -273,6 +281,7 @@ pub async fn run_sync(params: SyncParams) -> Result<SyncResult> {
                 combined.trial_decrypt_ms += result.trial_decrypt_ms;
                 combined.get_transaction_ms += result.get_transaction_ms;
                 combined.full_decrypt_ms += result.full_decrypt_ms;
+                combined.bytes_downloaded += result.bytes_downloaded;
                 combined.spent_known_nullifiers.extend(result.spent_known_nullifiers);
             }
             Err(ref err) if is_retryable_error(err) && attempts < max_retries => {
@@ -338,6 +347,12 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let range = BlockRange {
         start: Some(BlockId { height: params.start_height as u64, hash: vec![] }),
         end: Some(BlockId { height: params.end_height as u64, hash: vec![] }),
+        // Empty means the server's default: data for all shielded pools (Sapling,
+        // Orchard and Ironwood). Narrowing this is measurable and large — asking for
+        // Ironwood alone cut the payload ~5x in a 1,001-block sample — but it is a
+        // correctness decision, not an optimisation, because an Ironwood-only request
+        // hides Orchard-pool receipts at the same unified address. Left unfiltered
+        // until that question is settled.
         pool_types: vec![],
     };
     let stream = client
@@ -349,6 +364,8 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     // 4. Atomic counters shared between the pipeline futures and the diagnostic task.
     let trial_ms_atomic = Arc::new(AtomicU64::new(0));
     let blocks_atomic = Arc::new(AtomicU64::new(0));
+    // Wire size of everything the stream hands us, summed before the block is consumed.
+    let bytes_atomic = Arc::new(AtomicU64::new(0));
 
     // 5. Background diagnostic task — emits a [diag] line to stderr every 10 s.
     //    Reads atomics non-blockingly; aborted once the pipeline finishes.
@@ -370,6 +387,7 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
 
     // Keep a handle to read the final counter values after the pipeline finishes.
     let trial_ms_final = Arc::clone(&trial_ms_atomic);
+    let bytes_final = Arc::clone(&bytes_atomic);
     // Extract callbacks before moving params fields into closures.
     let on_block_done = params.on_block_done;
     let on_transaction = params.on_transaction;
@@ -377,6 +395,11 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
     let mut block_results: Vec<TrialResult> = stream
         .map_err(|e| anyhow!("stream error: {}", e))
         .map_ok(move |block| {
+            // Wire size first: `process_compact_block` consumes the block.
+            bytes_atomic.fetch_add(
+                prost::Message::encoded_len(&block) as u64,
+                Ordering::Relaxed,
+            );
             let ivks = Arc::clone(&ivks);
             let trial_ms_ref = Arc::clone(&trial_ms_atomic);
             let blocks_ref = Arc::clone(&blocks_atomic);
@@ -658,6 +681,7 @@ async fn run_sync_inner(params: SyncParams) -> Result<SyncResult> {
         trial_decrypt_ms: trial_ms_final.load(Ordering::Relaxed),
         get_transaction_ms,
         full_decrypt_ms,
+        bytes_downloaded: bytes_final.load(Ordering::Relaxed),
         spent_known_nullifiers,
     })
 }
