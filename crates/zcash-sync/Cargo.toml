@@ -22,6 +22,10 @@ zcash_protocol        = { workspace = true }
 tokio   = { workspace = true }
 tonic   = { workspace = true }
 anyhow  = { workspace = true }
+# Serialises SyncResult for the FFI bindings. Deriving it here keeps one
+# definition of the wire shape, rather than each caller hand-building JSON --
+# which had already drifted once (zcash-cli omitted spent_known_nullifiers).
+serde   = { workspace = true }
 hex     = { workspace = true }
 futures = { workspace = true }
 # Only for `Message::encoded_len()`, to measure the wire size of the compact blocks

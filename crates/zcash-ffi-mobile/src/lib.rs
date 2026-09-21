@@ -28,6 +28,13 @@
 //! This depends on `panic = "unwind"` (the default). Setting `panic = "abort"`
 //! in a release profile would silently disable the protection.
 
+// Android cannot call the C ABI below: the JVM speaks only JNI. This module
+// adds JNI-shaped entry points over the same `zcash-crypto` calls, so the
+// engine ships one library per ABI carrying both doorways and the app needs no
+// native build of its own.
+#[cfg(target_os = "android")]
+mod jni_android;
+
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -85,7 +92,12 @@ pub unsafe extern "C" fn zcash_orchard_address_from_ufvk(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let ufvk_str = match CStr::from_ptr(ufvk).to_str() {
             Ok(s) => s,
-            Err(_) => return Err((ZCASH_ERR_INVALID_UTF8, "ufvk is not valid UTF-8".to_string())),
+            Err(_) => {
+                return Err((
+                    ZCASH_ERR_INVALID_UTF8,
+                    "ufvk is not valid UTF-8".to_string(),
+                ))
+            }
         };
 
         // Error messages from zcash-crypto are deliberately fixed strings that do
@@ -141,7 +153,12 @@ pub unsafe extern "C" fn zcash_ffi_thread_probe(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let ufvk_str = match CStr::from_ptr(ufvk).to_str() {
             Ok(s) => s,
-            Err(_) => return Err((ZCASH_ERR_INVALID_UTF8, "ufvk is not valid UTF-8".to_string())),
+            Err(_) => {
+                return Err((
+                    ZCASH_ERR_INVALID_UTF8,
+                    "ufvk is not valid UTF-8".to_string(),
+                ))
+            }
         };
 
         let n = iterations.max(1);
@@ -177,6 +194,131 @@ pub unsafe extern "C" fn zcash_ffi_thread_probe(
             parallel_ms,
             speedup
         ))
+    }));
+
+    match result {
+        Ok(Ok(json)) => write_out(out, json, ZCASH_OK),
+        Ok(Err((code, message))) => write_out(out, message, code),
+        Err(_) => write_out(
+            out,
+            "panic caught at FFI boundary".to_string(),
+            ZCASH_ERR_PANIC,
+        ),
+    }
+}
+
+/// Read a C string argument, or report which one was malformed.
+///
+/// Never name the *value* in the error, only the parameter: one of these is a
+/// viewing key.
+///
+/// # Safety
+/// `p` must be a valid NUL-terminated C string.
+#[cfg(feature = "sync")]
+unsafe fn read_c_str<'a>(p: *const c_char, name: &str) -> Result<&'a str, (i32, String)> {
+    CStr::from_ptr(p)
+        .to_str()
+        .map_err(|_| (ZCASH_ERR_INVALID_UTF8, format!("{name} is not valid UTF-8")))
+}
+
+/// Scan a block range and return the result as JSON.
+///
+/// Shared by the C ABI below and by the JNI entry point in `jni_android`, so
+/// the two doorways cannot drift apart.
+///
+/// # The runtime
+///
+/// `run_sync` is `async`, and this crate is a `cdylib`/`staticlib` with no
+/// ambient executor — unlike `zcash-cli` (which owns `main` via
+/// `#[tokio::main]`) or `zcash-ffi-node` (where Node supplies one). So the
+/// binding builds its own and blocks on it.
+///
+/// It is deliberately a **current-thread** runtime. The async side here is
+/// I/O — streaming compact blocks off gRPC — and concurrency is not
+/// parallelism: `try_buffer_unordered` keeps N requests in flight on one
+/// thread perfectly well. All the CPU work already leaves via `spawn_blocking`
+/// into Rayon, so worker threads would only add oversubscription on a phone.
+#[cfg(feature = "sync")]
+fn sync_range_json(
+    ufvk: &str,
+    grpc_url: &str,
+    network: &str,
+    start_height: u32,
+    end_height: u32,
+) -> Result<String, (i32, String)> {
+    use zcash_sync::sync::{run_sync, SyncParams};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        // Bounded on purpose: the default blocking pool allows 512 threads,
+        // which is not a sensible number on a handset.
+        .max_blocking_threads(4)
+        .build()
+        .map_err(|e| (ZCASH_ERR_CRYPTO, format!("could not start the runtime: {e}")))?;
+
+    let result = runtime
+        .block_on(run_sync(SyncParams {
+            grpc_url: grpc_url.to_string(),
+            viewing_key: ufvk.to_string(),
+            start_height,
+            end_height,
+            network: Some(network.to_string()),
+            verbose: false,
+            // The indexer returns 503 on large ranges under load; the engine
+            // splits and backs off, but only when retries are enabled.
+            max_retries: Some(3),
+            // Ledger accounts are Orchard-only, so Sapling outputs are stripped
+            // before trial decryption. Ironwood is Orchard-family and unaffected.
+            orchard_only: true,
+            // Always `None` from FFI (see SyncParams): these are the streaming
+            // hooks, and a C ABI cannot carry a Rust closure back to the caller.
+            // Everything is returned in one blob instead.
+            on_block_done: None,
+            on_transaction: None,
+            known_nullifiers: vec![],
+        }))
+        // `zcash-crypto` keeps key material out of its error strings, so this
+        // is safe to surface. Do not enrich it with the inputs.
+        .map_err(|e| (ZCASH_ERR_CRYPTO, e.to_string()))?;
+
+    serde_json::to_string(&result)
+        .map_err(|e| (ZCASH_ERR_CRYPTO, format!("could not serialise the result: {e}")))
+}
+
+/// Scan `start_height..=end_height` for notes belonging to `ufvk`.
+///
+/// **Blocking, and returns everything at once.** There is no progress and no
+/// cancellation: the call occupies the calling thread until the whole range is
+/// scanned, and a failure at the last block discards the entire result. That is
+/// tolerable for a few thousand blocks and wrong for a full history — see the
+/// sync design note on in-stream checkpointing.
+///
+/// On [`ZCASH_OK`], `*out` is the serialised `SyncResult`.
+///
+/// # Safety
+/// All four string arguments must be valid NUL-terminated C strings, and `out`
+/// a writable pointer to a `*mut c_char`. On [`ZCASH_OK`] or any error except
+/// [`ZCASH_ERR_NULL_ARG`], the caller owns `*out` and must release it with
+/// [`zcash_string_free`].
+#[cfg(feature = "sync")]
+#[no_mangle]
+pub unsafe extern "C" fn zcash_sync_range(
+    ufvk: *const c_char,
+    grpc_url: *const c_char,
+    network: *const c_char,
+    start_height: u32,
+    end_height: u32,
+    out: *mut *mut c_char,
+) -> i32 {
+    if ufvk.is_null() || grpc_url.is_null() || network.is_null() || out.is_null() {
+        return ZCASH_ERR_NULL_ARG;
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let ufvk = read_c_str(ufvk, "ufvk")?;
+        let grpc_url = read_c_str(grpc_url, "grpc_url")?;
+        let network = read_c_str(network, "network")?;
+        sync_range_json(ufvk, grpc_url, network, start_height, end_height)
     }));
 
     match result {

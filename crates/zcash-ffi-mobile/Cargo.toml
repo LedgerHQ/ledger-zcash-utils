@@ -24,13 +24,25 @@ default = []
 # = 0 matches, vs 31 for zcash-sync). Shielded *receive* therefore ships with no
 # async runtime linked into the app at all. Enable `sync` only when the block-scan
 # surface is bound.
-sync = ["dep:zcash-sync"]
+sync = ["dep:zcash-sync", "dep:tokio", "dep:serde_json"]
 
 [dependencies]
 zcash-crypto = { path = "../zcash-crypto" }
 zcash-sync = { path = "../zcash-sync", optional = true }
+# Both `sync`-only. `run_sync` is async and this crate is a cdylib/staticlib with
+# no ambient runtime -- unlike zcash-cli (#[tokio::main]) or zcash-ffi-node
+# (Node supplies one) -- so the binding builds its own and blocks on it.
+tokio      = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 # Used only by the threading probe below. `zcash-crypto` already depends on
 # rayon for batch trial decryption, but the linker strips it from this crate's
 # artifacts while nothing reachable from an exported symbol uses it -- which is
 # exactly what the probe exists to change and measure.
 rayon = { workspace = true }
+
+# Android only. The JVM has no FFI, so the C ABI above is unreachable from
+# Kotlin; `jni` provides the types for the JNI-shaped entry points in
+# `src/jni_android.rs`. Target-gated so no other platform, and no host test
+# build, links it.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.22"

@@ -30,6 +30,34 @@ pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Returns an error if the URL is invalid, the TLS handshake fails, or the
 /// connection cannot be established within [`CONNECT_TIMEOUT`].
+/// Root certificates for the TLS handshake.
+///
+/// Mobile cannot use the native trust store. `rustls-native-certs` reads
+/// `/etc/ssl/certs` on Unix, which does not exist on Android -- its CAs live in
+/// `/system/etc/security/cacerts` -- and tonic treats an empty native store as
+/// a hard error (`NativeCertsNotFound`) *before* it would consider webpki
+/// roots, so `with_enabled_roots()` fails outright rather than falling back.
+/// Observed on the Android emulator, 2026-09-21: "TLS config failed".
+///
+/// So mobile gets the bundled Mozilla root store (+73 KB) and desktop keeps
+/// following the OS trust store, which is what lets an enterprise or
+/// user-installed CA work there.
+///
+/// **[TO VERIFY]** iOS is included on the same reasoning -- it has no
+/// `/etc/ssl/certs` either -- but has not been exercised yet.
+fn tls_config() -> tonic::transport::ClientTlsConfig {
+    let config = tonic::transport::ClientTlsConfig::new();
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        config.with_webpki_roots()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        config.with_enabled_roots()
+    }
+}
+
 pub async fn connect(grpc_url: &str) -> Result<Channel> {
     let endpoint = tonic::transport::Channel::from_shared(grpc_url.to_owned())
         .map_err(|e| anyhow!("invalid gRPC URL: {}", e))?
@@ -37,7 +65,7 @@ pub async fn connect(grpc_url: &str) -> Result<Channel> {
 
     let channel = if grpc_url.starts_with("https://") {
         endpoint
-            .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+            .tls_config(tls_config())
             .map_err(|e| anyhow!("TLS config failed: {}", e))?
             .connect()
             .await

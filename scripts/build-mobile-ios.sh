@@ -17,6 +17,14 @@ LIB="libzcash_ffi_mobile.a"
 # in Cargo.toml.
 PROFILE="mobile"
 
+# Opt-in cargo features, e.g. ZCASH_FFI_FEATURES=sync. Off by default: `sync`
+# links tokio, tonic, hyper and rustls.
+FEATURE_ARGS=()
+if [ -n "${ZCASH_FFI_FEATURES:-}" ]; then
+    FEATURE_ARGS=(--features "$ZCASH_FFI_FEATURES")
+    echo "Building with features: $ZCASH_FFI_FEATURES"
+fi
+
 # Simulator slices are lipo'd into one fat archive. x86_64 covers Intel Macs; drop
 # it from SIM_TARGETS if the team is entirely on Apple Silicon and build time matters.
 DEVICE_TARGET="aarch64-apple-ios"
@@ -30,7 +38,7 @@ rustup target add "$DEVICE_TARGET" "${SIM_TARGETS[@]}"
 for target in "$DEVICE_TARGET" "${SIM_TARGETS[@]}"; do
     echo ""
     echo "Building for $target (profile: $PROFILE)..."
-    cargo build --profile "$PROFILE" --target "$target" -p zcash-ffi-mobile
+    cargo build --profile "$PROFILE" --target "$target" -p zcash-ffi-mobile ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 done
 
 # xcodebuild refuses to overwrite an existing .xcframework, so clear prior output.

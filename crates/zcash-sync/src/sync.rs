@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 use futures::TryStreamExt;
 use std::collections::VecDeque;
 use std::sync::{
@@ -96,7 +97,7 @@ pub struct SyncParams {
 /// `None` for Sapling notes. A dedicated `SaplingNote` type would be cleaner
 /// but is deferred until Sapling spending support is needed (Ledger is
 /// Orchard-only).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShieldedNote {
     /// Value in zatoshis.
     pub amount: u64,
@@ -143,7 +144,7 @@ pub struct ShieldedNote {
 }
 
 /// A matched and fully-decrypted shielded transaction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShieldedTransaction {
     /// Transaction ID in big-endian (display) hex order.
     pub txid: String,
@@ -176,7 +177,7 @@ pub struct ShieldedTransaction {
 }
 
 /// Result returned after scanning a block range.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct SyncResult {
     pub transactions: Vec<ShieldedTransaction>,
     pub blocks_scanned: u32,

@@ -59,8 +59,23 @@ echo "Building ${#ABIS[@]} ABIs (profile: $PROFILE, API $API_LEVEL)..."
 abi_args=()
 for abi in "${ABIS[@]}"; do abi_args+=("-t" "$abi"); done
 
+# Record a SONAME. Nothing links against this library today -- the JVM dlopens
+# it by path out of jniLibs -- so this is defensive: when a separate shim linked
+# against it and found no SONAME, the linker wrote the absolute build-host path
+# into that shim's DT_NEEDED, and the library failed to load on device.
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-soname,$LIB"
+
+# Opt-in cargo features, e.g. ZCASH_FFI_FEATURES=sync to include the block
+# scanner. Off by default: `sync` links tokio, tonic, hyper and rustls, which
+# the key-derivation-only build does not carry at all.
+FEATURE_ARGS=()
+if [ -n "${ZCASH_FFI_FEATURES:-}" ]; then
+    FEATURE_ARGS=(--features "$ZCASH_FFI_FEATURES")
+    echo "Building with features: $ZCASH_FFI_FEATURES"
+fi
+
 cargo ndk "${abi_args[@]}" --platform "$API_LEVEL" -o "$DIST_DIR" \
-    build --profile "$PROFILE" -p zcash-ffi-mobile
+    build --profile "$PROFILE" -p zcash-ffi-mobile ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 # Decide on captured output, never on nm's exit status: Rust's precompiled `std`
 # carries embedded LLVM bitcode that some binutils cannot parse, which makes nm

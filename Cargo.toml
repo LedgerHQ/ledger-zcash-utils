@@ -42,7 +42,14 @@ zcash_script          = "0.4"
 
 # Async / gRPC (only zcash-sync and its dependents need these)
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
-tonic = { version = "0.14", features = ["codegen", "transport", "tls-native-roots", "tls-ring"] }
+# `tls-webpki-roots` is not redundant with `tls-native-roots`: the two are
+# additive, and Android has no native root store to read. `rustls-native-certs`
+# looks in /etc/ssl/certs, which does not exist there (Android keeps its CAs in
+# /system/etc/security/cacerts), so rustls ends up with zero trusted roots and
+# refuses to build a TLS config -- "TLS config failed: transport error", seen on
+# the emulator 2026-09-21. Bundling Mozilla's root store makes the mobile build
+# work; desktop keeps following the OS trust store as before.
+tonic = { version = "0.14", features = ["codegen", "transport", "tls-native-roots", "tls-webpki-roots", "tls-ring"] }
 
 # FFI
 napi         = { version = "2.16", features = ["async"] }

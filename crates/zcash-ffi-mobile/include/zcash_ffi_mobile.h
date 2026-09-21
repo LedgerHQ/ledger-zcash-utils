@@ -31,9 +31,20 @@ int zcash_orchard_address_from_ufvk(const char *ufvk, char **out);
  * {"threads":N,"iterations":N,"serial_ms":N,"parallel_ms":N,"speedup":N.NN} */
 int zcash_ffi_thread_probe(const char *ufvk, unsigned int iterations, char **out);
 
+/* Scan start_height..=end_height for notes belonging to ufvk, and return the
+ * serialised SyncResult as JSON.
+ *
+ * BLOCKING: occupies the calling thread for the whole range, with no progress
+ * and no cancellation, and discards everything if the last block fails. Call
+ * it off the UI thread, and keep the range small. Only present when the engine
+ * was built with the `sync` feature. */
+int zcash_sync_range(const char *ufvk, const char *grpc_url, const char *network,
+                     unsigned int start_height, unsigned int end_height, char **out);
+
 /* Release a string returned through an out parameter. NULL is a no-op. */
 void zcash_string_free(char *s);
 
+/* OUI TEST ENTRY POINT */
 #ifdef __cplusplus
 }
 #endif
