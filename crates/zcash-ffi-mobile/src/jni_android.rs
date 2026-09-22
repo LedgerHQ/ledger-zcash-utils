@@ -80,8 +80,15 @@ const SYNC_RANGE: NativeMethod = native_method! {
         network: JString,
         start_height: jint,
         end_height: jint,
+        known_nullifiers: JString,
         out_status: [jint]
     ) -> JString,
+};
+
+/// `nativeChainTip(String, int[]) -> String`
+#[cfg(feature = "sync")]
+const CHAIN_TIP: NativeMethod = native_method! {
+    fn native_chain_tip(grpc_url: JString, out_status: [jint]) -> JString,
 };
 
 /// Called by the JVM when `System.loadLibrary("zcash_ffi_mobile")` succeeds.
@@ -114,7 +121,7 @@ pub unsafe extern "system" fn JNI_OnLoad(vm: *mut jni::sys::JavaVM, _reserved: *
             // already reports as ZCASH_FFI_UNAVAILABLE.
             let mut methods = vec![DERIVE_ORCHARD_ADDRESS, THREAD_PROBE];
             #[cfg(feature = "sync")]
-            methods.push(SYNC_RANGE);
+            methods.extend([SYNC_RANGE, CHAIN_TIP]);
 
             unsafe { env.register_native_methods(&class, &methods) }
         })
@@ -254,15 +261,18 @@ fn native_sync_range<'local>(
     network: JString<'local>,
     start_height: jint,
     end_height: jint,
+    known_nullifiers: JString<'local>,
     out_status: JIntArray<'local>,
 ) -> Result<JString<'local>, Error> {
     let ufvk_chars = ufvk.mutf8_chars(env)?;
     let url_chars = grpc_url.mutf8_chars(env)?;
     let network_chars = network.mutf8_chars(env)?;
+    let nullifier_chars = known_nullifiers.mutf8_chars(env)?;
 
     let ufvk_utf8 = ufvk_chars.to_str();
     let url_utf8 = url_chars.to_str();
     let network_utf8 = network_chars.to_str();
+    let nullifiers_utf8 = nullifier_chars.to_str();
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         crate::sync_range_json(
@@ -271,11 +281,34 @@ fn native_sync_range<'local>(
             &network_utf8,
             start_height.max(0) as u32,
             end_height.max(0) as u32,
+            &nullifiers_utf8,
         )
     }));
 
     let (status, value) = match outcome {
         Ok(Ok(json)) => (ZCASH_OK, json),
+        Ok(Err((code, message))) => (code, message),
+        Err(_) => (ZCASH_ERR_PANIC, "panic caught at JNI boundary".to_string()),
+    };
+
+    respond(env, &out_status, status, value)
+}
+
+/// Backs `ZcashFfiModule.nativeChainTip`.
+#[cfg(feature = "sync")]
+fn native_chain_tip<'local>(
+    env: &mut Env<'local>,
+    _this: JObject<'local>,
+    grpc_url: JString<'local>,
+    out_status: JIntArray<'local>,
+) -> Result<JString<'local>, Error> {
+    let url_chars = grpc_url.mutf8_chars(env)?;
+    let url_utf8 = url_chars.to_str();
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| crate::chain_tip_string(&url_utf8)));
+
+    let (status, value) = match outcome {
+        Ok(Ok(height)) => (ZCASH_OK, height),
         Ok(Err((code, message))) => (code, message),
         Err(_) => (ZCASH_ERR_PANIC, "panic caught at JNI boundary".to_string()),
     };

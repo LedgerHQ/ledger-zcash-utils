@@ -245,6 +245,7 @@ fn sync_range_json(
     network: &str,
     start_height: u32,
     end_height: u32,
+    known_nullifiers: &str,
 ) -> Result<String, (i32, String)> {
     use zcash_sync::sync::{run_sync, SyncParams};
 
@@ -275,7 +276,18 @@ fn sync_range_json(
             // Everything is returned in one blob instead.
             on_block_done: None,
             on_transaction: None,
-            known_nullifiers: vec![],
+            // Nullifiers of notes the caller already holds and believes
+            // unspent. Without these, a chunked scan cannot see that a note
+            // found in an earlier range was spent in this one -- each call is
+            // a fresh `run_sync` with no memory of previous ones -- and the
+            // note stays marked unspent, inflating the balance. Newline
+            // separated; blank lines ignored; empty string means none.
+            known_nullifiers: known_nullifiers
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect(),
         }))
         // `zcash-crypto` keeps key material out of its error strings, so this
         // is safe to surface. Do not enrich it with the inputs.
@@ -283,6 +295,50 @@ fn sync_range_json(
 
     serde_json::to_string(&result)
         .map_err(|e| (ZCASH_ERR_CRYPTO, format!("could not serialise the result: {e}")))
+}
+
+/// Current chain tip height, as a decimal string.
+///
+/// The chunked scan loop needs to know where to stop, and only the engine can
+/// ask -- there is no gRPC client on the JavaScript side of a phone.
+#[cfg(feature = "sync")]
+fn chain_tip_string(grpc_url: &str) -> Result<String, (i32, String)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| (ZCASH_ERR_CRYPTO, format!("could not start the runtime: {e}")))?;
+
+    runtime
+        .block_on(zcash_sync::client::chain_tip(grpc_url.to_string()))
+        .map(|h| h.to_string())
+        .map_err(|e| (ZCASH_ERR_CRYPTO, e.to_string()))
+}
+
+/// Write the current chain tip height to `*out` as a decimal string.
+///
+/// # Safety
+/// Same contract as [`zcash_orchard_address_from_ufvk`].
+#[cfg(feature = "sync")]
+#[no_mangle]
+pub unsafe extern "C" fn zcash_chain_tip(grpc_url: *const c_char, out: *mut *mut c_char) -> i32 {
+    if grpc_url.is_null() || out.is_null() {
+        return ZCASH_ERR_NULL_ARG;
+    }
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let grpc_url = read_c_str(grpc_url, "grpc_url")?;
+        chain_tip_string(grpc_url)
+    }));
+
+    match result {
+        Ok(Ok(height)) => write_out(out, height, ZCASH_OK),
+        Ok(Err((code, message))) => write_out(out, message, code),
+        Err(_) => write_out(
+            out,
+            "panic caught at FFI boundary".to_string(),
+            ZCASH_ERR_PANIC,
+        ),
+    }
 }
 
 /// Scan `start_height..=end_height` for notes belonging to `ufvk`.
@@ -308,6 +364,7 @@ pub unsafe extern "C" fn zcash_sync_range(
     network: *const c_char,
     start_height: u32,
     end_height: u32,
+    known_nullifiers: *const c_char,
     out: *mut *mut c_char,
 ) -> i32 {
     if ufvk.is_null() || grpc_url.is_null() || network.is_null() || out.is_null() {
@@ -318,7 +375,13 @@ pub unsafe extern "C" fn zcash_sync_range(
         let ufvk = read_c_str(ufvk, "ufvk")?;
         let grpc_url = read_c_str(grpc_url, "grpc_url")?;
         let network = read_c_str(network, "network")?;
-        sync_range_json(ufvk, grpc_url, network, start_height, end_height)
+        // Optional: a null pointer means "no known nullifiers".
+        let nullifiers = if known_nullifiers.is_null() {
+            ""
+        } else {
+            read_c_str(known_nullifiers, "known_nullifiers")?
+        };
+        sync_range_json(ufvk, grpc_url, network, start_height, end_height, nullifiers)
     }));
 
     match result {

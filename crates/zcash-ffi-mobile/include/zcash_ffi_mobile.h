@@ -39,7 +39,12 @@ int zcash_ffi_thread_probe(const char *ufvk, unsigned int iterations, char **out
  * it off the UI thread, and keep the range small. Only present when the engine
  * was built with the `sync` feature. */
 int zcash_sync_range(const char *ufvk, const char *grpc_url, const char *network,
-                     unsigned int start_height, unsigned int end_height, char **out);
+                     unsigned int start_height, unsigned int end_height,
+                     const char *known_nullifiers, char **out);
+
+/* Current chain tip height, written to *out as a decimal string. The chunked
+ * scan loop needs it to know where to stop. Only with the `sync` feature. */
+int zcash_chain_tip(const char *grpc_url, char **out);
 
 /* Release a string returned through an out parameter. NULL is a no-op. */
 void zcash_string_free(char *s);
