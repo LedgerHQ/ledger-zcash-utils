@@ -389,10 +389,11 @@ pub struct BuildTransactionResult {
 /// Build, prove, and serialize a PCZT for a send transaction.
 ///
 /// Supports Orchard-source (Private→*) and transparent-source (Public→*)
-/// flows. Halo 2 proof generation happens here for Orchard-bundle transactions
-/// (~2-5 s first call, ~hundreds of ms thereafter thanks to the process-global
-/// ProvingKey cache). Transparent-only transactions skip the Orchard prover, and
-/// need no UFVK — see `ufvk` / `transparentAccountPubkey` on the params.
+/// flows. Halo 2 proof generation happens here for Orchard-bundle transactions.
+/// It runs on every core, off the JavaScript thread: roughly 0.4 s per action
+/// on a 10-core host, plus a one-time proving-key build per circuit that the
+/// process-global ProvingKey cache then amortizes. Transparent-only transactions
+/// skip the Orchard prover, and need no UFVK — see `ufvk` / `transparentAccountPubkey` on the params.
 ///
 /// Note: unlike `finalize_transaction` (purely CPU-bound, offloaded via
 /// `spawn_blocking`), this is an async orchestrator that interleaves gRPC
@@ -579,9 +580,10 @@ fn convert_ironwood_transparent_inputs(
 /// place of Orchard ones and emitting a V6 (ZIP-230) PCZT.
 ///
 /// Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
-/// happens here for the Ironwood bundle (~2-5 s first call against the
-/// `PostNu6_3` circuit, ~hundreds of ms thereafter via the process-global
-/// proving-key cache).
+/// happens here for the Ironwood bundle, on every core and off the JavaScript
+/// thread (roughly 0.4 s per action on a 10-core host), plus a one-time
+/// proving-key build for the `PostNu6_3` circuit that the process-global
+/// proving-key cache then amortizes.
 #[napi]
 pub async fn build_ironwood_transaction(
     params: BuildIronwoodTransactionParams,

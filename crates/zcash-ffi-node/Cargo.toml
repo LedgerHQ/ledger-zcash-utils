@@ -18,7 +18,8 @@ doctest = false
 
 [dependencies]
 zcash-sync   = { path = "../zcash-sync" }
-zcash-crypto = { path = "../zcash-crypto" }
+# The addon proves off the JavaScript thread, on every core.
+zcash-crypto = { path = "../zcash-crypto", features = ["multicore"] }
 
 napi        = { workspace = true }
 napi-derive = { workspace = true }
