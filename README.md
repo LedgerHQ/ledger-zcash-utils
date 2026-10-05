@@ -155,7 +155,7 @@ Full signatures, every field, and its constraints are in [`index.d.ts`](index.d.
 
 | Export | Purpose |
 | --- | --- |
-| `buildTransaction(params)` | Builds, proves, and serializes a V5 PCZT from Orchard notes, transparent UTXOs, or both. Bears the Halo 2 proving cost inline (~2–5 s cold, ~hundreds of ms after, via a process-global proving-key cache). |
+| `buildTransaction(params)` | Builds, proves, and serializes a V5 PCZT from Orchard notes, transparent UTXOs, or both. Halo 2 proving runs on every core, off the JavaScript thread: roughly 0.4 s per action on a 10-core host, plus a one-time proving-key build per circuit (cached process-wide). The Node addon enables this; the `zcash-crypto` Rust crate stays single-threaded unless its `multicore` feature is enabled. |
 | `buildIronwoodTransaction(params)` | Same, for an Ironwood (NU6.3) source — a redacted V6 PCZT. See [Ironwood (NU6.3)](#ironwood-nu63) below. |
 | `parsePczt(pcztHex)` | Decodes canonical PCZT bytes into the `PcztTransaction` the device signer consumes. Fails if a field the device needs to sign is missing. |
 | `finalizeTransaction(params)` | Injects device signatures, computes the binding signature, extracts the signed transaction and its txid. CPU-bound (proof verification), dispatched to a blocking thread. |
