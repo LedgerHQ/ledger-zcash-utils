@@ -50,7 +50,7 @@
     "napi-smoke": "tsx examples/napi-smoke.ts"
   },
   "devDependencies": {
-    "@changesets/cli": "^2.29.8",
+    "@changesets/cli": "^3.0.3",
     "@napi-rs/cli": "^2.18.0",
     "@types/node": "^25.5.2",
     "prettier": "^3.9.6",

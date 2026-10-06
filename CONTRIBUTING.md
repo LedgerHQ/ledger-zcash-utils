@@ -110,26 +110,23 @@ Open the pull request against `main` — it needs one approval to merge, and an 
 
 ## Release
 
-Versioning is managed with [Changesets](https://github.com/changesets/action). Every merge to `main` triggers the CI workflow, which:
-
-1. Builds all artifacts in parallel on their respective platforms
-2. Either opens/updates a **"Version Packages"** PR if changesets are pending
-3. Or publishes immediately if the "Version Packages" PR has already been merged
+Versioning is managed with [Changesets](https://changesets.dev) v3, which needs Node.js `^22.11 || ^24 || >=26` locally. A release needs nothing but changesets: no hand-edited version, no manual tag.
 
 ### Publishing a new version
 
-```bash
-# 1. Describe the change (patch / minor / major)
-pnpm changeset
+1. Each pull request carrying a user-visible change commits its changeset (`pnpm changeset`, see [Contributing workflow](#contributing-workflow)).
+2. When it merges, the **Publish Release** workflow (`.github/workflows/publish-release.yml`) opens or updates a pull request titled **"release: version packages"**. It consumes the pending changesets: it bumps `package.json` and writes `CHANGELOG.md`. Further merges keep updating it.
+3. Merging that pull request is the release. The workflow then:
+   1. builds the `.node` binaries and the CLI binaries in parallel on their platforms;
+   2. packs the package once (`changeset pack`);
+   3. attests that exact tarball (SLSA provenance) with `LedgerHQ/actions-security`'s `attest-for-npmsjs-com`. The attestation is bound to the tarball bytes, which is why packing and publishing are separate steps;
+   4. publishes that same tarball (`changeset publish --from-pack-dir`), pushes the `v{version}` tag, creates the GitHub Release and attaches the CLI binaries to it.
 
-# 2. Commit the generated .changeset file and push
-git add .changeset/
-git commit -m "chore: add changeset"
-git push
+On each push to `main`, the workflow first selects a mode: `version` when changesets are pending, `publish` when `package.json` holds a version the registry does not have, and nothing otherwise. A re-run, or a manual run from the Actions tab, is therefore harmless: a version already on the registry is neither packed nor published again.
 
-# 3. Merge the PR → CI automatically opens a "Version Packages" PR
-# 4. Merge the "Version Packages" PR → CI publishes
-```
+The bot's commits go through the GitHub API, so they are signed, and its pull request is reviewed and merged like any other. This requires the repository setting **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"** to stay enabled. Because that pull request is opened with the workflow's own token, the build-and-test workflow does not run on it.
+
+The publish job runs on `public-ledgerhq-shared-medium`. That runner is GitHub-hosted, which the attestation requires, and it can reach the IP-restricted JFrog registry. Do not move the job to a self-hosted runner.
 
 ### Artifacts produced per release
 
@@ -141,7 +138,7 @@ git push
 
 The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
 
-The package is published on the **public npm registry**, so consumers need no registry configuration. The publish job authenticates through Ledger's release infrastructure via OIDC rather than a long-lived token, which is why no npm credential appears among the secrets below.
+The package is published to Ledger's JFrog registry, which relays it to the **public npm registry** together with its attestation, so consumers need no registry configuration. The publish job authenticates through Ledger's release infrastructure via OIDC rather than a long-lived token, which is why no npm credential appears among the secrets below.
 
 CLI binaries are attached to the tagged GitHub Release (`v{version}`) and are not part of the npm package.
 
