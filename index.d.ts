@@ -261,6 +261,11 @@ export interface BuildTransactionParams {
   /** Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows. */
   transparentInputs: Array<TransparentInputJs>
   outputs: Array<OutputRequestJs>
+  /**
+   * Explicit anchor height; omitted → `tip − 10`. An explicit height above the
+   * tip is rejected. The transaction always targets the next block, `tip + 1`,
+   * so the chain tip is queried in either case.
+   */
   anchorHeight?: number
 }
 export interface BuildTransactionResult {
@@ -272,7 +277,7 @@ export interface BuildTransactionResult {
   pcztHex: string
   /** Decimal fee in zatoshis. */
   feeZat: string
-  /** Block height the Merkle paths were computed against. */
+  /** Block height the Merkle paths were computed against (the resolved anchor). */
   anchorHeight: number
   /** Orchard action count after dummy padding. */
   nActionsOrchard: number
@@ -349,6 +354,11 @@ export interface BuildIronwoodTransactionParams {
   /** Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows. */
   transparentInputs: Array<TransparentInputJs>
   outputs: Array<IronwoodOutputRequestJs>
+  /**
+   * Explicit anchor height; omitted → `tip − 10`. An explicit height above the
+   * tip is rejected. The transaction always targets the next block, `tip + 1`,
+   * so the chain tip is queried in either case.
+   */
   anchorHeight?: number
 }
 export interface BuildIronwoodTransactionResult {
@@ -361,7 +371,7 @@ export interface BuildIronwoodTransactionResult {
   pcztHex: string
   /** Decimal fee in zatoshis. */
   feeZat: string
-  /** Block height the Merkle paths were computed against. */
+  /** Block height the Merkle paths were computed against (the resolved anchor). */
   anchorHeight: number
   /** Ironwood action count after dummy padding. */
   nActionsIronwood: number

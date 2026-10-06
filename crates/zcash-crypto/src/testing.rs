@@ -450,6 +450,7 @@ mod tests {
         let inputs = BuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
+            anchor_height: 1,
             orchard_fvk: Some(fvk),
             ovk,
             change_address: Some(change),
@@ -516,6 +517,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu6_3_height(),
+            anchor_height: 1,
             ironwood_fvk: Some(fvk),
             ovk,
             change_address: Some(change),
@@ -561,6 +563,7 @@ mod tests {
         let inputs = BuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
+            anchor_height: 1,
             orchard_fvk: None,
             ovk: None,
             change_address: None,
@@ -644,6 +647,7 @@ mod tests {
         let inputs = BuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu5_height(),
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk,
             change_address: Some(change),
@@ -743,6 +747,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
             target_height: nu6_3_height(),
+            anchor_height: 1,
             ironwood_fvk: Some(fvk),
             ovk,
             change_address: Some(change),

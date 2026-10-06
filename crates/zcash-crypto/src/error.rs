@@ -63,6 +63,19 @@ pub enum Error {
     #[error("craft error: {0}")]
     Craft(String),
 
+    /// The default expiry would outlive the next network upgrade, and capping it
+    /// below that upgrade leaves too few blocks for nodes to accept the
+    /// transaction.
+    #[error(
+        "expiry too close to activation: target {target_height}, next upgrade at \
+         {activation_height}, capped expiry {capped_expiry}"
+    )]
+    ExpiryTooCloseToActivation {
+        target_height: u32,
+        activation_height: u32,
+        capped_expiry: u32,
+    },
+
     /// Transaction finalization failed: PCZT parse/role error, signature
     /// rejected during injection, proof verification failure, or serialization error.
     #[error("finalize error: {0}")]
@@ -162,6 +175,19 @@ mod tests {
     fn test_craft_error_display() {
         let e = Error::Craft("bad anchor".into());
         assert_eq!(e.to_string(), "craft error: bad anchor");
+    }
+
+    #[test]
+    fn test_expiry_too_close_to_activation_display() {
+        let e = Error::ExpiryTooCloseToActivation {
+            target_height: 98,
+            activation_height: 100,
+            capped_expiry: 99,
+        };
+        assert_eq!(
+            e.to_string(),
+            "expiry too close to activation: target 98, next upgrade at 100, capped expiry 99"
+        );
     }
 
     #[test]
