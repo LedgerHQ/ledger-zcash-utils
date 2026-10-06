@@ -286,8 +286,9 @@ export interface BuildTransactionResult {
  *
  * Supports Orchard-source (Private→*) and transparent-source (Public→*)
  * flows. Halo 2 proof generation happens here for Orchard-bundle transactions.
- * It runs on every core, off the JavaScript thread: roughly 0.4 s per action
- * on a 10-core host, plus a one-time proving-key build per circuit that the
+ * It runs on every core, off the JavaScript thread: about five times faster
+ * than on a single core (roughly 0.35–0.4 s per action on an Apple M1 Max),
+ * plus a one-time proving-key build per circuit that the
  * process-global ProvingKey cache then amortizes. Transparent-only transactions
  * skip the Orchard prover, and need no UFVK — see `ufvk` / `transparentAccountPubkey` on the params.
  *
@@ -377,7 +378,7 @@ export interface BuildIronwoodTransactionResult {
  *
  * Same proving-cost profile as `buildTransaction`: Halo 2 proof generation
  * happens here for the Ironwood bundle, on every core and off the JavaScript
- * thread (roughly 0.4 s per action on a 10-core host), plus a one-time
+ * thread (roughly 0.35–0.4 s per action on an Apple M1 Max), plus a one-time
  * proving-key build for the `PostNu6_3` circuit that the process-global
  * proving-key cache then amortizes.
  */

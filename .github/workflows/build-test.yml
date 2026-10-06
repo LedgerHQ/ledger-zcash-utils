@@ -55,6 +55,23 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # The addon must prove on every core, while the zcash-crypto crate on its
+      # own stays single-threaded. Workspace builds unify the feature, so no
+      # test would notice either wiring breaking; resolve each package alone.
+      - name: Check the multicore feature wiring
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo tree -p zcash-ffi-node -e features -i halo2_proofs | grep -q 'halo2_proofs feature "multicore"'; then
+            echo "::error::zcash-ffi-node no longer enables halo2_proofs/multicore"
+            exit 1
+          fi
+          if cargo tree -p zcash-crypto -e features -i halo2_proofs | grep -q 'feature "multicore"'; then
+            echo "::error::zcash-crypto enables multicore by default"
+            exit 1
+          fi
+
       - name: Build NAPI addon
         run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
 

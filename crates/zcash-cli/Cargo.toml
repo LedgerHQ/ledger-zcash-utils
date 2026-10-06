@@ -10,8 +10,7 @@ name = "ledger-zcash-cli"
 path = "src/main.rs"
 
 [dependencies]
-# Proves like the addon if it ever builds transactions.
-zcash-crypto = { path = "../zcash-crypto", features = ["transparent-inputs", "multicore"] }
+zcash-crypto = { path = "../zcash-crypto", features = ["transparent-inputs"] }
 zcash-sync   = { path = "../zcash-sync" }
 
 anyhow     = { workspace = true }
