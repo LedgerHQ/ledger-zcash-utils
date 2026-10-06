@@ -1,9 +1,9 @@
 name: Publish Release
 
 # Releases are driven by changesets alone. A merge to main that brings pending
-# changesets opens (or updates) a "Version packages" pull request; merging that
-# pull request is the release: the package is built, packed, attested and
-# published, then tagged and released on GitHub.
+# changesets opens (or updates) the "release: version packages" pull request;
+# merging that pull request is the release: the package is built, packed,
+# attested and published, then tagged and released on GitHub.
 on:
   push:
     branches:
@@ -12,12 +12,18 @@ on:
 
 permissions: {}
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+# No workflow-level concurrency: a pending run would be superseded by the next
+# push to main, and the run for a merged version pull request could then be
+# cancelled before it publishes. Each job that writes takes its own group below.
 
 jobs:
   # ── Step 0: Decide between versioning, publishing and nothing ───────────────
   select-mode:
     name: Select mode
+    # Only main releases: a manual run from another branch would publish, tag
+    # and release code that never went through a pull request. Every other job
+    # depends on this one and is skipped with it.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,12 +49,16 @@ jobs:
         id: select-mode
         uses: changesets/action/select-mode@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
 
-  # ── Step 1: Open or update the "Version packages" pull request ──────────────
+  # ── Step 1: Open or update the "release: version packages" pull request ─────
   version:
-    name: Version packages
+    name: Update the version pull request
     needs: select-mode
     if: needs.select-mode.outputs.mode == 'version'
     runs-on: ubuntu-latest
+    # Only the latest state of main matters for the version pull request.
+    concurrency:
+      group: ${{ github.workflow }}-version
+      cancel-in-progress: true
     permissions:
       contents: write # push the release branch
       pull-requests: write # open or update the pull request
@@ -192,6 +202,11 @@ jobs:
     runs-on: public-ledgerhq-shared-medium
     needs: [select-mode, build-napi, build-cli]
     if: needs.select-mode.outputs.mode == 'publish'
+    # Serialised, never cancelled: a publish must not be dropped in favour of a
+    # later run that selected another mode.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+      cancel-in-progress: false
     permissions:
       id-token: write # JFrog OIDC login and attestation signing
       contents: write # git tag, GitHub Release and its assets

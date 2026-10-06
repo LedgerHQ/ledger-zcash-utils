@@ -122,11 +122,26 @@ Versioning is managed with [Changesets](https://changesets.dev) v3, which needs 
    3. attests that exact tarball (SLSA provenance) with `LedgerHQ/actions-security`'s `attest-for-npmsjs-com`. The attestation is bound to the tarball bytes, which is why packing and publishing are separate steps;
    4. publishes that same tarball (`changeset publish --from-pack-dir`), pushes the `v{version}` tag, creates the GitHub Release and attaches the CLI binaries to it.
 
-On each push to `main`, the workflow first selects a mode: `version` when changesets are pending, `publish` when `package.json` holds a version the registry does not have, and nothing otherwise. A re-run, or a manual run from the Actions tab, is therefore harmless: a version already on the registry is neither packed nor published again.
+On each push to `main`, the workflow first selects a mode: `version` when changesets are pending, `publish` when `package.json` holds a version the registry does not have, and nothing otherwise. Pending changesets take precedence, so a version is published only by the run of the commit that merged its version pull request. The workflow can also be started from the Actions tab, on `main` only; on any other branch every job is skipped. A version already on the registry is never packed or published again.
 
 The bot's commits go through the GitHub API, so they are signed, and its pull request is reviewed and merged like any other. This requires the repository setting **Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"** to stay enabled. Because that pull request is opened with the workflow's own token, the build-and-test workflow does not run on it.
 
 The publish job runs on `public-ledgerhq-shared-medium`. That runner is GitHub-hosted, which the attestation requires, and it can reach the IP-restricted JFrog registry. Do not move the job to a self-hosted runner.
+
+### When a release does not complete
+
+A re-run cannot finish a release whose publish already reached the registry, because a published version yields nothing to pack. Two cases need a hand:
+
+- **The run of a merged version pull request did not publish** (cancelled, or failed before `changeset publish`). Later runs select `version` as soon as new changesets are pending, so they will not publish it. Re-run that run from the Actions tab: it checks out its own commit, where `package.json` holds the unpublished version.
+- **The package is published but the tag, the GitHub Release or its CLI binaries are missing** (a failure after `changeset publish`; a failed tag push is only logged as a warning). Finish by hand from the merged version commit:
+
+  ```bash
+  git tag v<version> <version-commit> && git push origin v<version>
+  gh release create v<version> --verify-tag --notes-file <changelog-excerpt>
+  gh release upload v<version> ledger-zcash-cli-macos-universal ledger-zcash-cli-linux-x86_64
+  ```
+
+  The CLI binaries are the `cli-*` artifacts of the failed run.
 
 ### Artifacts produced per release
 

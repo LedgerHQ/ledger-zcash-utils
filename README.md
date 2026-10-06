@@ -16,7 +16,7 @@ Published on the public npm registry under the `@ledgerhq` scope; no registry co
 
 Prebuilt `.node` binaries are bundled for six targets — `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc` — so there is no compilation step and no Rust toolchain to install. On any other platform, build from source: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-Node.js 20 or later. The addon is a native module, so it runs in Node and in the Electron main process, not in a browser or a renderer without `nodeIntegration`.
+Node.js 24 or later. The addon is a native module, so it runs in Node and in the Electron main process, not in a browser or a renderer without `nodeIntegration`.
 
 ## Quick start — scanning
 
