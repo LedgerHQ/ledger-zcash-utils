@@ -1,16 +1,96 @@
 name: Publish Release
 
+# Releases are driven by changesets alone. A merge to main that brings pending
+# changesets opens (or updates) the "release: version packages" pull request;
+# merging that pull request is the release: the package is built, packed,
+# attested and published, then tagged and released on GitHub.
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
 
-concurrency: ${{ github.workflow }}-${{ github.ref }}
+permissions: {}
+
+# No workflow-level concurrency: a pending run would be superseded by the next
+# push to main, and the run for a merged version pull request could then be
+# cancelled before it publishes. Each job that writes takes its own group below.
 
 jobs:
-  # ── Step 1a: Build .node binaries (NAPI — Node.js/Electron) ─────────────────
+  # ── Step 0: Decide between versioning, publishing and nothing ───────────────
+  select-mode:
+    name: Select mode
+    # Only main releases: a manual run from another branch would publish, tag
+    # and release code that never went through a pull request. Every other job
+    # depends on this one and is skipped with it.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.select-mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '24' }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `version` when changesets are pending, `publish` when package.json holds
+      # a version the registry does not have yet, `none` otherwise.
+      - name: Select Changesets mode
+        id: select-mode
+        uses: changesets/action/select-mode@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+
+  # ── Step 1: Open or update the "release: version packages" pull request ─────
+  version:
+    name: Update the version pull request
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'version'
+    runs-on: ubuntu-latest
+    # Only the latest state of main matters for the version pull request.
+    concurrency:
+      group: ${{ github.workflow }}-version
+      cancel-in-progress: true
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open or update the pull request
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '24' }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Commits go through the GitHub API, so they are signed by GitHub and
+      # satisfy the signed-commit rule on main once the pull request merges.
+      - name: Version packages
+        uses: changesets/action/version@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          commit-message: "release: version packages"
+          pr-title: "release: version packages"
+
+  # ── Step 2a: Build .node binaries (NAPI — Node.js/Electron) ─────────────────
   build-napi:
     name: NAPI ${{ matrix.target }}
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'publish'
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,7 +128,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ vars.NODE_VERSION || '20' }}
+          node-version: ${{ vars.NODE_VERSION || '24' }}
           cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -76,9 +156,13 @@ jobs:
           path: "*.node"
           if-no-files-found: error
 
-  # ── Step 1b: Build CLI binaries ──────────────────────────────────────────────
+  # ── Step 2b: Build CLI binaries ──────────────────────────────────────────────
   build-cli:
     name: CLI ${{ matrix.name }}
+    needs: select-mode
+    if: needs.select-mode.outputs.mode == 'publish'
+    permissions:
+      contents: read
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -112,23 +196,33 @@ jobs:
           path: ${{ matrix.artifact }}
           if-no-files-found: error
 
-  # ── Step 2: Publish to JFrog + attach CLI binaries to GitHub Release ─────────
+  # ── Step 3: Publish to JFrog, then tag and release on GitHub ─────────────────
   publish:
     name: Publish to JFrog
     runs-on: public-ledgerhq-shared-medium
-    needs: [build-napi, build-cli]
+    needs: [select-mode, build-napi, build-cli]
+    if: needs.select-mode.outputs.mode == 'publish'
+    # Serialised, never cancelled: a publish must not be dropped in favour of a
+    # later run that selected another mode.
+    concurrency:
+      group: ${{ github.workflow }}-publish
+      cancel-in-progress: false
     permissions:
-      id-token: write
-      contents: write
+      id-token: write # JFrog OIDC login and attestation signing
+      contents: write # git tag, GitHub Release and its assets
+      attestations: write # SLSA provenance of the published tarball
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - uses: pnpm/action-setup@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: ${{ vars.NODE_VERSION || '20' }}
+          node-version: ${{ vars.NODE_VERSION || '24' }}
           cache: pnpm
 
       - name: Install dependencies
@@ -174,12 +268,53 @@ jobs:
           //${INPUTS_REGISTRY}/:_authToken=${INPUTS_TOKEN}
           EOF
 
-      - name: 🚀 Publish to JFrog
-        run: pnpm changeset publish
+      # Packing is separate from publishing so the exact tarball can be attested
+      # first. `changeset pack` only packs versions the registry does not have
+      # yet, which is why it runs after the npmrc above points at JFrog; it
+      # writes `packages/*.tgz` plus `publish-plan.json` (the tarball integrity)
+      # into the output directory, and an already-published version yields an
+      # empty plan, keeping a re-run idempotent.
+      - name: 📦 Pack the package
+        id: pack
+        env:
+          OUT_DIR: ${{ runner.temp }}/changesets-pack
+        run: |
+          set -euo pipefail
+          pnpm exec changeset pack --out-dir "$OUT_DIR"
+
+          shopt -s nullglob
+          tarballs=("$OUT_DIR"/packages/*.tgz)
+          shopt -u nullglob
+
+          {
+            echo "out-dir=$OUT_DIR"
+            echo "count=${#tarballs[@]}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Packed ${#tarballs[@]} tarball(s) into $OUT_DIR"
+
+      # Provenance must be generated on a GitHub-hosted runner, which this
+      # runner is. Skipped on an empty plan: the action fails when it finds
+      # nothing to attest.
+      - name: 🔏 Attest the tarball
+        if: steps.pack.outputs.count != '0'
+        # actions/attest-for-npmsjs-com-0.1.2
+        uses: LedgerHQ/actions-security/actions/attest-for-npmsjs-com@c92cff0840fbb28663c0061698e5e8ac5228dcce
+        with:
+          subject-path: ${{ steps.pack.outputs.out-dir }}/packages
+
+      # Publishes the attested tarball byte for byte, then pushes the `v<version>`
+      # tag and creates the GitHub Release through the API.
+      - name: 🚀 Publish to JFrog, tag and release
+        id: publish
+        uses: changesets/action/publish@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
+        with:
+          script: pnpm exec changeset publish --from-pack-dir "${{ steps.pack.outputs.out-dir }}"
 
       - name: 📎 Attach CLI binaries to GitHub Release
+        if: steps.publish.outputs.published == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ fromJSON(steps.publish.outputs.published-packages)[0].version }}
           files: |
             dist/ledger-zcash-cli-macos-universal
             dist/ledger-zcash-cli-linux-x86_64
