@@ -64,8 +64,8 @@ pub enum Error {
     Craft(String),
 
     /// The default expiry would outlive the next network upgrade, and capping it
-    /// below that upgrade leaves too few blocks for nodes to accept the
-    /// transaction.
+    /// below that upgrade leaves too few blocks for nodes to still accept the
+    /// transaction once the user has signed it.
     #[error(
         "expiry too close to activation: target {target_height}, next upgrade at \
          {activation_height}, capped expiry {capped_expiry}"

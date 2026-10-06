@@ -1236,7 +1236,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_transaction(req).await.unwrap_err();
+        // The tip is injected, so the only network operation left is the
+        // anchor fetch: a connect failure can come from nowhere else.
+        let err = craft_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         // Must reach the anchor fetch (and fail there), not an earlier guard.
         assert!(
             !err.to_string().contains("no inputs"),
@@ -1984,7 +1988,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        // The tip is injected, so the witness fetch is the only network
+        // operation left: a connect failure can come from nowhere else.
+        let err = craft_ironwood_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             !err.to_string().contains("no inputs"),
             "should pass the input guard, got: {err}"
@@ -2042,7 +2050,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        // The tip is injected, so the anchor fetch is the only network
+        // operation left: a connect failure can come from nowhere else.
+        let err = craft_ironwood_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             !err.to_string().contains("no inputs"),
             "should pass the input guard, got: {err}"
@@ -2055,6 +2067,65 @@ mod tests {
             !err.to_string().contains("invalid destination address"),
             "Ironwood destination must decode, got: {err}"
         );
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "expected anchor-fetch connect failure, got: {err}"
+        );
+    }
+
+    /// Public→Ironwood request on a refused port, with the given anchor height.
+    fn public_to_ironwood_request(anchor_height: Option<u32>) -> IronwoodCraftRequest {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
+        let (ua, _) = ufvk
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+        IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: keys.ufvk.clone(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 15_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![IronwoodOutputRequestDto {
+                address: ua.encode(&Network::MainNetwork),
+                value_zat: 10_000,
+                memo: None,
+            }],
+            anchor_height,
+        }
+    }
+
+    /// The Ironwood path applies the same height rule as the Orchard one: an
+    /// explicit anchor above the tip is refused before any network operation.
+    #[tokio::test]
+    async fn ironwood_craft_rejects_explicit_anchor_above_tip() {
+        let err = craft_ironwood_transaction_with_tip(
+            public_to_ironwood_request(Some(OFFLINE_TIP + 1)),
+            offline_tip,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("above the chain tip"), "{err}");
+    }
+
+    /// With the anchor omitted, the Ironwood path derives it from the injected
+    /// tip and goes straight to the anchor fetch, without querying the tip
+    /// itself.
+    #[tokio::test]
+    async fn ironwood_craft_derives_the_anchor_from_the_injected_tip() {
+        let err = craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "expected anchor-fetch connect failure, got: {err}"
