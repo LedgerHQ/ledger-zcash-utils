@@ -44,9 +44,12 @@ use zcash_protocol::consensus::Network;
 
 // ── Captured vector (real testnet data, see module doc) ──────────────────────
 
-/// Height the anchor below was captured at (also the `target_height` basis for
-/// the build below, since NU6.3 must be active at `target_height`).
+/// Height the anchor below was captured at.
 const ANCHOR_HEIGHT: u32 = 4_193_460;
+
+/// Height the build below targets: past `ANCHOR_HEIGHT` and past NU6.3
+/// activation, which must be active at `target_height`.
+const TARGET_HEIGHT: u32 = ANCHOR_HEIGHT + 40;
 
 /// Real Ironwood anchor (commitment-tree root) at `ANCHOR_HEIGHT`. The only
 /// captured value this file's test actually consumes.
@@ -172,7 +175,8 @@ fn build_ironwood_transaction_with_real_testnet_anchor_produces_valid_v6_pczt() 
 
     let inputs = IronwoodBuildInputs {
         network: Network::TestNetwork.into(),
-        target_height: ANCHOR_HEIGHT + zcash_crypto::craft::DEFAULT_TX_EXPIRY_DELTA,
+        target_height: TARGET_HEIGHT,
+        anchor_height: ANCHOR_HEIGHT,
         ironwood_fvk: None, // no real Ironwood spends
         ovk,
         change_address: Some(change_address),

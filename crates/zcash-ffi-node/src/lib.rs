@@ -365,6 +365,9 @@ pub struct BuildTransactionParams {
     /// Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows.
     pub transparent_inputs: Vec<TransparentInputJs>,
     pub outputs: Vec<OutputRequestJs>,
+    /// Explicit anchor height; omitted → `tip − 10`. An explicit height above the
+    /// tip is rejected. The transaction always targets the next block, `tip + 1`,
+    /// so the chain tip is queried in either case.
     pub anchor_height: Option<u32>,
 }
 
@@ -376,7 +379,7 @@ pub struct BuildTransactionResult {
     pub pczt_hex: String,
     /// Decimal fee in zatoshis.
     pub fee_zat: String,
-    /// Block height the Merkle paths were computed against.
+    /// Block height the Merkle paths were computed against (the resolved anchor).
     pub anchor_height: u32,
     /// Orchard action count after dummy padding.
     pub n_actions_orchard: u32,
@@ -532,6 +535,9 @@ pub struct BuildIronwoodTransactionParams {
     /// Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows.
     pub transparent_inputs: Vec<TransparentInputJs>,
     pub outputs: Vec<IronwoodOutputRequestJs>,
+    /// Explicit anchor height; omitted → `tip − 10`. An explicit height above the
+    /// tip is rejected. The transaction always targets the next block, `tip + 1`,
+    /// so the chain tip is queried in either case.
     pub anchor_height: Option<u32>,
 }
 
@@ -544,7 +550,7 @@ pub struct BuildIronwoodTransactionResult {
     pub pczt_hex: String,
     /// Decimal fee in zatoshis.
     pub fee_zat: String,
-    /// Block height the Merkle paths were computed against.
+    /// Block height the Merkle paths were computed against (the resolved anchor).
     pub anchor_height: u32,
     /// Ironwood action count after dummy padding.
     pub n_actions_ironwood: u32,

@@ -101,13 +101,20 @@ const result: BuildTransactionResult = await buildTransaction({
       memo: "thanks!",
     },
   ],
-  // Optional: pin the Merkle anchor. Defaults to a recent confirmed height.
+  // Optional: pin the Merkle anchor. Defaults to `tip - 10`; a height above the
+  // tip is rejected. The transaction always targets the next block (`tip + 1`),
+  // so the chain tip is queried either way.
   // anchorHeight: 280500,
 });
 
 // result.pcztHex        — canonical PCZT bytes (hex), ready for the device
 // result.feeZat         — fee applied (decimal zatoshis)
 // result.anchorHeight   — height the Merkle paths were computed against
+//
+// The expiry is the upstream builder's default for the target block, lowered to
+// one block below the next network upgrade when one is ahead. When that leaves
+// fewer than 3 blocks of validity the craft is refused with an error starting
+// `expiry too close to activation`; retry once the upgrade has activated.
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex);
 ```

@@ -32,33 +32,33 @@ fn anchor_height_from_tip(tip: u32, anchor_depth_blocks: Option<u32>) -> u32 {
     tip.saturating_sub(depth).max(1)
 }
 
-/// Resolve the anchor height for a flow that does not otherwise contact the
-/// witness orchestrator — the transparent-only Public→Public path, which builds
-/// no Orchard bundle and therefore never calls [`compute_witnesses`] or
-/// [`fetch_orchard_anchor`].
+/// Anchor height for a craft, given the chain `tip` queried once for it.
 ///
-/// Returns an explicit `anchor_height` verbatim without any network I/O;
-/// otherwise queries the chain tip and resolves `tip - anchor_depth_blocks`
-/// (see [`resolve_from_tip`]). This keeps the transaction's target/expiry height
-/// anchored to the live tip on the transparent path, matching the shielded
-/// flows.
+/// An `explicit` height is kept verbatim, but must not lie above the tip: the
+/// chain has no tree state there yet. Otherwise the anchor is
+/// `tip - DEFAULT_ANCHOR_DEPTH_BLOCKS` (clamped to a minimum of height 1).
 ///
 /// # Errors
 ///
-/// Returns an error if resolution needs the tip and the gRPC connection or
-/// `GetLatestBlock` call fails.
-pub async fn resolve_anchor_height(
-    grpc_url: &str,
-    anchor_height: Option<u32>,
-    anchor_depth_blocks: Option<u32>,
-) -> Result<u32> {
-    if let Some(h) = anchor_height {
-        return Ok(h);
+/// Returns an error if `explicit` is above `tip`.
+pub(crate) fn resolve_anchor_from_tip(tip: u32, explicit: Option<u32>) -> Result<u32> {
+    match explicit {
+        Some(height) if height > tip => Err(anyhow!(
+            "anchor_height {height} is above the chain tip {tip}"
+        )),
+        Some(height) => Ok(height),
+        None => Ok(anchor_height_from_tip(tip, None)),
     }
-    let channel = connect(grpc_url).await?;
-    let mut client: CompactTxStreamerClient<Channel> = CompactTxStreamerClient::new(channel);
-    let tip = chain_tip_with_client(&mut client).await?;
-    Ok(anchor_height_from_tip(tip, anchor_depth_blocks))
+}
+
+/// Height of the block a transaction crafted at `tip` is built for: the next one.
+///
+/// # Errors
+///
+/// Returns an error if `tip + 1` overflows.
+pub(crate) fn next_block_height(tip: u32) -> Result<u32> {
+    tip.checked_add(1)
+        .ok_or_else(|| anyhow!("target_height overflow"))
 }
 
 /// The shielded pool a witness/anchor is computed against. Orchard and Ironwood
@@ -628,6 +628,49 @@ mod tests {
         compact_formats::{CompactBlock, CompactOrchardAction, CompactTx},
         service::SubtreeRoot,
     };
+
+    // ── Height arithmetic ─────────────────────────────────────────────────────
+
+    #[test]
+    fn next_block_height_is_tip_plus_one() {
+        assert_eq!(next_block_height(2_800_000).unwrap(), 2_800_001);
+        assert_eq!(next_block_height(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn next_block_height_errors_on_overflow() {
+        assert!(next_block_height(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn resolve_anchor_defaults_to_tip_minus_depth() {
+        assert_eq!(resolve_anchor_from_tip(1_000, None).unwrap(), 990);
+        // Clamped to height 1 on a very young chain.
+        assert_eq!(resolve_anchor_from_tip(5, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn resolve_anchor_keeps_explicit_height_verbatim() {
+        assert_eq!(resolve_anchor_from_tip(1_000, Some(400)).unwrap(), 400);
+        assert_eq!(resolve_anchor_from_tip(1_000, Some(1_000)).unwrap(), 1_000);
+    }
+
+    #[test]
+    fn resolve_anchor_rejects_explicit_height_above_tip() {
+        let err = resolve_anchor_from_tip(1_000, Some(1_001)).unwrap_err();
+        assert!(err.to_string().contains("above the chain tip"), "{err}");
+    }
+
+    /// The composition the craft path relies on: for any tip the anchor sits ten
+    /// blocks below it and the target is the next block, so a change to either
+    /// constant cannot silently move the other.
+    #[test]
+    fn anchor_and_target_compose_from_the_same_tip() {
+        for tip in [11u32, 100, 2_800_000, u32::MAX - 1] {
+            assert_eq!(resolve_anchor_from_tip(tip, None).unwrap(), tip - 10);
+            assert_eq!(next_block_height(tip).unwrap(), tip + 1);
+        }
+    }
 
     // ── 1. push_block_cmxs collects in tx/action order ────────────────────────
 
