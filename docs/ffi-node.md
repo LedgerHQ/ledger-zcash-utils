@@ -113,8 +113,15 @@ const result: BuildTransactionResult = await buildTransaction({
 //
 // The expiry is the upstream builder's default for the target block, lowered to
 // one block below the next network upgrade when one is ahead. When that leaves
-// fewer than 3 blocks of validity the craft is refused with an error starting
-// `expiry too close to activation`; retry once the upgrade has activated.
+// fewer than 8 blocks of validity (zcashd's 3-block expiring-soon rule, plus 5
+// blocks for signing on the device) the craft is refused with an error whose
+// message contains `expiry too close to activation`; retry once the upgrade has
+// activated.
+//
+// The target is the block after the tip reported by the indexer at `grpcUrl`.
+// An indexer lagging the chain across an activation yields the branch id and
+// the expiry cap of a height the network has already passed, and nodes reject
+// the transaction: point it at an indexer that follows the chain tip.
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex);
 ```

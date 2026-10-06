@@ -129,10 +129,21 @@ use crate::network::AnyZcashNetwork;
 use crate::network::ZCASH_REGTEST;
 
 /// Minimum number of blocks a transaction must remain valid for, counted from
-/// the block it targets, for nodes to accept it into their mempool. Mirrors
-/// zcashd's `TX_EXPIRING_SOON_THRESHOLD`, which rejects a transaction when
+/// the next block, for zcashd to accept and relay it. Mirrors zcashd's
+/// `TX_EXPIRING_SOON_THRESHOLD`, which rejects a transaction when
 /// `next_block_height + 3 > expiry_height`.
 const EXPIRING_SOON_THRESHOLD: u32 = 3;
+
+/// Blocks allowed to pass between crafting and broadcast: the user reviews and
+/// signs on the device in between. zcashd applies the expiring-soon rule to its
+/// own next block at acceptance, not to the craft-time target, so every block
+/// mined during signing eats into the margin. Five blocks cover about six
+/// minutes at 75-second spacing and about two at 25 seconds.
+const SIGNING_MARGIN_BLOCKS: u32 = 5;
+
+/// Fewest blocks of validity, counted from the target, that a crafted
+/// transaction must keep to still be accepted when broadcast after signing.
+const MIN_VALIDITY_BLOCKS: u32 = EXPIRING_SOON_THRESHOLD + SIGNING_MARGIN_BLOCKS;
 
 /// The network upgrade that follows `nu`, or `None` for the last one this crate
 /// knows about.
@@ -182,8 +193,8 @@ fn next_activation_height(network: &AnyZcashNetwork, target: BlockHeight) -> Opt
 /// # Errors
 ///
 /// [`Error::ExpiryTooCloseToActivation`] when the capped expiry leaves fewer
-/// than [`EXPIRING_SOON_THRESHOLD`] blocks after `target`: nodes would reject
-/// the transaction, so it is not produced.
+/// than [`MIN_VALIDITY_BLOCKS`] blocks after `target`: by the time the user has
+/// signed it, nodes could refuse to accept or relay it, so it is not produced.
 fn cap_expiry_below_next_activation(
     network: &AnyZcashNetwork,
     target: BlockHeight,
@@ -197,7 +208,7 @@ fn cap_expiry_below_next_activation(
     };
     // `activation > target >= 0`, so the subtraction cannot underflow.
     let capped = expiry.min(activation - 1);
-    if u32::from(capped) < u32::from(target).saturating_add(EXPIRING_SOON_THRESHOLD) {
+    if u32::from(capped) < u32::from(target).saturating_add(MIN_VALIDITY_BLOCKS) {
         return Err(Error::ExpiryTooCloseToActivation {
             target_height: u32::from(target),
             activation_height: u32::from(activation),
@@ -4610,22 +4621,22 @@ mod tests {
     }
 
     #[test]
-    fn cap_accepts_exactly_the_expiring_soon_threshold() {
-        // A = target + 4 -> capped = target + 3, which still clears the threshold.
-        let network = regtest_with_next_upgrade_at(14);
+    fn cap_accepts_exactly_the_minimum_validity() {
+        // A = target + 9 -> capped = target + 8, exactly the minimum validity.
+        let network = regtest_with_next_upgrade_at(19);
         let capped = cap_expiry_below_next_activation(
             &network,
             BlockHeight::from_u32(10),
             BlockHeight::from_u32(50),
         )
         .unwrap();
-        assert_eq!(capped, BlockHeight::from_u32(13));
+        assert_eq!(capped, BlockHeight::from_u32(18));
     }
 
     #[test]
     fn cap_refuses_when_too_few_blocks_remain() {
-        // A = target + 3 -> capped = target + 2, below the threshold.
-        let network = regtest_with_next_upgrade_at(13);
+        // A = target + 8 -> capped = target + 7, one block short of the minimum.
+        let network = regtest_with_next_upgrade_at(18);
         let err = cap_expiry_below_next_activation(
             &network,
             BlockHeight::from_u32(10),
@@ -4636,8 +4647,8 @@ mod tests {
             err,
             Error::ExpiryTooCloseToActivation {
                 target_height: 10,
-                activation_height: 13,
-                capped_expiry: 12
+                activation_height: 18,
+                capped_expiry: 17
             }
         ));
     }
