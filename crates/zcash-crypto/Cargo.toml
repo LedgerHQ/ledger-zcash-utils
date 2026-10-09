@@ -15,6 +15,10 @@ path = "src/lib.rs"
 # On by default so zcash-sync and zcash-ffi-node inherit it transitively.
 default = ["transparent-inputs"]
 transparent-inputs = ["zcash_keys/transparent-inputs", "zcash_primitives/transparent-inputs"]
+# Creates Orchard and Ironwood proofs on every core (halo2's rayon backend).
+# Off by default: a consumer that must not fan out (a phone, a constrained host)
+# keeps single-threaded proving unless it opts in.
+multicore = ["orchard/multicore"]
 
 [dependencies]
 # zcash_client_backend: only the `orchard` feature is needed here.
