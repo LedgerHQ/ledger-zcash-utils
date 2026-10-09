@@ -128,9 +128,100 @@ use crate::network::AnyZcashNetwork;
 #[cfg(test)]
 use crate::network::ZCASH_REGTEST;
 
-/// Default expiry delta in blocks. Matches `DEFAULT_TX_EXPIRY_DELTA` in
-/// `zcash_primitives::transaction::builder`.
-pub const DEFAULT_TX_EXPIRY_DELTA: u32 = 40;
+/// Minimum number of blocks a transaction must remain valid for, counted from
+/// the next block, for zcashd to accept and relay it. Mirrors zcashd's
+/// `TX_EXPIRING_SOON_THRESHOLD` (`src/main.h`), which rejects a transaction
+/// when `next_block_height + 3 > expiry_height`.
+const EXPIRING_SOON_THRESHOLD: u32 = 3;
+
+/// Blocks allowed to pass between crafting and broadcast: the user reviews and
+/// signs on the device in between. zcashd applies the expiring-soon rule to its
+/// own next block at acceptance, not to the craft-time target, so every block
+/// mined during signing eats into the margin. Five blocks cover about six
+/// minutes at 75-second spacing and about two at the 25 seconds ZIP 218 sets
+/// from NU7 (`PostNU7PoWTargetSpacing`).
+const SIGNING_MARGIN_BLOCKS: u32 = 5;
+
+/// Fewest blocks of validity, counted from the target, that a crafted
+/// transaction must keep to still be accepted when broadcast after signing.
+const MIN_VALIDITY_BLOCKS: u32 = EXPIRING_SOON_THRESHOLD + SIGNING_MARGIN_BLOCKS;
+
+/// The network upgrade that follows `nu`, or `None` for the last one this crate
+/// knows about.
+///
+/// Deliberately an exhaustive `match` with no wildcard arm: `zcash_protocol`
+/// keeps its own ordered list private, so a new [`NetworkUpgrade`] variant must
+/// break this build rather than silently drop out of the activation walk.
+fn next_upgrade(nu: NetworkUpgrade) -> Option<NetworkUpgrade> {
+    match nu {
+        NetworkUpgrade::Overwinter => Some(NetworkUpgrade::Sapling),
+        NetworkUpgrade::Sapling => Some(NetworkUpgrade::Blossom),
+        NetworkUpgrade::Blossom => Some(NetworkUpgrade::Heartwood),
+        NetworkUpgrade::Heartwood => Some(NetworkUpgrade::Canopy),
+        NetworkUpgrade::Canopy => Some(NetworkUpgrade::Nu5),
+        NetworkUpgrade::Nu5 => Some(NetworkUpgrade::Nu6),
+        NetworkUpgrade::Nu6 => Some(NetworkUpgrade::Nu6_1),
+        NetworkUpgrade::Nu6_1 => Some(NetworkUpgrade::Nu6_2),
+        NetworkUpgrade::Nu6_2 => Some(NetworkUpgrade::Nu6_3),
+        NetworkUpgrade::Nu6_3 => None,
+    }
+}
+
+/// The lowest activation height strictly above `target` among the upgrades the
+/// network defines a height for, or `None` when no later activation is known.
+fn next_activation_height(network: &AnyZcashNetwork, target: BlockHeight) -> Option<BlockHeight> {
+    let mut next: Option<BlockHeight> = None;
+    let mut nu = Some(NetworkUpgrade::Overwinter);
+    while let Some(current) = nu {
+        if let Some(height) = network.activation_height(current) {
+            if height > target && next.is_none_or(|n| height < n) {
+                next = Some(height);
+            }
+        }
+        nu = next_upgrade(current);
+    }
+    next
+}
+
+/// Lowers `expiry` so the transaction cannot outlive the next network upgrade.
+///
+/// Only upgrades the pinned `zcash_protocol` gives an activation height for are
+/// seen. On a named network whose last known upgrade is already active, there
+/// is nothing ahead to cap against until the dependency learns the next one.
+///
+/// A transaction commits to the branch id in force at `target`, so it can only
+/// be mined before the next activation height `A`; an expiry at or past `A`
+/// promises a validity window it cannot keep. The upstream-derived `expiry` is
+/// therefore capped at `A - 1` and never raised. Without a known later
+/// activation, or for a zero (non-expiring) value, `expiry` is returned as is.
+///
+/// # Errors
+///
+/// [`Error::ExpiryTooCloseToActivation`] when the capped expiry leaves fewer
+/// than [`MIN_VALIDITY_BLOCKS`] blocks after `target`: by the time the user has
+/// signed it, nodes could refuse to accept or relay it, so it is not produced.
+fn cap_expiry_below_next_activation(
+    network: &AnyZcashNetwork,
+    target: BlockHeight,
+    expiry: BlockHeight,
+) -> Result<BlockHeight, Error> {
+    if u32::from(expiry) == 0 {
+        return Ok(expiry);
+    }
+    let Some(activation) = next_activation_height(network, target) else {
+        return Ok(expiry);
+    };
+    // `activation > target >= 0`, so the subtraction cannot underflow.
+    let capped = expiry.min(activation - 1);
+    if u32::from(capped) < u32::from(target).saturating_add(MIN_VALIDITY_BLOCKS) {
+        return Err(Error::ExpiryTooCloseToActivation {
+            target_height: u32::from(target),
+            activation_height: u32::from(activation),
+            capped_expiry: u32::from(capped),
+        });
+    }
+    Ok(capped)
+}
 
 /// Coin type used when stamping a ZIP-32/BIP-44 derivation path into a PCZT.
 ///
@@ -247,9 +338,14 @@ pub struct OutputRequest {
 /// Inputs to [`build_transaction`].
 pub struct BuildInputs {
     pub network: AnyZcashNetwork,
-    /// Target block height. Builder uses `target + DEFAULT_TX_EXPIRY_DELTA` for
-    /// the expiry. Branch ID is derived from this height.
+    /// Height of the block the transaction is built for (the next block). The
+    /// branch ID and the Orchard proving key are derived from this height. The
+    /// expiry is the builder's default for it, lowered below the next network
+    /// upgrade when one is ahead.
     pub target_height: u32,
+    /// Height the anchor and witnesses were resolved at; reported back unchanged
+    /// in [`BuildOutput::anchor_height`].
+    pub anchor_height: u32,
     /// Orchard full viewing key (extracted from the UFVK). Required (`Some`)
     /// only when an Orchard bundle will be present (Orchard spends or Orchard
     /// outputs). `None` is valid for the transparent-only Public→Public flow,
@@ -312,7 +408,7 @@ pub struct BuildOutput {
     /// Fee in zatoshis. Echoes the caller-supplied fee, which has been
     /// validated against ZIP-317 for the final action layout.
     pub fee: u64,
-    /// Anchor height (== `target_height - DEFAULT_TX_EXPIRY_DELTA`, clamped).
+    /// Anchor height the caller resolved the witnesses at, echoed unchanged.
     pub anchor_height: u32,
     /// Orchard action count after dummy padding.
     pub n_actions_orchard: u32,
@@ -363,6 +459,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     let BuildInputs {
         network,
         target_height,
+        anchor_height,
         orchard_fvk,
         ovk,
         change_address,
@@ -593,7 +690,11 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
         .as_ref()
         .map_or(0u32, |b| b.actions().len() as u32);
 
-    let pczt: Pczt = Creator::build_from_parts(pczt_result.pczt_parts).ok_or_else(|| {
+    let mut pczt_parts = pczt_result.pczt_parts;
+    pczt_parts.expiry_height =
+        cap_expiry_below_next_activation(&network, target, pczt_parts.expiry_height)?;
+
+    let pczt: Pczt = Creator::build_from_parts(pczt_parts).ok_or_else(|| {
         Error::Craft("PCZT Creator rejected the PcztParts (unsupported tx version)".into())
     })?;
 
@@ -653,7 +754,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     Ok(BuildOutput {
         pczt_bytes,
         fee,
-        anchor_height: target_height.saturating_sub(DEFAULT_TX_EXPIRY_DELTA),
+        anchor_height,
         n_actions_orchard,
         n_transparent_inputs,
         n_transparent_outputs,
@@ -1083,10 +1184,15 @@ pub struct IronwoodOutputRequest {
 /// Inputs to [`build_ironwood_transaction`].
 pub struct IronwoodBuildInputs {
     pub network: AnyZcashNetwork,
-    /// Target block height. Builder uses `target + DEFAULT_TX_EXPIRY_DELTA` for
-    /// the expiry. Branch ID is derived from this height and must resolve to
-    /// `Nu6_3` (or later) for the Ironwood bundle to be available.
+    /// Height of the block the transaction is built for (the next block). The
+    /// branch ID is derived from this height and must resolve to `Nu6_3` (or
+    /// later) for the Ironwood bundle to be available. The expiry is the
+    /// builder's default for it, lowered below the next network upgrade when one
+    /// is ahead.
     pub target_height: u32,
+    /// Height the anchor and witnesses were resolved at; reported back unchanged
+    /// in [`BuildOutput::anchor_height`].
+    pub anchor_height: u32,
     /// Orchard/Ironwood full viewing key (the same key type spends from either
     /// pool — see [`IronwoodDestination`]). Required (`Some`) only when
     /// Ironwood spends are present.
@@ -1160,6 +1266,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     let IronwoodBuildInputs {
         network,
         target_height,
+        anchor_height,
         ironwood_fvk,
         ovk,
         change_address,
@@ -1373,7 +1480,11 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
         .as_ref()
         .map_or(0u32, |b| b.actions().len() as u32);
 
-    let pczt: Pczt = Creator::build_from_parts(pczt_result.pczt_parts).ok_or_else(|| {
+    let mut pczt_parts = pczt_result.pczt_parts;
+    pczt_parts.expiry_height =
+        cap_expiry_below_next_activation(&network, target, pczt_parts.expiry_height)?;
+
+    let pczt: Pczt = Creator::build_from_parts(pczt_parts).ok_or_else(|| {
         Error::Craft("PCZT Creator rejected the PcztParts (unsupported tx version)".into())
     })?;
 
@@ -1418,7 +1529,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     Ok(BuildOutput {
         pczt_bytes,
         fee,
-        anchor_height: target_height.saturating_sub(DEFAULT_TX_EXPIRY_DELTA),
+        anchor_height,
         n_actions_orchard: 0,
         n_transparent_inputs,
         n_transparent_outputs,
@@ -1771,6 +1882,7 @@ mod tests {
         IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: Some(fvk),
             ovk,
             change_address: Some(change),
@@ -1832,6 +1944,7 @@ mod tests {
         BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk),
             ovk,
             change_address: Some(change),
@@ -1929,6 +2042,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -1987,6 +2101,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2027,6 +2142,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2075,6 +2191,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2109,6 +2226,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: 100,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2272,6 +2390,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2316,6 +2435,7 @@ mod tests {
         let inputs = BuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu5_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(change),
@@ -2540,6 +2660,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2602,6 +2723,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2668,6 +2790,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2728,6 +2851,7 @@ mod tests {
         BuildInputs {
             network: network.into(),
             target_height,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2827,6 +2951,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -2954,6 +3079,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3025,6 +3151,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3133,6 +3260,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3205,6 +3333,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3286,6 +3415,7 @@ mod tests {
         let inputs = BuildInputs {
             network: network.into(),
             target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             // Orchard change address is supplied but must NOT be used here: with
@@ -3552,6 +3682,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3620,6 +3751,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: None,
             change_address: None, // intentionally missing
@@ -3692,6 +3824,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -3756,6 +3889,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
             // An Ironwood change address is supplied but must NOT be used here:
@@ -3953,6 +4087,7 @@ mod tests {
         IronwoodBuildInputs {
             network: network.into(),
             target_height: nu6_3_activation_height(network) + 1,
+            anchor_height: 1,
             ironwood_fvk: Some(fvk.clone()),
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -4125,6 +4260,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: Network::MainNetwork.into(),
             target_height: nu6_3_activation_height(Network::MainNetwork) + 1,
+            anchor_height: 1,
             ironwood_fvk: None,
             ovk: None,
             change_address: None,
@@ -4189,6 +4325,7 @@ mod tests {
         let inputs = BuildInputs {
             network: AnyZcashNetwork::Local(ZCASH_REGTEST),
             target_height: 3,
+            anchor_height: 1,
             orchard_fvk: None,
             ovk: None,
             change_address: None,
@@ -4228,6 +4365,7 @@ mod tests {
             network: AnyZcashNetwork::Local(ZCASH_REGTEST),
             // ZCASH_REGTEST.nu5 == Some(2), so height 1 is one block before activation.
             target_height: 1,
+            anchor_height: 1,
             orchard_fvk: None,
             ovk: None,
             change_address: None,
@@ -4285,6 +4423,7 @@ mod tests {
         let inputs = IronwoodBuildInputs {
             network: AnyZcashNetwork::Local(ZCASH_REGTEST),
             target_height: 3,
+            anchor_height: 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
             change_address: Some(fvk.address_at(0u32, Scope::Internal)),
@@ -4334,6 +4473,328 @@ mod tests {
             matches!(&err, Error::Craft(s) if s.contains("NU6.3 is not active")),
             "the regtest gate must still reject a target_height below its own NU6.3 \
              activation height instead of accepting every height unconditionally; got: {err}"
+        );
+    }
+
+    // ── Expiry cap and activation boundaries ────────────────────────────────
+
+    use zcash_protocol::local_consensus::LocalNetwork;
+
+    /// Regtest with NU5 live from height 2 and a later upgrade (NU6.1) activating
+    /// at `activation`, with the upgrades after it left undefined.
+    fn regtest_with_next_upgrade_at(activation: u32) -> AnyZcashNetwork {
+        AnyZcashNetwork::Local(LocalNetwork {
+            nu6_1: Some(BlockHeight::from_u32(activation)),
+            nu6_2: None,
+            nu6_3: None,
+            ..ZCASH_REGTEST
+        })
+    }
+
+    fn transparent_only_inputs(network: AnyZcashNetwork, target_height: u32) -> BuildInputs {
+        let t_recv = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let fee = zip317_fee(0, 0, 1, 1);
+        let out_value = 10_000u64;
+        BuildInputs {
+            network,
+            target_height,
+            anchor_height: target_height - 1,
+            orchard_fvk: None,
+            ovk: None,
+            change_address: None,
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor: [0u8; 32],
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(out_value + fee)],
+            outputs: vec![OutputRequest {
+                destination: Destination::Transparent(t_recv),
+                value: out_value,
+                memo: None,
+            }],
+        }
+    }
+
+    fn expiry_of(pczt_bytes: &[u8]) -> u32 {
+        crate::parse::parse_pczt(pczt_bytes)
+            .expect("parse")
+            .global
+            .expiry_height
+    }
+
+    #[test]
+    fn next_upgrade_walks_the_sequence_and_ends_at_nu6_3() {
+        let mut seen = vec![NetworkUpgrade::Overwinter];
+        while let Some(next) = next_upgrade(*seen.last().unwrap()) {
+            seen.push(next);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                NetworkUpgrade::Overwinter,
+                NetworkUpgrade::Sapling,
+                NetworkUpgrade::Blossom,
+                NetworkUpgrade::Heartwood,
+                NetworkUpgrade::Canopy,
+                NetworkUpgrade::Nu5,
+                NetworkUpgrade::Nu6,
+                NetworkUpgrade::Nu6_1,
+                NetworkUpgrade::Nu6_2,
+                NetworkUpgrade::Nu6_3,
+            ]
+        );
+    }
+
+    #[test]
+    fn next_activation_height_is_none_past_the_last_known_upgrade() {
+        let network = AnyZcashNetwork::Named(Network::MainNetwork);
+        let past = BlockHeight::from_u32(nu6_3_activation_height(Network::MainNetwork) + 1);
+        assert_eq!(next_activation_height(&network, past), None);
+    }
+
+    #[test]
+    fn next_activation_height_finds_the_upcoming_upgrade() {
+        let network = regtest_with_next_upgrade_at(100);
+        assert_eq!(
+            next_activation_height(&network, BlockHeight::from_u32(50)),
+            Some(BlockHeight::from_u32(100))
+        );
+        // At the activation height itself the upgrade is no longer ahead.
+        assert_eq!(
+            next_activation_height(&network, BlockHeight::from_u32(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn cap_leaves_expiry_unchanged_without_a_later_activation() {
+        let network = AnyZcashNetwork::Named(Network::MainNetwork);
+        let target = BlockHeight::from_u32(nu6_3_activation_height(Network::MainNetwork) + 1);
+        let expiry = target + 40;
+        assert_eq!(
+            cap_expiry_below_next_activation(&network, target, expiry).unwrap(),
+            expiry
+        );
+    }
+
+    #[test]
+    fn cap_leaves_expiry_below_the_activation_unchanged() {
+        let network = regtest_with_next_upgrade_at(1_000);
+        let target = BlockHeight::from_u32(10);
+        assert_eq!(
+            cap_expiry_below_next_activation(&network, target, BlockHeight::from_u32(50)).unwrap(),
+            BlockHeight::from_u32(50)
+        );
+    }
+
+    #[test]
+    fn cap_lowers_expiry_to_one_below_the_activation() {
+        let network = regtest_with_next_upgrade_at(30);
+        let target = BlockHeight::from_u32(10);
+        assert_eq!(
+            cap_expiry_below_next_activation(&network, target, BlockHeight::from_u32(50)).unwrap(),
+            BlockHeight::from_u32(29)
+        );
+    }
+
+    #[test]
+    fn cap_never_raises_the_expiry() {
+        let network = regtest_with_next_upgrade_at(30);
+        let target = BlockHeight::from_u32(10);
+        assert_eq!(
+            cap_expiry_below_next_activation(&network, target, BlockHeight::from_u32(20)).unwrap(),
+            BlockHeight::from_u32(20)
+        );
+    }
+
+    #[test]
+    fn cap_keeps_a_zero_expiry() {
+        let network = regtest_with_next_upgrade_at(30);
+        assert_eq!(
+            cap_expiry_below_next_activation(
+                &network,
+                BlockHeight::from_u32(10),
+                BlockHeight::from_u32(0)
+            )
+            .unwrap(),
+            BlockHeight::from_u32(0)
+        );
+    }
+
+    #[test]
+    fn cap_accepts_exactly_the_minimum_validity() {
+        // A = target + 9 -> capped = target + 8, exactly the minimum validity.
+        let network = regtest_with_next_upgrade_at(19);
+        let capped = cap_expiry_below_next_activation(
+            &network,
+            BlockHeight::from_u32(10),
+            BlockHeight::from_u32(50),
+        )
+        .unwrap();
+        assert_eq!(capped, BlockHeight::from_u32(18));
+    }
+
+    #[test]
+    fn cap_refuses_when_too_few_blocks_remain() {
+        // A = target + 8 -> capped = target + 7, one block short of the minimum.
+        let network = regtest_with_next_upgrade_at(18);
+        let err = cap_expiry_below_next_activation(
+            &network,
+            BlockHeight::from_u32(10),
+            BlockHeight::from_u32(50),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::ExpiryTooCloseToActivation {
+                target_height: 10,
+                activation_height: 18,
+                capped_expiry: 17
+            }
+        ));
+    }
+
+    /// The cap is not a regtest artefact: on a named network it applies below
+    /// any activation the pinned parameters know, here mainnet NU6.3.
+    #[test]
+    fn orchard_path_caps_on_a_named_network_before_a_known_activation() {
+        let activation = nu6_3_activation_height(Network::MainNetwork);
+        let target = activation - 20;
+        let out = build_transaction(transparent_only_inputs(
+            AnyZcashNetwork::Named(Network::MainNetwork),
+            target,
+        ))
+        .unwrap();
+        assert_eq!(expiry_of(&out.pczt_bytes), activation - 1);
+    }
+
+    #[test]
+    fn orchard_path_refuses_on_a_named_network_close_to_a_known_activation() {
+        let activation = nu6_3_activation_height(Network::MainNetwork);
+        let err = build_transaction(transparent_only_inputs(
+            AnyZcashNetwork::Named(Network::MainNetwork),
+            activation - 5,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ExpiryTooCloseToActivation { .. }),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn orchard_path_keeps_the_builder_expiry_far_from_an_activation() {
+        let target = 10u32;
+        let out = build_transaction(transparent_only_inputs(
+            regtest_with_next_upgrade_at(10_000),
+            target,
+        ))
+        .unwrap();
+        assert_eq!(
+            expiry_of(&out.pczt_bytes),
+            target + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
+        );
+    }
+
+    #[test]
+    fn orchard_path_caps_the_expiry_below_the_next_activation() {
+        let target = 10u32;
+        let out = build_transaction(transparent_only_inputs(
+            regtest_with_next_upgrade_at(target + 20),
+            target,
+        ))
+        .unwrap();
+        assert_eq!(expiry_of(&out.pczt_bytes), target + 19);
+    }
+
+    #[test]
+    fn orchard_path_refuses_close_to_an_activation() {
+        let target = 10u32;
+        let err = build_transaction(transparent_only_inputs(
+            regtest_with_next_upgrade_at(target + 2),
+            target,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ExpiryTooCloseToActivation {
+                    target_height: 10,
+                    activation_height: 12,
+                    capped_expiry: 11
+                }
+            ),
+            "got: {err}"
+        );
+        assert!(err
+            .to_string()
+            .starts_with("expiry too close to activation"));
+    }
+
+    #[test]
+    fn orchard_path_reports_the_given_anchor_not_one_derived_from_the_target() {
+        let mut inputs = transparent_only_inputs(AnyZcashNetwork::Local(ZCASH_REGTEST), 100);
+        inputs.anchor_height = 90;
+        let out = build_transaction(inputs).unwrap();
+        // 90 is neither target - 40 nor target - 1.
+        assert_eq!(out.anchor_height, 90);
+    }
+
+    #[test]
+    fn ironwood_path_keeps_the_builder_expiry_and_reports_the_given_anchor() {
+        let fvk = make_fvk();
+        let recipient = fvk.address_at(0u32, Scope::External);
+        let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+        let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+            .into_option()
+            .unwrap();
+        let anchor_note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .unwrap();
+        let leaf =
+            MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
+        let (anchor, _path) = synthetic_anchor_and_path(leaf);
+        let fee = zip317_fee_ironwood(0, 1, 1, 0);
+        let out_value = 10_000u64;
+
+        let target = 50u32;
+        let out = build_ironwood_transaction(IronwoodBuildInputs {
+            network: AnyZcashNetwork::Local(ZCASH_REGTEST),
+            target_height: target,
+            anchor_height: 33,
+            ironwood_fvk: None,
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(out_value + fee)],
+            outputs: vec![IronwoodOutputRequest {
+                destination: IronwoodDestination::Ironwood(recipient),
+                value: out_value,
+                memo: None,
+            }],
+        })
+        .unwrap();
+        assert_eq!(out.anchor_height, 33);
+        assert_eq!(
+            expiry_of(&out.pczt_bytes),
+            target + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
         );
     }
 }

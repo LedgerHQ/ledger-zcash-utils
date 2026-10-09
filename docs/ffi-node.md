@@ -101,13 +101,33 @@ const result: BuildTransactionResult = await buildTransaction({
       memo: "thanks!",
     },
   ],
-  // Optional: pin the Merkle anchor. Defaults to a recent confirmed height.
+  // Optional: pin the Merkle anchor. Defaults to `tip - 10`; a height above the
+  // tip is rejected. The transaction always targets the next block (`tip + 1`),
+  // so the chain tip is queried either way.
   // anchorHeight: 280500,
 });
 
 // result.pcztHex        — canonical PCZT bytes (hex), ready for the device
 // result.feeZat         — fee applied (decimal zatoshis)
 // result.anchorHeight   — height the Merkle paths were computed against
+//
+// The expiry is the upstream builder's default for the target block, lowered to
+// one block below the next network upgrade when one is ahead. "Ahead" means an
+// upgrade the bundled consensus parameters give a height for: with the current
+// `zcash_protocol` pin, mainnet and testnet have none past NU6.3, so the cap only
+// takes effect for NU7 once a release carrying NU7's heights ships. When the cap
+// leaves fewer than 8 blocks of validity (zcashd's 3-block expiring-soon rule, plus 5
+// blocks for signing on the device) the craft is refused with an error whose
+// message contains `expiry too close to activation`; retry once the upgrade has
+// activated.
+//
+// The target is the block after the tip reported by the indexer at `grpcUrl`.
+// An indexer lagging the chain across an activation yields the branch id and
+// the expiry cap of a height the network has already passed, and nodes reject
+// the transaction: point it at an indexer that follows the chain tip. For the
+// same reason an explicit `anchorHeight` above that indexer's tip is refused
+// (`anchor_height … is above the chain tip …`): pass an anchor the indexer has
+// already seen, or omit it.
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex);
 ```
