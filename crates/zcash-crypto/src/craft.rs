@@ -130,15 +130,16 @@ use crate::network::ZCASH_REGTEST;
 
 /// Minimum number of blocks a transaction must remain valid for, counted from
 /// the next block, for zcashd to accept and relay it. Mirrors zcashd's
-/// `TX_EXPIRING_SOON_THRESHOLD`, which rejects a transaction when
-/// `next_block_height + 3 > expiry_height`.
+/// `TX_EXPIRING_SOON_THRESHOLD` (`src/main.h`), which rejects a transaction
+/// when `next_block_height + 3 > expiry_height`.
 const EXPIRING_SOON_THRESHOLD: u32 = 3;
 
 /// Blocks allowed to pass between crafting and broadcast: the user reviews and
 /// signs on the device in between. zcashd applies the expiring-soon rule to its
 /// own next block at acceptance, not to the craft-time target, so every block
 /// mined during signing eats into the margin. Five blocks cover about six
-/// minutes at 75-second spacing and about two at 25 seconds.
+/// minutes at 75-second spacing and about two at the 25 seconds ZIP 218 sets
+/// from NU7 (`PostNU7PoWTargetSpacing`).
 const SIGNING_MARGIN_BLOCKS: u32 = 5;
 
 /// Fewest blocks of validity, counted from the target, that a crafted
@@ -183,6 +184,10 @@ fn next_activation_height(network: &AnyZcashNetwork, target: BlockHeight) -> Opt
 }
 
 /// Lowers `expiry` so the transaction cannot outlive the next network upgrade.
+///
+/// Only upgrades the pinned `zcash_protocol` gives an activation height for are
+/// seen. On a named network whose last known upgrade is already active, there
+/// is nothing ahead to cap against until the dependency learns the next one.
 ///
 /// A transaction commits to the branch id in force at `target`, so it can only
 /// be mined before the next activation height `A`; an expiry at or past `A`
@@ -4651,6 +4656,34 @@ mod tests {
                 capped_expiry: 17
             }
         ));
+    }
+
+    /// The cap is not a regtest artefact: on a named network it applies below
+    /// any activation the pinned parameters know, here mainnet NU6.3.
+    #[test]
+    fn orchard_path_caps_on_a_named_network_before_a_known_activation() {
+        let activation = nu6_3_activation_height(Network::MainNetwork);
+        let target = activation - 20;
+        let out = build_transaction(transparent_only_inputs(
+            AnyZcashNetwork::Named(Network::MainNetwork),
+            target,
+        ))
+        .unwrap();
+        assert_eq!(expiry_of(&out.pczt_bytes), activation - 1);
+    }
+
+    #[test]
+    fn orchard_path_refuses_on_a_named_network_close_to_a_known_activation() {
+        let activation = nu6_3_activation_height(Network::MainNetwork);
+        let err = build_transaction(transparent_only_inputs(
+            AnyZcashNetwork::Named(Network::MainNetwork),
+            activation - 5,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ExpiryTooCloseToActivation { .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
