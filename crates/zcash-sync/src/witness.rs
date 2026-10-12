@@ -257,7 +257,13 @@ async fn find_pool_activation_height(
 /// shard 0 spans ~1.52M (NU5 at 1,842,420 → completed at 3,364,755). Those overlap,
 /// so a block count cannot tell them apart — hence a generous ceiling here and the
 /// precise check elsewhere.
-const MAX_FIRST_LEAF_SCAN_BLOCKS: u32 = 2_000_000;
+///
+/// The ceiling is calibrated from both sides. It must admit two years of growth of
+/// a shard 0 that is still the frontier at the shortest block spacing, 25 seconds
+/// since ZIP 218: 2,522,880 blocks. It must also stay below a genesis clamp on the
+/// live chains, which already spans more than 3.4M blocks on mainnet and testnet.
+/// A spacing change that moves either figure past this value breaks one of the two.
+const MAX_FIRST_LEAF_SCAN_BLOCKS: u32 = 3_000_000;
 
 /// Reject an implausibly wide first-leaf scan range before any block is fetched.
 fn check_first_leaf_scan_width(pool: Pool, first_leaf: u32, end_height: u32) -> Result<()> {
@@ -1198,6 +1204,31 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// The same two years of growth at ZIP 218's 25-second spacing (~2.52M blocks),
+    /// which triples the blocks a shard 0 accumulates over the same time.
+    #[test]
+    fn check_first_leaf_scan_width_admits_years_of_chain_growth_at_25s_spacing() {
+        let first_leaf = 3_428_144u32;
+        let two_years_of_blocks = 2 * 365 * 24 * 60 * 60 / 25;
+        assert!(
+            check_first_leaf_scan_width(
+                Pool::Ironwood,
+                first_leaf,
+                first_leaf + two_years_of_blocks
+            )
+            .is_ok()
+        );
+    }
+
+    /// A scan floored at genesis is still refused on both live chains. The end
+    /// heights are the mainnet and testnet tips on 2026-10-09; the chains only
+    /// grow, so this can only get further from the bound.
+    #[test]
+    fn check_first_leaf_scan_width_rejects_a_genesis_clamp_on_both_networks() {
+        assert!(check_first_leaf_scan_width(Pool::Ironwood, 1, 3_512_157).is_err());
+        assert!(check_first_leaf_scan_width(Pool::Ironwood, 1, 4_471_646).is_err());
     }
 
     /// Exactly at the bound is allowed; one block wider is not.
