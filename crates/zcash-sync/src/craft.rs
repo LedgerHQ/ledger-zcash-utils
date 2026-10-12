@@ -25,16 +25,17 @@ use zcash_crypto::{
     craft::{
         build_ironwood_transaction, build_transaction, BuildInputs, BuildOutput, Destination,
         IronwoodBuildInputs, IronwoodDestination, IronwoodOutputRequest, IronwoodSpendInput,
-        OrchardSpendInput, OutputRequest, TransparentInput, DEFAULT_TX_EXPIRY_DELTA,
+        OrchardSpendInput, OutputRequest, TransparentInput,
     },
     network::{parse_any_network, AnyZcashNetwork},
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 use zcash_transparent::keys::AccountPubKey;
 
+use crate::client::chain_tip;
 use crate::witness::{
     compute_ironwood_witnesses, compute_witnesses, fetch_ironwood_anchor, fetch_orchard_anchor,
-    resolve_anchor_height, NoteRef, WitnessRequest,
+    next_block_height, resolve_anchor_from_tip, NoteRef, WitnessRequest,
 };
 
 /// JS-facing spend descriptor — hex strings come directly from `ShieldedNote`.
@@ -130,13 +131,24 @@ pub struct CraftRequest {
     /// Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows.
     pub transparent_inputs: Vec<TransparentInputDto>,
     pub outputs: Vec<OutputRequestDto>,
-    /// Explicit anchor height; `None` ⇒ tip − 10 (defaults via the witness
-    /// orchestrator).
+    /// Explicit anchor height; `None` ⇒ `tip − 10`. An explicit height above the
+    /// tip is rejected. The transaction always targets the next block, `tip + 1`,
+    /// so the chain tip is queried in either case.
     pub anchor_height: Option<u32>,
 }
 
 /// Compute witnesses, decode addresses, then call the pure builder.
 pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
+    craft_transaction_with_tip(req, chain_tip).await
+}
+
+/// [`craft_transaction`] with the chain-tip query injected, so the height
+/// arithmetic and the build can be exercised without a live endpoint.
+async fn craft_transaction_with_tip<F, Fut>(req: CraftRequest, tip_source: F) -> Result<BuildOutput>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<u32>>,
+{
     let has_orchard_spends = !req.spends.is_empty();
     let has_transparent_inputs = !req.transparent_inputs.is_empty();
 
@@ -330,14 +342,20 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
     let transparent_change_pubkey = transparent_change.as_ref().map(|(_, pk, _)| *pk);
     let transparent_change_address_index = transparent_change.as_ref().map(|(_, _, i)| *i);
 
-    // ── 4. Anchor routing ─────────────────────────────────────────────────────
-    // Each branch resolves the anchor height the transaction is built against.
-    // For the shielded flows this is the height the witness orchestrator already
-    // resolved (an explicit `anchor_height`, or `tip − depth`); the
-    // transparent-only flow resolves it independently since it builds no Orchard
-    // bundle. Step 7 derives `target_height` from this so the expiry/branch-id
-    // stays consistent with the anchor the paths were computed against.
-    let (anchor, spends, resolved_anchor_height) = if has_orchard_spends {
+    // ── 4. Heights ────────────────────────────────────────────────────────────
+    // The chain tip is queried once. The anchor derives from it (an explicit
+    // `anchor_height` kept verbatim, otherwise `tip − depth`) and the target is
+    // the next block, so the branch id and proving key selected from the target
+    // are the ones in force where the transaction will be mined.
+    let tip = tip_source(req.grpc_url.clone()).await?;
+    let anchor_height = resolve_anchor_from_tip(tip, req.anchor_height)?;
+    let target_height = next_block_height(tip)?;
+
+    // ── 4b. Anchor routing ────────────────────────────────────────────────────
+    // Each branch is handed the resolved `anchor_height`, so none of them queries
+    // the tip again.
+    // The transparent-only flow builds no Orchard bundle and needs no anchor root.
+    let (anchor, spends) = if has_orchard_spends {
         // Private→* : compute full witnesses for each spend note.
         let notes: Vec<NoteRef> = req
             .spends
@@ -351,7 +369,7 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
             .collect::<Result<_>>()?;
         let witness_out = compute_witnesses(WitnessRequest {
             grpc_url: req.grpc_url.clone(),
-            anchor_height: req.anchor_height,
+            anchor_height: Some(anchor_height),
             anchor_depth_blocks: None,
             notes,
         })
@@ -380,17 +398,14 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
             })
             .collect::<Result<_>>()?;
 
-        (witness_out.anchor, spends, witness_out.anchor_height)
+        (witness_out.anchor, spends)
     } else if has_orchard_outputs {
         // Public→Private: fetch anchor only (no spend witnesses).
-        let witness_out = fetch_orchard_anchor(&req.grpc_url, req.anchor_height, None).await?;
-        (witness_out.anchor, vec![], witness_out.anchor_height)
+        let witness_out = fetch_orchard_anchor(&req.grpc_url, Some(anchor_height), None).await?;
+        (witness_out.anchor, vec![])
     } else {
-        // Public→Public: no Orchard bundle; the anchor is unused, but the target
-        // height still must track the live tip (or an explicit anchor), so
-        // resolve it here rather than defaulting to a fixed low height.
-        let resolved = resolve_anchor_height(&req.grpc_url, req.anchor_height, None).await?;
-        ([0u8; 32], vec![], resolved)
+        // Public→Public: no Orchard bundle; the anchor root is unused.
+        ([0u8; 32], vec![])
     };
 
     // ── 5. Decode transparent inputs ─────────────────────────────────────────
@@ -406,19 +421,11 @@ pub async fn craft_transaction(req: CraftRequest) -> Result<BuildOutput> {
 
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
-    // ── 7. target_height = anchor_height + DEFAULT_TX_EXPIRY_DELTA ───────────
-    // Use the anchor height resolved in step 4 (an explicit `anchor_height`, or
-    // `tip − depth`), NOT a fixed fallback. Deriving the target from a stale
-    // default (e.g. 1 → target 41) would put it below the NU5 activation height
-    // and the builder — which always emits v5 — would reject every send.
-    let target_height = resolved_anchor_height
-        .checked_add(DEFAULT_TX_EXPIRY_DELTA)
-        .ok_or_else(|| anyhow!("target_height overflow"))?;
-
-    // ── 8. Build ──────────────────────────────────────────────────────────────
+    // ── 6. Build ──────────────────────────────────────────────────────────────
     build_transaction(BuildInputs {
         network,
         target_height,
+        anchor_height,
         orchard_fvk,
         ovk,
         change_address,
@@ -555,13 +562,26 @@ pub struct IronwoodCraftRequest {
     /// Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows.
     pub transparent_inputs: Vec<TransparentInputDto>,
     pub outputs: Vec<IronwoodOutputRequestDto>,
-    /// Explicit anchor height; `None` ⇒ tip − 10 (defaults via the witness
-    /// orchestrator).
+    /// Explicit anchor height; `None` ⇒ `tip − 10`. An explicit height above the
+    /// tip is rejected. The transaction always targets the next block, `tip + 1`,
+    /// so the chain tip is queried in either case.
     pub anchor_height: Option<u32>,
 }
 
 /// Compute Ironwood witnesses, decode addresses, then call the pure builder.
 pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<BuildOutput> {
+    craft_ironwood_transaction_with_tip(req, chain_tip).await
+}
+
+/// [`craft_ironwood_transaction`] with the chain-tip query injected.
+async fn craft_ironwood_transaction_with_tip<F, Fut>(
+    req: IronwoodCraftRequest,
+    tip_source: F,
+) -> Result<BuildOutput>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<u32>>,
+{
     let has_ironwood_spends = !req.spends.is_empty();
     let has_transparent_inputs = !req.transparent_inputs.is_empty();
 
@@ -700,8 +720,19 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
     let transparent_change_pubkey = transparent_change.as_ref().map(|(_, pk, _)| *pk);
     let transparent_change_address_index = transparent_change.as_ref().map(|(_, _, i)| *i);
 
-    // ── 4. Anchor routing ─────────────────────────────────────────────────────
-    let (anchor, spends, resolved_anchor_height) = if has_ironwood_spends {
+    // ── 4. Heights ────────────────────────────────────────────────────────────
+    // The chain tip is queried once. The anchor derives from it (an explicit
+    // `anchor_height` kept verbatim, otherwise `tip − depth`) and the target is
+    // the next block, so the branch id and proving key selected from the target
+    // are the ones in force where the transaction will be mined.
+    let tip = tip_source(req.grpc_url.clone()).await?;
+    let anchor_height = resolve_anchor_from_tip(tip, req.anchor_height)?;
+    let target_height = next_block_height(tip)?;
+
+    // ── 4b. Anchor routing ────────────────────────────────────────────────────
+    // Each branch is handed the resolved `anchor_height`, so none of them queries
+    // the tip again.
+    let (anchor, spends) = if has_ironwood_spends {
         // Ironwood→* : compute full witnesses for each spend note.
         let notes: Vec<NoteRef> = req
             .spends
@@ -715,7 +746,7 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
             .collect::<Result<_>>()?;
         let witness_out = compute_ironwood_witnesses(WitnessRequest {
             grpc_url: req.grpc_url.clone(),
-            anchor_height: req.anchor_height,
+            anchor_height: Some(anchor_height),
             anchor_depth_blocks: None,
             notes,
         })
@@ -744,11 +775,11 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
             })
             .collect::<Result<_>>()?;
 
-        (witness_out.anchor, spends, witness_out.anchor_height)
+        (witness_out.anchor, spends)
     } else {
         // Public→Ironwood: fetch anchor only (no spend witnesses).
-        let witness_out = fetch_ironwood_anchor(&req.grpc_url, req.anchor_height, None).await?;
-        (witness_out.anchor, vec![], witness_out.anchor_height)
+        let witness_out = fetch_ironwood_anchor(&req.grpc_url, Some(anchor_height), None).await?;
+        (witness_out.anchor, vec![])
     };
 
     // ── 5. Decode + verify transparent inputs ────────────────────────────────
@@ -757,15 +788,11 @@ pub async fn craft_ironwood_transaction(req: IronwoodCraftRequest) -> Result<Bui
 
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
-    // ── 6. target_height = anchor_height + DEFAULT_TX_EXPIRY_DELTA ───────────
-    let target_height = resolved_anchor_height
-        .checked_add(DEFAULT_TX_EXPIRY_DELTA)
-        .ok_or_else(|| anyhow!("target_height overflow"))?;
-
-    // ── 7. Build ──────────────────────────────────────────────────────────────
+    // ── 6. Build ──────────────────────────────────────────────────────────────
     build_ironwood_transaction(IronwoodBuildInputs {
         network,
         target_height,
+        anchor_height,
         ironwood_fvk: Some(fvk),
         ovk,
         change_address,
@@ -1209,7 +1236,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_transaction(req).await.unwrap_err();
+        // The tip is injected, so the only network operation left is the
+        // anchor fetch: a connect failure can come from nowhere else.
+        let err = craft_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         // Must reach the anchor fetch (and fail there), not an earlier guard.
         assert!(
             !err.to_string().contains("no inputs"),
@@ -1385,8 +1416,16 @@ mod tests {
     }
 
     /// Mainnet height well past NU5, so `target_height` lands on a real consensus
-    /// branch. Explicit, so the transparent path resolves it without any network.
+    /// branch. Explicit anchor for the offline transparent builds.
     const OFFLINE_ANCHOR_HEIGHT: u32 = 2_800_000;
+
+    /// Chain tip handed to the offline builds in place of a `GetLatestBlock` call.
+    const OFFLINE_TIP: u32 = OFFLINE_ANCHOR_HEIGHT + 10;
+
+    /// Stand-in for the chain-tip query, so the builds below need no endpoint.
+    async fn offline_tip(_grpc_url: String) -> Result<u32> {
+        Ok(OFFLINE_TIP)
+    }
 
     fn transparent_request(
         ufvk: Option<String>,
@@ -1427,7 +1466,9 @@ mod tests {
             10_000,
         );
 
-        let out = craft_transaction(req).await.expect("transparent build");
+        let out = craft_transaction_with_tip(req, offline_tip)
+            .await
+            .expect("transparent build");
         assert_eq!(out.n_transparent_inputs, 1);
         assert_eq!(
             out.n_transparent_outputs, 2,
@@ -1445,24 +1486,142 @@ mod tests {
     async fn transparent_account_pubkey_and_ufvk_build_identically() {
         let (ufvk, apk, apk_hex) = test_account_keys();
 
-        let from_ufvk = craft_transaction(transparent_request(
-            Some(ufvk),
-            None,
-            owned_transparent_input(&apk, 100_000),
-            10_000,
-        ))
+        let from_ufvk = craft_transaction_with_tip(
+            transparent_request(
+                Some(ufvk),
+                None,
+                owned_transparent_input(&apk, 100_000),
+                10_000,
+            ),
+            offline_tip,
+        )
         .await
         .expect("build from UFVK");
-        let from_apk = craft_transaction(transparent_request(
-            None,
-            Some(apk_hex),
-            owned_transparent_input(&apk, 100_000),
-            10_000,
-        ))
+        let from_apk = craft_transaction_with_tip(
+            transparent_request(
+                None,
+                Some(apk_hex),
+                owned_transparent_input(&apk, 100_000),
+                10_000,
+            ),
+            offline_tip,
+        )
         .await
         .expect("build from account pubkey");
 
         assert_eq!(from_apk.pczt_bytes, from_ufvk.pczt_bytes);
+    }
+
+    // ── Heights: anchor and target both derive from one tip ──────────────────
+
+    /// The target is the next block and the anchor is ten blocks below the tip;
+    /// the build reports the anchor it was handed, not one re-derived from the
+    /// target.
+    #[tokio::test]
+    async fn craft_reports_resolved_anchor_and_targets_next_block() {
+        let (_ufvk, apk, apk_hex) = test_account_keys();
+        let mut req = transparent_request(
+            None,
+            Some(apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+        req.anchor_height = None;
+
+        let out = craft_transaction_with_tip(req, offline_tip).await.unwrap();
+        assert_eq!(out.anchor_height, OFFLINE_TIP - 10);
+        // The target (tip + 1) is not anchor + 40: the PCZT expiry is the
+        // builder's default for it.
+        let parsed = zcash_crypto::parse::parse_pczt(&out.pczt_bytes).unwrap();
+        assert_eq!(
+            parsed.global.expiry_height,
+            OFFLINE_TIP + 1 + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
+        );
+    }
+
+    /// An explicit anchor is reported verbatim, whatever its distance from the tip.
+    #[tokio::test]
+    async fn craft_reports_explicit_anchor_unchanged() {
+        let (_ufvk, apk, apk_hex) = test_account_keys();
+        let req = transparent_request(
+            None,
+            Some(apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+        let out = craft_transaction_with_tip(req, |_| async { Ok(OFFLINE_ANCHOR_HEIGHT + 500) })
+            .await
+            .unwrap();
+        assert_eq!(out.anchor_height, OFFLINE_ANCHOR_HEIGHT);
+    }
+
+    #[tokio::test]
+    async fn craft_rejects_explicit_anchor_above_tip() {
+        let (_ufvk, apk, apk_hex) = test_account_keys();
+        let mut req = transparent_request(
+            None,
+            Some(apk_hex),
+            owned_transparent_input(&apk, 100_000),
+            10_000,
+        );
+        req.anchor_height = Some(OFFLINE_TIP + 1);
+        let err = craft_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("above the chain tip"), "{err}");
+    }
+
+    /// An explicit anchor no longer skips the network: the target needs the tip.
+    #[tokio::test]
+    async fn public_to_public_with_explicit_anchor_still_queries_the_tip() {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let addr = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            a
+        };
+        let req = CraftRequest {
+            grpc_url: format!("https://127.0.0.1:{}", addr.port()),
+            ufvk: Some(keys.ufvk.clone()),
+            transparent_account_pubkey_hex: None,
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_transparent_output()],
+            anchor_height: Some(OFFLINE_ANCHOR_HEIGHT),
+        };
+        let err = craft_transaction(req).await.unwrap_err();
+        assert!(err.to_string().contains("gRPC connect failed"), "{err}");
+    }
+
+    /// Activation boundary: a target one block below an activation uses the
+    /// pre-activation branch id, the target at the activation uses the new one;
+    /// the branch id is never one the next block will not be mined under.
+    #[test]
+    fn target_never_selects_a_branch_the_next_block_does_not_use() {
+        use zcash_protocol::consensus::{BranchId, Network, NetworkUpgrade, Parameters};
+
+        let network = Network::MainNetwork;
+        let a = u32::from(network.activation_height(NetworkUpgrade::Nu6_3).unwrap());
+        let branch_at = |tip: u32| {
+            let target = crate::witness::next_block_height(tip).unwrap();
+            BranchId::for_height(&network, target.into())
+        };
+        // Tip A-2: the next block is A-1, still pre-activation.
+        assert_eq!(
+            branch_at(a - 2),
+            BranchId::for_height(&network, (a - 1).into())
+        );
+        assert_ne!(branch_at(a - 2), BranchId::for_height(&network, a.into()));
+        // Tip A-1: the next block is A, the first post-activation block.
+        assert_eq!(branch_at(a - 1), BranchId::for_height(&network, a.into()));
     }
 
     /// Neither form supplied: refused by the up-front guard, so the caller gets
@@ -1520,7 +1679,10 @@ mod tests {
             90_000,
         );
 
-        let msg = craft_transaction(req).await.unwrap_err().to_string();
+        let msg = craft_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             msg.contains("no transparent account key was given"),
             "got: {msg}"
@@ -1826,7 +1988,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        // The tip is injected, so the witness fetch is the only network
+        // operation left: a connect failure can come from nowhere else.
+        let err = craft_ironwood_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             !err.to_string().contains("no inputs"),
             "should pass the input guard, got: {err}"
@@ -1884,7 +2050,11 @@ mod tests {
             anchor_height: Some(1),
         };
 
-        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        // The tip is injected, so the anchor fetch is the only network
+        // operation left: a connect failure can come from nowhere else.
+        let err = craft_ironwood_transaction_with_tip(req, offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             !err.to_string().contains("no inputs"),
             "should pass the input guard, got: {err}"
@@ -1897,6 +2067,65 @@ mod tests {
             !err.to_string().contains("invalid destination address"),
             "Ironwood destination must decode, got: {err}"
         );
+        assert!(
+            err.to_string().contains("gRPC connect failed"),
+            "expected anchor-fetch connect failure, got: {err}"
+        );
+    }
+
+    /// Public→Ironwood request on a refused port, with the given anchor height.
+    fn public_to_ironwood_request(anchor_height: Option<u32>) -> IronwoodCraftRequest {
+        use zcash_crypto::keys::{derive_keys, ZcashNetwork};
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
+        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
+        let (ua, _) = ufvk
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+        IronwoodCraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: keys.ufvk.clone(),
+            network: Some("mainnet".into()),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 15_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![IronwoodOutputRequestDto {
+                address: ua.encode(&Network::MainNetwork),
+                value_zat: 10_000,
+                memo: None,
+            }],
+            anchor_height,
+        }
+    }
+
+    /// The Ironwood path applies the same height rule as the Orchard one: an
+    /// explicit anchor above the tip is refused before any network operation.
+    #[tokio::test]
+    async fn ironwood_craft_rejects_explicit_anchor_above_tip() {
+        let err = craft_ironwood_transaction_with_tip(
+            public_to_ironwood_request(Some(OFFLINE_TIP + 1)),
+            offline_tip,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("above the chain tip"), "{err}");
+    }
+
+    /// With the anchor omitted, the Ironwood path derives it from the injected
+    /// tip and goes straight to the anchor fetch, without querying the tip
+    /// itself.
+    #[tokio::test]
+    async fn ironwood_craft_derives_the_anchor_from_the_injected_tip() {
+        let err = craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "expected anchor-fetch connect failure, got: {err}"
