@@ -22,11 +22,13 @@
 //!   4. For each transparent input i, `append_transparent_signature(i, der_sig)`.
 //!   5. `signer.finish()`.
 //!   6. If there are transparent inputs: `SpendFinalizer::finalize_spends()`.
-//!   7. `TransactionExtractor::new(pczt).with_orchard(verifying_key()).extract()`
+//!   7. `TransactionExtractor::new(pczt).with_orchard(verifying_key()).extract(rng)`
 //!      — applies the Orchard or Ironwood binding signature host-side (per the
 //!      bundle present in the PCZT) and verifies the proof. Produces V5 or V6.
 //!   8. Serialize the transaction (ZIP-225 V5 or ZIP-230 V6) and compute the txid.
 
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
 use std::sync::OnceLock;
 
 use orchard::{
@@ -251,7 +253,7 @@ pub fn finalize_transaction(inputs: FinalizeInputs) -> Result<FinalizeOutput, Er
     //    multi-second build cost.
     let tx = TransactionExtractor::new(pczt)
         .with_orchard(verifying_key_for(consensus_branch_id))
-        .extract()
+        .extract(UnwrapErr(SysRng))
         .map_err(|e| Error::Finalize(format!("TransactionExtractor: {e:?}")))?;
 
     // 8. Serialize (ZIP-225 V5 or ZIP-230 V6) + compute txid.
@@ -619,7 +621,7 @@ mod tests {
         let mut signer = PcztSigner::new(pczt).expect("sign_unsigned_actions: Signer::new");
         for idx in &unsigned_indices {
             signer
-                .sign_orchard(*idx, ask)
+                .sign_orchard(UnwrapErr(SysRng), *idx, ask)
                 .expect("sign_unsigned_actions: sign_orchard");
         }
         let signed_pczt = signer.finish();
@@ -669,7 +671,7 @@ mod tests {
     ///     ZIP-317: orchard_actions = max(2, max(1 spend, 2 outputs)) = 2,
     ///     transparent_actions = max(1 in, 0 out) = 1 → fee = 5_000 × 3 = 15_000.
     fn build_mixed_pczt() -> (Vec<u8>, secp256k1::SecretKey) {
-        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use secp256k1::{PublicKey, SecretKey};
 
         let fvk = make_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
@@ -694,9 +696,8 @@ mod tests {
         let ovk = Some(fvk.to_ovk(Scope::External));
 
         // Transparent input controlled by a known key so the test can sign it.
-        let secp = Secp256k1::new();
-        let t_sk = SecretKey::from_slice(&[0x07u8; 32]).unwrap();
-        let t_pubkey = PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let t_sk = SecretKey::from_secret_bytes([0x07u8; 32]).unwrap();
+        let t_pubkey = PublicKey::from_secret_key(&t_sk).serialize();
         let transparent_value: u64 = 15_000;
 
         let fee = 15_000u64;
@@ -763,7 +764,7 @@ mod tests {
         index: usize,
         sk: &secp256k1::SecretKey,
     ) -> Vec<u8> {
-        use secp256k1::{Message, Secp256k1};
+        use secp256k1::Message;
 
         let pczt = Pczt::parse(pczt_bytes).expect("valid_transparent_der_signature: parse");
         let signer = PcztSigner::new(pczt).expect("valid_transparent_der_signature: Signer::new");
@@ -771,8 +772,7 @@ mod tests {
             .transparent_sighash(index)
             .expect("valid_transparent_der_signature: transparent_sighash");
 
-        let secp = Secp256k1::new();
-        let sig = secp.sign_ecdsa(&Message::from_digest(sighash), sk);
+        let sig = secp256k1::ecdsa::sign(Message::from_digest(sighash), sk);
         sig.serialize_der().to_vec()
     }
 
@@ -1167,11 +1167,10 @@ mod tests {
     /// A standard DER signature (no Ledger modifications) round-trips correctly.
     #[test]
     fn parse_transparent_der_standard_signature() {
-        use secp256k1::{Message, Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x01u8; 32]).unwrap();
+        use secp256k1::{Message, SecretKey};
+        let sk = SecretKey::from_secret_bytes([0x01u8; 32]).unwrap();
         let msg = Message::from_digest([0xabu8; 32]);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
         let der = sig.serialize_der().to_vec();
 
         // Standard DER (0x30 header, no trailing byte): must parse cleanly.
@@ -1182,11 +1181,10 @@ mod tests {
     /// The Ledger header-bit mutation (`0x30 → 0x31`) is normalized to `0x30`.
     #[test]
     fn parse_transparent_der_normalizes_ledger_header_byte() {
-        use secp256k1::{Message, Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
+        use secp256k1::{Message, SecretKey};
+        let sk = SecretKey::from_secret_bytes([0x02u8; 32]).unwrap();
         let msg = Message::from_digest([0xbcu8; 32]);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
 
         let mut der = sig.serialize_der().to_vec();
         der[0] = 0x31; // simulate Ledger y-parity bit
@@ -1198,11 +1196,10 @@ mod tests {
     /// indicates the buffer is 1 byte too long.
     #[test]
     fn parse_transparent_der_strips_trailing_sighash_type_byte() {
-        use secp256k1::{Message, Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x03u8; 32]).unwrap();
+        use secp256k1::{Message, SecretKey};
+        let sk = SecretKey::from_secret_bytes([0x03u8; 32]).unwrap();
         let msg = Message::from_digest([0xcdu8; 32]);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
 
         let mut der = sig.serialize_der().to_vec();
         der.push(0x01); // SIGHASH_ALL appended by device
@@ -1213,11 +1210,10 @@ mod tests {
     /// Both normalizations together (Ledger header bit + trailing sighash byte).
     #[test]
     fn parse_transparent_der_both_normalizations() {
-        use secp256k1::{Message, Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x04u8; 32]).unwrap();
+        use secp256k1::{Message, SecretKey};
+        let sk = SecretKey::from_secret_bytes([0x04u8; 32]).unwrap();
         let msg = Message::from_digest([0xdeu8; 32]);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
 
         let mut der = sig.serialize_der().to_vec();
         der[0] = 0x31; // y-parity bit
@@ -1246,11 +1242,10 @@ mod tests {
     // sighash byte) back to a canonical signature.
     #[test]
     fn transparent_der_parse_integrates_with_finalize_path() {
-        use secp256k1::{Message, Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x05u8; 32]).unwrap();
+        use secp256k1::{Message, SecretKey};
+        let sk = SecretKey::from_secret_bytes([0x05u8; 32]).unwrap();
         let msg = Message::from_digest([0xefu8; 32]);
-        let sig = secp.sign_ecdsa(&msg, &sk);
+        let sig = secp256k1::ecdsa::sign(msg, &sk);
         let mut der = sig.serialize_der().to_vec();
         der[0] = 0x31; // Ledger header
         der.push(0x01); // sighash byte
@@ -1430,7 +1425,7 @@ mod tests {
             PcztSigner::new(pczt).expect("sign_unsigned_ironwood_actions: Signer::new");
         for idx in &unsigned_indices {
             signer
-                .sign_ironwood(*idx, ask)
+                .sign_ironwood(UnwrapErr(SysRng), *idx, ask)
                 .expect("sign_unsigned_ironwood_actions: sign_ironwood");
         }
         let signed_pczt = signer.finish();
@@ -1461,7 +1456,7 @@ mod tests {
             build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
             IronwoodOutputRequest, IronwoodSpendInput,
         };
-        use secp256k1::{PublicKey, Secp256k1, SecretKey};
+        use secp256k1::{PublicKey, SecretKey};
 
         let fvk = make_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
@@ -1489,9 +1484,8 @@ mod tests {
         let leaf = MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
         let (anchor, path) = synthetic_anchor_and_path(leaf);
 
-        let secp = Secp256k1::new();
-        let t_sk = SecretKey::from_slice(&[0x07u8; 32]).unwrap();
-        let t_pubkey = PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let t_sk = SecretKey::from_secret_bytes([0x07u8; 32]).unwrap();
+        let t_pubkey = PublicKey::from_secret_key(&t_sk).serialize();
 
         let inputs = IronwoodBuildInputs {
             network: zcash_protocol::consensus::Network::MainNetwork.into(),
@@ -1698,7 +1692,7 @@ mod tests {
             return;
         };
 
-        use secp256k1::{Message, PublicKey, Secp256k1};
+        use secp256k1::{Message, PublicKey};
 
         let pczt_bytes = hex::decode(pczt_hex).expect("golden pczt_hex must be valid hex");
         let pczt = Pczt::parse(&pczt_bytes).expect("golden pczt_hex must parse as a PCZT");
@@ -1710,7 +1704,6 @@ mod tests {
         );
 
         let signer = PcztSigner::new(pczt).expect("Signer::new on golden PCZT");
-        let secp = Secp256k1::new();
 
         for (index, (sig_hex, pubkey_hex)) in transparent_inputs.iter().enumerate() {
             let raw = hex::decode(sig_hex)
@@ -1737,7 +1730,7 @@ mod tests {
             let pubkey = PublicKey::from_slice(&pubkey_bytes)
                 .unwrap_or_else(|e| panic!("transparent input {index} pubkey: {e}"));
 
-            secp.verify_ecdsa(&Message::from_digest(sighash), &parsed, &pubkey)
+            secp256k1::ecdsa::verify(&parsed, Message::from_digest(sighash), &pubkey)
                 .unwrap_or_else(|e| {
                     panic!(
                         "transparent input {index}: the normalized device signature does NOT \

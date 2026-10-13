@@ -10,6 +10,7 @@ use orchard::{
     },
     note_encryption::{CompactAction, IronwoodDomain, OrchardDomain},
 };
+use sapling_crypto::note_encryption::COMPACT_NOTE_SIZE;
 use sapling_crypto::{
     note::ExtractedNoteCommitment as SaplingExtractedNoteCommitment,
     note_encryption::{
@@ -21,7 +22,7 @@ use uuid::Uuid;
 use zcash_address::unified::{Encoding, Ufvk};
 use zcash_client_backend::decrypt_transaction;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_note_encryption::{batch, EphemeralKeyBytes, COMPACT_NOTE_SIZE};
+use zcash_note_encryption::{batch, EphemeralKeyBytes};
 use zcash_primitives::transaction::Transaction as ZcashTransaction;
 use zcash_protocol::{
     consensus::{BlockHeight, BranchId, Network},
@@ -251,7 +252,7 @@ fn decode_note_value(z: Zatoshis) -> u64 {
 ///
 /// Returns [`Error::Decrypt`] if the UFVK string cannot be decoded or parsed.
 pub fn prepare_ivks(viewing_key: &str) -> Result<PreparedIvks, Error> {
-    let (_network, ufvk_str) = Ufvk::decode(viewing_key)
+    let (_network, _revision, ufvk_str) = Ufvk::decode(viewing_key)
         .map_err(|e| Error::Decrypt(format!("UFVK decode failed: {:?}", e)))?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk_str)
         .map_err(|e| Error::Decrypt(format!("UFVK parse failed: {:?}", e)))?;
@@ -664,7 +665,7 @@ pub fn full_decrypt_tx(
     height: u32,
     network: Network,
 ) -> Result<DecryptedTx, Error> {
-    let (_network, ufvk_str) = Ufvk::decode(viewing_key)
+    let (_network, _revision, ufvk_str) = Ufvk::decode(viewing_key)
         .map_err(|e| Error::Decrypt(format!("UFVK decode failed: {:?}", e)))?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk_str)
         .map_err(|e| Error::Decrypt(format!("UFVK parse failed: {:?}", e)))?;
@@ -726,11 +727,11 @@ pub(crate) fn parse_compact_orchard_action(
             action.ephemeral_key.len()
         ))
     })?;
-    let ct_bytes: [u8; COMPACT_NOTE_SIZE] =
+    let ct_bytes: [u8; orchard::note_encryption::COMPACT_NOTE_SIZE] =
         action.ciphertext.as_slice().try_into().map_err(|_| {
             Error::Decrypt(format!(
                 "ciphertext must be {} bytes, got {}",
-                COMPACT_NOTE_SIZE,
+                orchard::note_encryption::COMPACT_NOTE_SIZE,
                 action.ciphertext.len()
             ))
         })?;
@@ -1357,7 +1358,7 @@ mod tests {
         use orchard::value::NoteValue;
         use zcash_note_encryption::Domain;
 
-        let (_network, ufvk_str) = Ufvk::decode(ALICE_UFVK).unwrap();
+        let (_network, _revision, ufvk_str) = Ufvk::decode(ALICE_UFVK).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
         let fvk = ufvk
             .orchard()
@@ -1392,7 +1393,7 @@ mod tests {
             nf: rho_bytes.to_vec(),
             cmx: cmx_bytes.to_vec(),
             ephemeral_key: ephemeral_key.0.to_vec(),
-            ciphertext: full_ciphertext[..COMPACT_NOTE_SIZE].to_vec(),
+            ciphertext: full_ciphertext.0[..orchard::note_encryption::COMPACT_NOTE_SIZE].to_vec(),
         };
         (action, rho_bytes)
     }

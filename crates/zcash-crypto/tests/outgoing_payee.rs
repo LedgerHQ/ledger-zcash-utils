@@ -77,7 +77,7 @@ fn the_recovered_payee_is_not_one_of_our_own_addresses() {
         .sapling()
         .expect("testnet fixture wallet has a Sapling key");
 
-    let encode = |(_, address)| Address::Sapling(address).encode(&Network::TestNetwork);
+    let encode = |(_, address)| Address::Sapling(Box::new(address)).encode(&Network::TestNetwork);
     let ours = [
         encode(sapling.default_address()),
         encode(sapling.change_address()),

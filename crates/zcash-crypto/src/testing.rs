@@ -12,18 +12,28 @@
 
 use bip39::Mnemonic;
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
+use bitcoin::secp256k1::Secp256k1;
 use bitcoin::NetworkKind;
 use orchard::keys::{SpendAuthorizingKey, SpendingKey};
 use pczt::{
     roles::{signer::Signer as PcztSigner, updater::Updater},
     Pczt,
 };
-use secp256k1::{Message, Secp256k1};
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
+use secp256k1::Message;
 use zcash_protocol::consensus::{Network as ZcashConsensusNetwork, NetworkConstants};
 use zip32::AccountId;
 
 use crate::error::Error;
 use crate::keys::ZcashNetwork;
+
+/// The `secp256k1` key the PCZT signer takes, from the one `bitcoin`'s BIP-32 derivation yields.
+/// The two crates link different `secp256k1` lines, so the key crosses as its 32 secret bytes.
+fn to_signing_key(sk: bitcoin::secp256k1::SecretKey) -> secp256k1::SecretKey {
+    secp256k1::SecretKey::from_secret_bytes(sk.secret_bytes())
+        .expect("a valid secp256k1 secret key stays valid across crate versions")
+}
 
 /// Derives the account UFVK and transparent xpub the test-only `test_derive_keys`
 /// NAPI export returns. A thin, default-options wrapper over
@@ -125,7 +135,7 @@ pub fn sign_pczt_orchard_actions(
         PcztSigner::new(pczt).map_err(|e| Error::Finalize(format!("Signer::new: {e:?}")))?;
     for idx in &unsigned_indices {
         signer
-            .sign_orchard(*idx, ask)
+            .sign_orchard(UnwrapErr(SysRng), *idx, ask)
             .map_err(|e| Error::Finalize(format!("sign_orchard(action {idx}): {e:?}")))?;
     }
     let signed_pczt = signer.finish();
@@ -181,7 +191,7 @@ pub fn sign_pczt_ironwood_actions(
         PcztSigner::new(pczt).map_err(|e| Error::Finalize(format!("Signer::new: {e:?}")))?;
     for idx in &unsigned_indices {
         signer
-            .sign_ironwood(*idx, ask)
+            .sign_ironwood(UnwrapErr(SysRng), *idx, ask)
             .map_err(|e| Error::Finalize(format!("sign_ironwood(action {idx}): {e:?}")))?;
     }
     let signed_pczt = signer.finish();
@@ -308,7 +318,10 @@ pub fn sign_pczt_transparent_inputs(
     // which takes ownership of the PCZT.
     let secret_keys: Vec<secp256k1::SecretKey> = paths
         .iter()
-        .map(|path| root.derive_priv(&secp, path).map(|leaf| leaf.private_key))
+        .map(|path| {
+            root.derive_priv(&secp, path)
+                .map(|leaf| to_signing_key(leaf.private_key))
+        })
         .collect::<Result<_, _>>()?;
 
     let signer =
@@ -321,7 +334,7 @@ pub fn sign_pczt_transparent_inputs(
             let sighash = signer
                 .transparent_sighash(index)
                 .map_err(|e| Error::Finalize(format!("transparent_sighash({index}): {e:?}")))?;
-            let sig = secp.sign_ecdsa(&Message::from_digest(sighash), sk);
+            let sig = secp256k1::ecdsa::sign(Message::from_digest(sighash), sk);
             Ok(sig.serialize_der().to_vec())
         })
         .collect()
@@ -335,6 +348,7 @@ mod tests {
         TransparentInput,
     };
     use crate::finalize::{finalize_transaction, FinalizeInputs};
+    use crate::network::{AnyZcashNetwork, ZCASH_REGTEST};
     use incrementalmerkletree::{Marking, Retention};
     use orchard::{
         keys::Scope,
@@ -343,6 +357,8 @@ mod tests {
         value::NoteValue,
     };
     use shardtree::{store::memory::MemoryShardStore, ShardTree};
+    use zcash_protocol::consensus::BranchId;
+    use zcash_protocol::local_consensus::LocalNetwork;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -553,9 +569,8 @@ mod tests {
         use secp256k1::{PublicKey, SecretKey};
         use zcash_transparent::address::TransparentAddress;
 
-        let secp = Secp256k1::new();
-        let t_sk = SecretKey::from_slice(&[0x11u8; 32]).unwrap();
-        let t_pubkey = PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let t_sk = SecretKey::from_secret_bytes([0x11u8; 32]).unwrap();
+        let t_pubkey = PublicKey::from_secret_key(&t_sk).serialize();
         let in_value: u64 = 20_000;
         let fee: u64 = 10_000;
         let out_value = in_value - fee;
@@ -604,6 +619,25 @@ mod tests {
     /// PCZT bytes and the transparent leaf secret key, so the test can verify
     /// the resulting signature independently of `sign_pczt_transparent_inputs`.
     fn build_mixed_pczt(address_index: u32) -> (Vec<u8>, secp256k1::SecretKey) {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        build_mixed_pczt_on(
+            zcash_protocol::consensus::Network::MainNetwork.into(),
+            nu5_height(),
+            address_index,
+            Destination::Orchard(recipient),
+            10_000,
+        )
+    }
+
+    /// [`build_mixed_pczt`] on a given network and target height, paying
+    /// `out_value` to `destination`.
+    fn build_mixed_pczt_on(
+        network: AnyZcashNetwork,
+        target_height: u32,
+        address_index: u32,
+        destination: Destination,
+        out_value: u64,
+    ) -> (Vec<u8>, secp256k1::SecretKey) {
         let secp = Secp256k1::new();
         let seed = Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
         let path = DerivationPath::from(vec![
@@ -615,8 +649,8 @@ mod tests {
         ]);
         let root = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
         let leaf = root.derive_priv(&secp, &path).unwrap();
-        let t_sk = leaf.private_key;
-        let t_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let t_sk = to_signing_key(leaf.private_key);
+        let t_pubkey = secp256k1::PublicKey::from_secret_key(&t_sk).serialize();
 
         let fvk = make_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
@@ -642,11 +676,10 @@ mod tests {
 
         let transparent_value: u64 = 15_000;
         let fee = 15_000u64;
-        let out_value = 10_000u64;
 
         let inputs = BuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork.into(),
-            target_height: nu5_height(),
+            network,
+            target_height,
             anchor_height: 1,
             orchard_fvk: Some(fvk.clone()),
             ovk,
@@ -675,7 +708,7 @@ mod tests {
                 derivation_address_index: address_index,
             }],
             outputs: vec![OutputRequest {
-                destination: Destination::Orchard(recipient),
+                destination,
                 value: out_value,
                 memo: None,
             }],
@@ -696,6 +729,19 @@ mod tests {
     /// even though `coin-zcash` routes exactly this shape (an Ironwood bundle
     /// alongside a transparent bundle) through the t→z and z→t flows.
     fn build_mixed_ironwood_pczt(address_index: u32) -> (Vec<u8>, secp256k1::SecretKey) {
+        build_mixed_ironwood_pczt_on(
+            zcash_protocol::consensus::Network::MainNetwork.into(),
+            nu6_3_height(),
+            address_index,
+        )
+    }
+
+    /// [`build_mixed_ironwood_pczt`] on a given network and target height.
+    fn build_mixed_ironwood_pczt_on(
+        network: AnyZcashNetwork,
+        target_height: u32,
+        address_index: u32,
+    ) -> (Vec<u8>, secp256k1::SecretKey) {
         use crate::craft::{
             build_ironwood_transaction, IronwoodBuildInputs, IronwoodDestination,
             IronwoodOutputRequest, IronwoodSpendInput,
@@ -712,8 +758,8 @@ mod tests {
         ]);
         let root = Xpriv::new_master(NetworkKind::Main, &seed).unwrap();
         let leaf = root.derive_priv(&secp, &path).unwrap();
-        let t_sk = leaf.private_key;
-        let t_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk).serialize();
+        let t_sk = to_signing_key(leaf.private_key);
+        let t_pubkey = secp256k1::PublicKey::from_secret_key(&t_sk).serialize();
 
         let fvk = make_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
@@ -745,8 +791,8 @@ mod tests {
         let out_value = 20_000u64;
 
         let inputs = IronwoodBuildInputs {
-            network: zcash_protocol::consensus::Network::MainNetwork.into(),
-            target_height: nu6_3_height(),
+            network,
+            target_height,
             anchor_height: 1,
             ironwood_fvk: Some(fvk),
             ovk,
@@ -1009,15 +1055,15 @@ mod tests {
         // `sign_pczt_transparent_inputs_signature_verifies_against_derived_pubkey`
         // -- proving the transparent leg is correct on its own, not just that
         // `finalize_transaction` happens to accept it.
-        let secp = Secp256k1::new();
-        let expected_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk);
+        let expected_pubkey = secp256k1::PublicKey::from_secret_key(&t_sk);
         let pczt_for_sighash = Pczt::parse(&pczt_bytes).unwrap();
         let signer_for_sighash = PcztSigner::new(pczt_for_sighash).unwrap();
         let sighash = signer_for_sighash.transparent_sighash(0).unwrap();
         let der_sig = secp256k1::ecdsa::Signature::from_der(&transparent_signatures[0])
             .expect("produced signature must be valid DER");
-        secp.verify_ecdsa(&Message::from_digest(sighash), &der_sig, &expected_pubkey)
-            .expect("transparent signature must verify against the pubkey derived at the input's own path");
+        secp256k1::ecdsa::verify(&der_sig, Message::from_digest(sighash), &expected_pubkey).expect(
+            "transparent signature must verify against the pubkey derived at the input's own path",
+        );
 
         let out = finalize_transaction(FinalizeInputs {
             pczt_bytes,
@@ -1057,6 +1103,100 @@ mod tests {
         );
     }
 
+    // ── Past NU7 activation ────────────────────────────────────────────────────
+    //
+    // The named networks only resolve `BranchId::Nu7` once the pinned
+    // `zcash_protocol` carries their activation height, so these build on a
+    // local network with NU7 active, past its activation, and take each pool's
+    // transaction through signing to its serialized form.
+
+    /// Regtest with every upgrade through NU7 active from height 2.
+    fn nu7_network() -> AnyZcashNetwork {
+        AnyZcashNetwork::Local(LocalNetwork {
+            nu7: Some(zcash_protocol::consensus::BlockHeight::from_u32(2)),
+            ..ZCASH_REGTEST
+        })
+    }
+
+    /// The consensus branch id a PCZT commits to.
+    fn pczt_branch_id(pczt_bytes: &[u8]) -> u32 {
+        *Pczt::parse(pczt_bytes)
+            .unwrap()
+            .global()
+            .consensus_branch_id()
+    }
+
+    #[test]
+    fn nu7_branch_id_is_the_zip_259_value() {
+        assert_eq!(u32::from(BranchId::Nu7), 0x7719_0ad9);
+    }
+
+    #[test]
+    fn v5_transaction_built_past_nu7_signs_and_serializes_under_nu7() {
+        // From NU6.3 an Orchard bundle can no longer pay another Orchard address,
+        // so the V5 path past NU7 is an Orchard note drained to a transparent
+        // address, at an exact balance (no Orchard change output).
+        let t_recv = zcash_transparent::address::TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let (pczt_bytes, _t_sk) = build_mixed_pczt_on(
+            nu7_network(),
+            3,
+            2,
+            Destination::Transparent(t_recv),
+            20_000,
+        );
+        assert_eq!(pczt_branch_id(&pczt_bytes), u32::from(BranchId::Nu7));
+
+        let orchard_signatures = sign_pczt_orchard_actions(&pczt_bytes, &make_ask())
+            .expect("signing the Orchard spend must succeed past NU7");
+        let seed = Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let transparent_signatures =
+            sign_pczt_transparent_inputs(&pczt_bytes, &seed, ZcashNetwork::Mainnet)
+                .expect("signing the transparent input must succeed past NU7");
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures,
+            ironwood_signatures: vec![],
+            transparent_signatures,
+        })
+        .expect("a V5 transaction built past NU7 must finalize");
+
+        let tx = zcash_primitives::transaction::Transaction::read(&out.tx_bytes[..], BranchId::Nu7)
+            .expect("the finalized bytes must read back under NU7");
+        assert_eq!(tx.consensus_branch_id(), BranchId::Nu7);
+        assert_eq!(*tx.txid().as_ref(), out.txid);
+        assert!(tx.orchard_bundle().is_some());
+        assert!(tx.transparent_bundle().is_some());
+    }
+
+    #[test]
+    fn v6_transaction_built_past_nu7_signs_and_serializes_under_nu7() {
+        let (pczt_bytes, _t_sk) = build_mixed_ironwood_pczt_on(nu7_network(), 3, 2);
+        assert_eq!(pczt_branch_id(&pczt_bytes), u32::from(BranchId::Nu7));
+
+        let ironwood_signatures = sign_pczt_ironwood_actions(&pczt_bytes, &make_ask())
+            .expect("signing the Ironwood spend must succeed past NU7");
+        let seed = Mnemonic::parse(TEST_MNEMONIC).unwrap().to_seed("");
+        let transparent_signatures =
+            sign_pczt_transparent_inputs(&pczt_bytes, &seed, ZcashNetwork::Mainnet)
+                .expect("signing the transparent input must succeed past NU7");
+
+        let out = finalize_transaction(FinalizeInputs {
+            pczt_bytes,
+            orchard_signatures: vec![],
+            ironwood_signatures,
+            transparent_signatures,
+        })
+        .expect("a V6 transaction built past NU7 must finalize");
+
+        let tx = zcash_primitives::transaction::Transaction::read(&out.tx_bytes[..], BranchId::Nu7)
+            .expect("the finalized bytes must read back under NU7");
+        assert_eq!(tx.consensus_branch_id(), BranchId::Nu7);
+        assert_eq!(*tx.txid().as_ref(), out.txid);
+        assert!(tx.ironwood_bundle().is_some());
+        assert!(tx.transparent_bundle().is_some());
+    }
+
     // ── sign_pczt_transparent_inputs ───────────────────────────────────────────
 
     #[test]
@@ -1084,8 +1224,7 @@ mod tests {
         // Independently re-derive the expected pubkey and sighash, then verify
         // the produced DER signature against them — exercising both the
         // derivation and the verification, not just one.
-        let secp = Secp256k1::new();
-        let expected_pubkey = secp256k1::PublicKey::from_secret_key(&secp, &t_sk);
+        let expected_pubkey = secp256k1::PublicKey::from_secret_key(&t_sk);
 
         let pczt = Pczt::parse(&pczt_bytes).unwrap();
         let signer = PcztSigner::new(pczt).unwrap();
@@ -1094,7 +1233,7 @@ mod tests {
 
         let der_sig = secp256k1::ecdsa::Signature::from_der(&sigs[0])
             .expect("produced signature must be valid DER");
-        secp.verify_ecdsa(&msg, &der_sig, &expected_pubkey)
+        secp256k1::ecdsa::verify(&der_sig, msg, &expected_pubkey)
             .expect("signature must verify against the pubkey derived at the input's own path");
     }
 }

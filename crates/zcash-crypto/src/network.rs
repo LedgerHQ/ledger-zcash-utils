@@ -109,6 +109,9 @@ pub const ZCASH_REGTEST: LocalNetwork = LocalNetwork {
     nu6_1: Some(BlockHeight::from_u32(2)),
     nu6_2: Some(BlockHeight::from_u32(2)),
     nu6_3: Some(BlockHeight::from_u32(2)),
+    // Not part of the canonical regtest set: a regtest node only reaches NU7 when its
+    // `nuparams` schedule it, which this crate does not support (see above).
+    nu7: None,
 };
 
 /// Parse a network name string into an [`AnyZcashNetwork`] for transaction

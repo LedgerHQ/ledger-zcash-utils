@@ -54,6 +54,16 @@ mod tests {
         }
     }
 
+    /// NU7 keeps the Orchard protocol revision NU6.3 introduced, so it proves and
+    /// verifies with the same circuit generation.
+    #[test]
+    fn nu7_keeps_the_nu6_3_generation() {
+        assert_eq!(
+            orchard_circuit_version_for(BranchId::Nu7),
+            OrchardCircuitVersion::PostNu6_3
+        );
+    }
+
     /// Branches with no Orchard pool at all must not be treated as NU6.3.
     #[test]
     fn pre_orchard_branches_fall_back_to_the_old_generation() {

@@ -16,7 +16,7 @@
 //!   4. For each output: dispatch on the destination address type and call
 //!      `add_orchard_output` or `add_transparent_output`. An automatic change
 //!      output is added when value balance is positive.
-//!   5. `Builder::build_for_pczt(OsRng, &FeeRule::standard())` → `PcztParts`.
+//!   5. `Builder::build_for_pczt(rng, &FeeRule::standard())` → `PcztParts`.
 //!   6. `pczt::roles::creator::Creator::build_from_parts` wraps it into a
 //!      wire-format `Pczt`.
 //!   7. When an Orchard bundle is present: stamp ZIP-32 derivation paths, run
@@ -104,7 +104,8 @@ use pczt::{
     },
     Pczt,
 };
-use rand::rngs::OsRng;
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317::{self, FeeError as Zip317FeeError, FeeRule},
@@ -163,7 +164,8 @@ fn next_upgrade(nu: NetworkUpgrade) -> Option<NetworkUpgrade> {
         NetworkUpgrade::Nu6 => Some(NetworkUpgrade::Nu6_1),
         NetworkUpgrade::Nu6_1 => Some(NetworkUpgrade::Nu6_2),
         NetworkUpgrade::Nu6_2 => Some(NetworkUpgrade::Nu6_3),
-        NetworkUpgrade::Nu6_3 => None,
+        NetworkUpgrade::Nu6_3 => Some(NetworkUpgrade::Nu7),
+        NetworkUpgrade::Nu7 => None,
     }
 }
 
@@ -684,7 +686,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
 
     // ── 3. build_for_pczt + PCZT roles ───────────────────────────────────────
     let pczt_result = builder
-        .build_for_pczt(OsRng, &fee_rule)
+        .build_for_pczt(UnwrapErr(SysRng), &fee_rule)
         .map_err(|e| Error::Craft(format!("build_for_pczt: {e:?}")))?;
     let n_actions_orchard = pczt_result
         .pczt_parts
@@ -710,14 +712,14 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     };
 
     let pczt = IoFinalizer::new(pczt)
-        .finalize_io()
+        .finalize_io(UnwrapErr(SysRng))
         .map_err(|e| Error::Craft(format!("PCZT IoFinalizer: {e:?}")))?;
 
     // Generate the Orchard proof only when the bundle exists.
     let prover = Prover::new(pczt);
     let pczt = if prover.requires_orchard_proof() {
         prover
-            .create_orchard_proof(orchard_proving_key_for(&network, target))
+            .create_orchard_proof(UnwrapErr(SysRng), orchard_proving_key_for(&network, target))
             .map_err(|e| Error::Craft(format!("PCZT Prover (orchard): {e:?}")))?
             .finish()
     } else {
@@ -1558,7 +1560,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
 
     // ── 3. build_for_pczt + PCZT roles ───────────────────────────────────────
     let pczt_result = builder
-        .build_for_pczt(OsRng, &fee_rule)
+        .build_for_pczt(UnwrapErr(SysRng), &fee_rule)
         .map_err(|e| Error::Craft(format!("build_for_pczt: {e:?}")))?;
     let n_actions_ironwood = pczt_result
         .pczt_parts
@@ -1577,14 +1579,14 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     let pczt = stamp_ironwood_spend_derivations(pczt, &network, seed_fingerprint, account_index)?;
 
     let pczt = IoFinalizer::new(pczt)
-        .finalize_io()
+        .finalize_io(UnwrapErr(SysRng))
         .map_err(|e| Error::Craft(format!("PCZT IoFinalizer: {e:?}")))?;
 
     // Generate the Ironwood proof, using the pool-shared `PostNu6_3` key.
     let prover = Prover::new(pczt);
     let pczt = if prover.requires_ironwood_proof() {
         prover
-            .create_ironwood_proof(ironwood_proving_key())
+            .create_ironwood_proof(UnwrapErr(SysRng), ironwood_proving_key())
             .map_err(|e| Error::Craft(format!("PCZT Prover (ironwood): {e:?}")))?
             .finish()
     } else {
@@ -2089,10 +2091,9 @@ mod tests {
 
     /// A deterministic compressed secp256k1 pubkey (33 bytes) for testing.
     fn make_test_pubkey() -> [u8; 33] {
-        use secp256k1::{Secp256k1, SecretKey};
-        let secp = Secp256k1::new();
-        let sk = SecretKey::from_slice(&[0x01u8; 32]).unwrap();
-        secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+        use secp256k1::SecretKey;
+        let sk = SecretKey::from_secret_bytes([0x01u8; 32]).unwrap();
+        secp256k1::PublicKey::from_secret_key(&sk).serialize()
     }
 
     /// HASH160 (RIPEMD160 ∘ SHA256) of a compressed pubkey — the value that a
@@ -2674,7 +2675,7 @@ mod tests {
                     let note = action.output().encrypted_note();
                     assert_eq!(note.epk_bytes.len(), 32);
                     assert_eq!(
-                        note.enc_ciphertext.len(),
+                        note.enc_ciphertext.0.len(),
                         ORCHARD_ENC_CIPHERTEXT_SIZE,
                         "enc_ciphertext size must match device constant"
                     );
@@ -3375,10 +3376,9 @@ mod tests {
         let fvk = make_fvk();
         let input_pubkey = make_test_pubkey();
         let change_pubkey = {
-            use secp256k1::{Secp256k1, SecretKey};
-            let secp = Secp256k1::new();
-            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
-            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+            use secp256k1::SecretKey;
+            let sk = SecretKey::from_secret_bytes([0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&sk).serialize()
         };
         let t_recv = TransparentAddress::PublicKeyHash([0x22u8; 20]);
         let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
@@ -3638,10 +3638,9 @@ mod tests {
         let (anchor, _path) = synthetic_anchor_and_path(leaf);
 
         let change_pubkey = {
-            use secp256k1::{Secp256k1, SecretKey};
-            let secp = Secp256k1::new();
-            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
-            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+            use secp256k1::SecretKey;
+            let sk = SecretKey::from_secret_bytes([0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&sk).serialize()
         };
         let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
 
@@ -4121,10 +4120,9 @@ mod tests {
         let recipient = fvk.address_at(0u32, Scope::External);
 
         let change_pubkey = {
-            use secp256k1::{Secp256k1, SecretKey};
-            let secp = Secp256k1::new();
-            let sk = SecretKey::from_slice(&[0x02u8; 32]).unwrap();
-            secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+            use secp256k1::SecretKey;
+            let sk = SecretKey::from_secret_bytes([0x02u8; 32]).unwrap();
+            secp256k1::PublicKey::from_secret_key(&sk).serialize()
         };
         let t_change = TransparentAddress::PublicKeyHash([0x33u8; 20]);
 
@@ -4287,19 +4285,23 @@ mod tests {
             .unwrap();
 
         let fee_rule = FeeRule::standard();
-        let pczt_result = builder.build_for_pczt(OsRng, &fee_rule).unwrap();
+        let pczt_result = builder
+            .build_for_pczt(UnwrapErr(SysRng), &fee_rule)
+            .unwrap();
         let pczt: Pczt = Creator::build_from_parts(pczt_result.pczt_parts).unwrap();
-        let pczt = IoFinalizer::new(pczt).finalize_io().unwrap();
+        let pczt = IoFinalizer::new(pczt)
+            .finalize_io(UnwrapErr(SysRng))
+            .unwrap();
 
         let prover = Prover::new(pczt);
         assert!(prover.requires_orchard_proof());
         assert!(prover.requires_ironwood_proof());
 
         let prover = prover
-            .create_orchard_proof(ironwood_proving_key())
+            .create_orchard_proof(UnwrapErr(SysRng), ironwood_proving_key())
             .expect("the shared PostNu6_3 key must prove the Orchard bundle");
         let pczt = prover
-            .create_ironwood_proof(ironwood_proving_key())
+            .create_ironwood_proof(UnwrapErr(SysRng), ironwood_proving_key())
             .expect("the shared PostNu6_3 key must prove the Ironwood bundle")
             .finish();
 
@@ -4785,7 +4787,7 @@ mod tests {
     }
 
     #[test]
-    fn next_upgrade_walks_the_sequence_and_ends_at_nu6_3() {
+    fn next_upgrade_walks_the_sequence_and_ends_at_nu7() {
         let mut seen = vec![NetworkUpgrade::Overwinter];
         while let Some(next) = next_upgrade(*seen.last().unwrap()) {
             seen.push(next);
@@ -4803,14 +4805,43 @@ mod tests {
                 NetworkUpgrade::Nu6_1,
                 NetworkUpgrade::Nu6_2,
                 NetworkUpgrade::Nu6_3,
+                NetworkUpgrade::Nu7,
             ]
+        );
+    }
+
+    /// The testnet NU7 activation height the pinned `zcash_protocol` defines.
+    fn testnet_nu7_activation_height() -> BlockHeight {
+        Network::TestNetwork
+            .activation_height(NetworkUpgrade::Nu7)
+            .expect("the pinned zcash_protocol defines the testnet NU7 activation height")
+    }
+
+    #[test]
+    fn next_activation_height_after_nu6_3_is_nu7_on_testnet() {
+        let network = AnyZcashNetwork::Named(Network::TestNetwork);
+        let past_nu6_3 = BlockHeight::from_u32(nu6_3_activation_height(Network::TestNetwork) + 1);
+        assert_eq!(
+            next_activation_height(&network, past_nu6_3),
+            Some(testnet_nu7_activation_height())
+        );
+    }
+
+    #[test]
+    fn cap_refuses_a_testnet_target_too_close_to_nu7() {
+        let network = AnyZcashNetwork::Named(Network::TestNetwork);
+        let target = testnet_nu7_activation_height() - 3;
+        let err = cap_expiry_below_next_activation(&network, target, target + 40).unwrap_err();
+        assert!(
+            matches!(err, Error::ExpiryTooCloseToActivation { .. }),
+            "a send three blocks before NU7 cannot keep the minimum validity: {err:?}"
         );
     }
 
     #[test]
     fn next_activation_height_is_none_past_the_last_known_upgrade() {
-        let network = AnyZcashNetwork::Named(Network::MainNetwork);
-        let past = BlockHeight::from_u32(nu6_3_activation_height(Network::MainNetwork) + 1);
+        let network = AnyZcashNetwork::Named(Network::TestNetwork);
+        let past = testnet_nu7_activation_height() + 1;
         assert_eq!(next_activation_height(&network, past), None);
     }
 
@@ -4830,8 +4861,8 @@ mod tests {
 
     #[test]
     fn cap_leaves_expiry_unchanged_without_a_later_activation() {
-        let network = AnyZcashNetwork::Named(Network::MainNetwork);
-        let target = BlockHeight::from_u32(nu6_3_activation_height(Network::MainNetwork) + 1);
+        let network = AnyZcashNetwork::Named(Network::TestNetwork);
+        let target = testnet_nu7_activation_height() + 1;
         let expiry = target + 40;
         assert_eq!(
             cap_expiry_below_next_activation(&network, target, expiry).unwrap(),

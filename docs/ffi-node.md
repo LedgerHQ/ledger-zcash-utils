@@ -114,8 +114,9 @@ const result: BuildTransactionResult = await buildTransaction({
 // The expiry is the upstream builder's default for the target block, lowered to
 // one block below the next network upgrade when one is ahead. "Ahead" means an
 // upgrade the bundled consensus parameters give a height for: with the current
-// `zcash_protocol` pin, mainnet and testnet have none past NU6.3, so the cap only
-// takes effect for NU7 once a release carrying NU7's heights ships. When the cap
+// `zcash_protocol` pin, testnet has NU7's height but mainnet has none past NU6.3,
+// so on mainnet the cap only takes effect for NU7 once a release carrying its
+// mainnet height ships. When the cap
 // leaves fewer than 8 blocks of validity (zcashd's 3-block expiring-soon rule, plus 5
 // blocks for signing on the device) the craft is refused with an error whose
 // message contains `expiry too close to activation`; retry once the upgrade has

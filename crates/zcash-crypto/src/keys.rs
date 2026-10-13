@@ -7,7 +7,7 @@ use bitcoin::{
 };
 use orchard::keys::{FullViewingKey as OrchardFvk, Scope as OrchardScope};
 use sapling_crypto::zip32::DiversifiableFullViewingKey as SaplingDfvk;
-use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
+use zcash_address::unified::{Container, Encoding, Fvk, Ufvk, Uitem};
 use zcash_keys::{
     address::UnifiedAddress,
     keys::{UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
@@ -92,9 +92,10 @@ impl Default for DeriveOptions {
 pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error> {
     // Fixed messages: upstream Display impls are not guaranteed to omit the input
     // string, and echoing a UFVK into logs or error payloads is a privacy leak.
-    let (network_type, container) = Ufvk::decode(ufvk_str).map_err(|_| Error::InvalidUfvk {
-        reason: "bech32m decoding failed".into(),
-    })?;
+    let (network_type, _revision, container) =
+        Ufvk::decode(ufvk_str).map_err(|_| Error::InvalidUfvk {
+            reason: "bech32m decoding failed".into(),
+        })?;
 
     let ufvk = UnifiedFullViewingKey::parse(&container).map_err(|_| Error::InvalidUfvk {
         reason: "FVK parsing failed".into(),
@@ -106,7 +107,7 @@ pub fn orchard_address_from_ufvk(ufvk_str: &str) -> Result<String, Error> {
 
     // from_receivers returns None when neither Orchard nor Sapling is Some.
     // Orchard is always Some here (concrete address from address_at()), so this is unreachable.
-    let ua = UnifiedAddress::from_receivers(Some(address), None, None)
+    let ua = UnifiedAddress::from_receivers(Some(address), None, None, None, None)
         .expect("unreachable: Orchard receiver is always Some");
 
     let consensus_network = match network_type {
@@ -201,18 +202,23 @@ pub fn derive_keys_with_options(
     let usk = UnifiedSpendingKey::from_seed(&zcash_net, &seed, account_id)
         .map_err(|e| Error::Derivation(format!("{e:?}")))?;
     let ufvk_obj = usk.to_unified_full_viewing_key();
+    let encoded_ufvk = ufvk_obj
+        .encode(&zcash_net)
+        .map_err(|e| Error::Derivation(format!("failed to encode generated UFVK: {e}")))?;
     let ufvk = if options.include_sapling_in_ufvk {
-        ufvk_obj.encode(&zcash_net)
+        encoded_ufvk
     } else {
-        let (ufvk_net, ufvk_container) = Ufvk::decode(&ufvk_obj.encode(&zcash_net))
+        // Rebuilt at the revision the full key was encoded at, so dropping Sapling does not
+        // change the encoding (and its `uview` prefix) of what remains.
+        let (ufvk_net, ufvk_revision, ufvk_container) = Ufvk::decode(&encoded_ufvk)
             .map_err(|e| Error::Derivation(format!("failed to parse generated UFVK: {e}")))?;
         let filtered_items = ufvk_container
             .items_as_parsed()
             .iter()
-            .filter(|item| !matches!(item, Fvk::Sapling(_)))
+            .filter(|item| !matches!(item, Uitem::Data(Fvk::Sapling(_))))
             .cloned()
             .collect();
-        Ufvk::try_from_items(filtered_items)
+        Ufvk::try_from_items(ufvk_revision, filtered_items)
             .map(|ufvk| ufvk.encode(&ufvk_net))
             .map_err(|e| {
                 Error::Derivation(format!("failed to rebuild UFVK without sapling: {e}"))
@@ -361,7 +367,7 @@ mod tests {
 
         // Verify UFVK components instead of exact string (encoding depends on
         // whether the `transparent-inputs` feature enables P2PKH inclusion).
-        let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_, _, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
         let items = ufvk.items();
         assert!(
             items.iter().any(|item| matches!(item, Fvk::Orchard(_))),
@@ -409,7 +415,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_, _, ufvk) = Ufvk::decode(&keys.ufvk).unwrap();
         let items = ufvk.items();
 
         assert!(

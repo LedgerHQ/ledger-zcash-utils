@@ -116,10 +116,9 @@ fn h32(s: &str) -> [u8; 32] {
 /// transparent input, mirroring `craft.rs`'s own private test helper (not
 /// reusable across the crate boundary, so duplicated here).
 fn make_test_pubkey() -> [u8; 33] {
-    use secp256k1::{Secp256k1, SecretKey};
-    let secp = Secp256k1::new();
-    let sk = SecretKey::from_slice(&[0x01u8; 32]).unwrap();
-    secp256k1::PublicKey::from_secret_key(&secp, &sk).serialize()
+    use secp256k1::SecretKey;
+    let sk = SecretKey::from_secret_bytes([0x01u8; 32]).unwrap();
+    secp256k1::PublicKey::from_secret_key(&sk).serialize()
 }
 
 /// Standard P2PKH scriptPubKey (25 bytes) for a 20-byte hash.
