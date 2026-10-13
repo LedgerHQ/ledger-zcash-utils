@@ -133,6 +133,20 @@ const result: BuildTransactionResult = await buildTransaction({
 console.log(result.pcztHex);
 ```
 
+#### Regtest nodes with their own activation schedule
+
+`network: "regtest"` assumes the canonical regtest schedule: Overwinter through Canopy at height 1, NU5 through NU6.3 at height 2, NU7 unscheduled. A local node started with other `activation_heights` must pass them as `regtestActivationHeights`, so the builder picks the branch id that node enforces and caps the expiry before the upgrade it has scheduled. Each height given replaces the canonical value and each omitted one keeps it. The schedule is refused if a height is 0, if an upgrade activates before its predecessor, or if any other network is named.
+
+```typescript
+const result = await buildTransaction({
+  // ...same fields as above, with a regtest node behind grpcUrl
+  network: "regtest",
+  regtestActivationHeights: { nu7: 150 },
+});
+```
+
+`buildIronwoodTransaction` takes the same field.
+
 #### Transparent-only sends: no UFVK
 
 A fully transparent send (transparent inputs, transparent recipient) carries no shielded bundle and reads no shielded key material. Its only key requirement is the account-level transparent pubkey at `m/44'/coin'/account'` — used to derive the internal change address and to verify each input's signing path — so it can be built without a UFVK at all. That matters for the wallet: exporting a UFVK takes a user confirmation on the device, and spending public funds must not require one.

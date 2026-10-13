@@ -331,6 +331,48 @@ pub struct TransparentInputJs {
 /// so the rule cannot live in the type. Supplying neither is refused up front,
 /// before any work, rather than deeper in the build. Which one a given flow
 /// needs is on each field below.
+/// Regtest activation heights a local node was started with, one optional
+/// height per network upgrade. Each height given replaces the canonical
+/// regtest value (Overwinter through Canopy at 1, NU5 through NU6.3 at 2, NU7
+/// unscheduled); each one omitted keeps it. Lets the builder pick the same
+/// branch id, and cap the expiry height at the same upcoming activation, as a
+/// node whose `activation_heights` differ from the canonical set.
+#[napi(object)]
+pub struct RegtestActivationHeightsJs {
+    pub overwinter: Option<u32>,
+    pub sapling: Option<u32>,
+    pub blossom: Option<u32>,
+    pub heartwood: Option<u32>,
+    pub canopy: Option<u32>,
+    pub nu5: Option<u32>,
+    pub nu6: Option<u32>,
+    #[napi(js_name = "nu6_1")]
+    pub nu6_1: Option<u32>,
+    #[napi(js_name = "nu6_2")]
+    pub nu6_2: Option<u32>,
+    #[napi(js_name = "nu6_3")]
+    pub nu6_3: Option<u32>,
+    pub nu7: Option<u32>,
+}
+
+impl From<RegtestActivationHeightsJs> for zcash_crypto::network::RegtestActivationHeights {
+    fn from(h: RegtestActivationHeightsJs) -> Self {
+        Self {
+            overwinter: h.overwinter,
+            sapling: h.sapling,
+            blossom: h.blossom,
+            heartwood: h.heartwood,
+            canopy: h.canopy,
+            nu5: h.nu5,
+            nu6: h.nu6,
+            nu6_1: h.nu6_1,
+            nu6_2: h.nu6_2,
+            nu6_3: h.nu6_3,
+            nu7: h.nu7,
+        }
+    }
+}
+
 #[napi(object)]
 pub struct BuildTransactionParams {
     pub grpc_url: String,
@@ -350,6 +392,10 @@ pub struct BuildTransactionParams {
     /// transparent send that omits the UFVK.
     pub transparent_account_pubkey: Option<String>,
     pub network: Option<String>,
+    /// Only with `network: "regtest"`: activation heights of the local node,
+    /// when its schedule differs from the canonical regtest set. Refused with
+    /// any other network.
+    pub regtest_activation_heights: Option<RegtestActivationHeightsJs>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// read from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed before signing.
@@ -460,6 +506,7 @@ pub async fn build_transaction(
         ufvk: params.ufvk,
         transparent_account_pubkey_hex: params.transparent_account_pubkey,
         network: params.network,
+        regtest_activation_heights: params.regtest_activation_heights.map(Into::into),
         seed_fingerprint_hex: params.seed_fingerprint,
         account_index: params.account_index,
         fee_zat: parse_u64(&params.fee_zat, "fee_zat")?,
@@ -527,6 +574,10 @@ pub struct BuildIronwoodTransactionParams {
     pub grpc_url: String,
     pub ufvk: String,
     pub network: Option<String>,
+    /// Only with `network: "regtest"`: activation heights of the local node,
+    /// when its schedule differs from the canonical regtest set. Refused with
+    /// any other network.
+    pub regtest_activation_heights: Option<RegtestActivationHeightsJs>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// read from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed before signing.
@@ -638,6 +689,7 @@ pub async fn build_ironwood_transaction(
         grpc_url: params.grpc_url,
         ufvk: params.ufvk,
         network: params.network,
+        regtest_activation_heights: params.regtest_activation_heights.map(Into::into),
         seed_fingerprint_hex: params.seed_fingerprint,
         account_index: params.account_index,
         fee_zat: parse_u64(&params.fee_zat, "fee_zat")?,

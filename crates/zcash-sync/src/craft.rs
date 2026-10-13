@@ -27,7 +27,7 @@ use zcash_crypto::{
         IronwoodBuildInputs, IronwoodDestination, IronwoodOutputRequest, IronwoodSpendInput,
         OrchardSpendInput, OutputRequest, TransparentInput,
     },
-    network::{parse_any_network, AnyZcashNetwork},
+    network::{resolve_any_network, AnyZcashNetwork, RegtestActivationHeights},
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 use zcash_transparent::keys::AccountPubKey;
@@ -115,8 +115,12 @@ pub struct CraftRequest {
     pub transparent_account_pubkey_hex: Option<String>,
     /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
     /// sync default). `"regtest"` targets a local node whose activation
-    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`, unless
+    /// `regtest_activation_heights` overrides some of them.
     pub network: Option<String>,
+    /// Regtest-only overrides of `ZCASH_REGTEST`'s activation heights, mirroring
+    /// the local node's own schedule. Refused with a named network.
+    pub regtest_activation_heights: Option<RegtestActivationHeights>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed.
@@ -175,7 +179,11 @@ where
         ));
     }
 
-    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = resolve_any_network(
+        req.network.as_deref(),
+        req.regtest_activation_heights.as_ref(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
@@ -546,8 +554,12 @@ pub struct IronwoodCraftRequest {
     pub ufvk: String,
     /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
     /// sync default). `"regtest"` targets a local node whose activation
-    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`, unless
+    /// `regtest_activation_heights` overrides some of them.
     pub network: Option<String>,
+    /// Regtest-only overrides of `ZCASH_REGTEST`'s activation heights, mirroring
+    /// the local node's own schedule. Refused with a named network.
+    pub regtest_activation_heights: Option<RegtestActivationHeights>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed.
@@ -594,7 +606,11 @@ where
         return Err(anyhow!("craft: outputs list is empty"));
     }
 
-    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = resolve_any_network(
+        req.network.as_deref(),
+        req.regtest_activation_heights.as_ref(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
@@ -1044,6 +1060,7 @@ mod tests {
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1057,12 +1074,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regtest_heights_with_named_network_returns_error() {
+        let req = CraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
+            network: Some("mainnet".into()),
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            }),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to \"regtest\""),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_regtest_schedule_returns_error() {
+        let req = CraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
+            network: Some("regtest".into()),
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu6_3: Some(300),
+                nu7: Some(200),
+                ..Default::default()
+            }),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("nu7 (200) activates before nu6_3 (300)"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_outputs_returns_error() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1085,6 +1157,7 @@ mod tests {
             ufvk: Some("this is not a UFVK".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1107,6 +1180,7 @@ mod tests {
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1159,6 +1233,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1222,6 +1297,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -1291,6 +1367,7 @@ mod tests {
             ufvk: Some(ufvk_no_transparent),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1340,6 +1417,7 @@ mod tests {
             ufvk: Some(ufvk_no_transparent),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1438,6 +1516,7 @@ mod tests {
             ufvk,
             transparent_account_pubkey_hex,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1589,6 +1668,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1834,6 +1914,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1852,6 +1933,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1873,6 +1955,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "this is not a UFVK".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1894,6 +1977,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1928,6 +2012,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: keys.ufvk,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1977,6 +2062,7 @@ mod tests {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -2039,6 +2125,7 @@ mod tests {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -2076,6 +2163,22 @@ mod tests {
     }
 
     /// Public→Ironwood request on a refused port, with the given anchor height.
+    #[tokio::test]
+    async fn ironwood_regtest_heights_with_named_network_returns_error() {
+        let req = IronwoodCraftRequest {
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            }),
+            ..public_to_ironwood_request(Some(1))
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to \"regtest\""),
+            "got: {err}"
+        );
+    }
+
     fn public_to_ironwood_request(anchor_height: Option<u32>) -> IronwoodCraftRequest {
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
         use zcash_keys::keys::UnifiedAddressRequest;
@@ -2093,6 +2196,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -2125,9 +2229,10 @@ mod tests {
     /// itself.
     #[tokio::test]
     async fn ironwood_craft_derives_the_anchor_from_the_injected_tip() {
-        let err = craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
-            .await
-            .unwrap_err();
+        let err =
+            craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
+                .await
+                .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "expected anchor-fetch connect failure, got: {err}"
