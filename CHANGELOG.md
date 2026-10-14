@@ -1,5 +1,17 @@
 # @ledgerhq/zcash-utils
 
+## 2.7.0
+
+### Minor Changes
+
+- 9f2aa1f: Move the Zcash crates to their NU7 pre-releases. A transaction whose target block is past NU7 activation is built under the ZIP 259 branch id (`0x77190AD9`), and the expiry cap now sees NU7 ahead on testnet. These releases carry no NU7 mainnet activation height yet, so mainnet transactions keep the NU6.3 branch id until a release that sets it is pinned. The PCZT encoding is unchanged.
+- 695c4e6: `buildTransaction` and `buildIronwoodTransaction` take an optional `regtestActivationHeights` for a regtest node whose activation schedule differs from the canonical one. The builder then selects the branch id that node enforces and caps the expiry below the upgrade it has scheduled. The field is refused with mainnet or testnet.
+- 57191c4: Apply ZIP 2009's ZIP-317 marginal fee: `buildTransaction` and `buildIronwoodTransaction` accept a fee computed at 1,000 zatoshis per logical action on mainnet from height 3,590,000 and on test networks, and keep 5,000 on mainnet below that height. A fee computed at 5,000 is still accepted past the switch.
+
+### Patch Changes
+
+- 38e0cfe: The error returned by `buildTransaction` and `buildIronwoodTransaction` for a fee that does not satisfy ZIP-317 reads `craft error: fee …` once, instead of repeating the `craft error:` prefix.
+
 ## 2.6.0
 
 ### Minor Changes
