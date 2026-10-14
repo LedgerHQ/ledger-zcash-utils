@@ -27,7 +27,7 @@ use zcash_crypto::{
         IronwoodBuildInputs, IronwoodDestination, IronwoodOutputRequest, IronwoodSpendInput,
         OrchardSpendInput, OutputRequest, TransparentInput,
     },
-    network::{parse_any_network, AnyZcashNetwork},
+    network::{resolve_any_network, AnyZcashNetwork, RegtestActivationHeights},
 };
 use zcash_keys::{address::Address, keys::UnifiedFullViewingKey};
 use zcash_transparent::keys::AccountPubKey;
@@ -115,8 +115,12 @@ pub struct CraftRequest {
     pub transparent_account_pubkey_hex: Option<String>,
     /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
     /// sync default). `"regtest"` targets a local node whose activation
-    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`, unless
+    /// `regtest_activation_heights` overrides some of them.
     pub network: Option<String>,
+    /// Regtest-only overrides of `ZCASH_REGTEST`'s activation heights, mirroring
+    /// the local node's own schedule. Refused with a named network.
+    pub regtest_activation_heights: Option<RegtestActivationHeights>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed.
@@ -175,7 +179,11 @@ where
         ));
     }
 
-    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = resolve_any_network(
+        req.network.as_deref(),
+        req.regtest_activation_heights.as_ref(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
@@ -185,7 +193,7 @@ where
         .ufvk
         .as_deref()
         .map(|encoded| {
-            let (_net, ufvk_str) =
+            let (_net, _revision, ufvk_str) =
                 Ufvk::decode(encoded).map_err(|e| anyhow!("UFVK decode failed: {e:?}"))?;
             UnifiedFullViewingKey::parse(&ufvk_str).map_err(|e| anyhow!("UFVK parse failed: {e:?}"))
         })
@@ -245,7 +253,7 @@ where
     // a change address or a signing path that does not belong to the funds being
     // spent, so it fails the build rather than picking a winner.
     let account_pubkey: Option<AccountPubKey> = match (
-        ufvk.as_ref().and_then(|k| k.transparent()),
+        ufvk.as_ref().and_then(|k| k.p2pkh()),
         req.transparent_account_pubkey_hex.as_deref(),
     ) {
         (Some(from_ufvk), Some(explicit_hex)) => {
@@ -546,8 +554,12 @@ pub struct IronwoodCraftRequest {
     pub ufvk: String,
     /// `"mainnet"` / `"testnet"` / `"regtest"`. `None` ⇒ testnet (matches
     /// sync default). `"regtest"` targets a local node whose activation
-    /// heights match `zcash_crypto::network::ZCASH_REGTEST`.
+    /// heights match `zcash_crypto::network::ZCASH_REGTEST`, unless
+    /// `regtest_activation_heights` overrides some of them.
     pub network: Option<String>,
+    /// Regtest-only overrides of `ZCASH_REGTEST`'s activation heights, mirroring
+    /// the local node's own schedule. Refused with a named network.
+    pub regtest_activation_heights: Option<RegtestActivationHeights>,
     /// 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
     /// obtained from the device. Stamped onto each real spend so the device can
     /// confirm the PCZT belongs to its seed.
@@ -594,11 +606,15 @@ where
         return Err(anyhow!("craft: outputs list is empty"));
     }
 
-    let network = parse_any_network(req.network.as_deref()).map_err(|e| anyhow!("{e}"))?;
+    let network = resolve_any_network(
+        req.network.as_deref(),
+        req.regtest_activation_heights.as_ref(),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
     let seed_fingerprint = hex_to_array::<32>(&req.seed_fingerprint_hex, "seed_fingerprint")?;
 
     // ── 1. Parse UFVK ─────────────────────────────────────────────────────────
-    let (_net, ufvk_str) =
+    let (_net, _revision, ufvk_str) =
         Ufvk::decode(&req.ufvk).map_err(|e| anyhow!("UFVK decode failed: {e:?}"))?;
     let ufvk =
         UnifiedFullViewingKey::parse(&ufvk_str).map_err(|e| anyhow!("UFVK parse failed: {e:?}"))?;
@@ -678,7 +694,7 @@ where
         [u8; 33],
         u32,
     )> = if !has_ironwood_spends {
-        let derived = ufvk.transparent().and_then(|tpk| {
+        let derived = ufvk.p2pkh().and_then(|tpk| {
             use zcash_transparent::keys::{IncomingViewingKey, TransparentKeyScope};
             let ivk = tpk.derive_internal_ivk().ok()?;
             let (addr, index) = ivk.default_address();
@@ -783,8 +799,7 @@ where
     };
 
     // ── 5. Decode + verify transparent inputs ────────────────────────────────
-    let transparent_inputs =
-        decode_transparent_inputs(ufvk.transparent(), &req.transparent_inputs)?;
+    let transparent_inputs = decode_transparent_inputs(ufvk.p2pkh(), &req.transparent_inputs)?;
 
     // Destinations were decoded once in step 1 and reused here as `outputs`.
 
@@ -1045,6 +1060,7 @@ mod tests {
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1058,12 +1074,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regtest_heights_with_named_network_returns_error() {
+        let req = CraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
+            network: Some("mainnet".into()),
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            }),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to \"regtest\""),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_regtest_schedule_returns_error() {
+        let req = CraftRequest {
+            grpc_url: "https://127.0.0.1:1".into(),
+            ufvk: Some("uview1bogus".into()),
+            transparent_account_pubkey_hex: None,
+            network: Some("regtest".into()),
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu6_3: Some(300),
+                nu7: Some(200),
+                ..Default::default()
+            }),
+            seed_fingerprint_hex: "42".repeat(32),
+            account_index: 0,
+            fee_zat: 10_000,
+            spends: vec![],
+            transparent_inputs: vec![dummy_transparent_input()],
+            outputs: vec![dummy_output()],
+            anchor_height: Some(1),
+        };
+        let err = craft_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("nu7 (200) activates before nu6_3 (300)"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_outputs_returns_error() {
         let req = CraftRequest {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1086,6 +1157,7 @@ mod tests {
             ufvk: Some("this is not a UFVK".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1108,6 +1180,7 @@ mod tests {
             ufvk: Some("uview1bogus".into()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1160,6 +1233,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1203,7 +1277,7 @@ mod tests {
 
         // Real UFVK + matching Orchard unified address for mainnet.
         let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_net, _revision, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
         let (ua, _) = ufvk
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
@@ -1223,6 +1297,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -1267,7 +1342,7 @@ mod tests {
     /// generic builder error later.
     #[tokio::test]
     async fn transparent_change_without_transparent_ufvk_fails_fast() {
-        use zcash_address::unified::{Container, Fvk};
+        use zcash_address::unified::{Container, Fvk, Uitem};
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
 
         const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -1275,14 +1350,16 @@ mod tests {
         // Derive a real UFVK, then strip the transparent (P2PKH) component so the
         // wallet has no transparent receiver to source an internal change address.
         let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (net, ufvk_revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
         let filtered = container
             .items_as_parsed()
             .iter()
-            .filter(|item| !matches!(item, Fvk::P2pkh(_)))
+            .filter(|item| !matches!(item, Uitem::Data(Fvk::P2pkh(_))))
             .cloned()
             .collect::<Vec<_>>();
-        let ufvk_no_transparent = Ufvk::try_from_items(filtered).unwrap().encode(&net);
+        let ufvk_no_transparent = Ufvk::try_from_items(ufvk_revision, filtered)
+            .unwrap()
+            .encode(&net);
 
         // 100_000 in, 10_000 out, 10_000 fee → 80_000 of transparent change.
         let req = CraftRequest {
@@ -1290,6 +1367,7 @@ mod tests {
             ufvk: Some(ufvk_no_transparent),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1316,20 +1394,22 @@ mod tests {
     /// past change derivation and proceed to the build.
     #[tokio::test]
     async fn transparent_exact_balance_without_transparent_ufvk_is_allowed() {
-        use zcash_address::unified::{Container, Fvk};
+        use zcash_address::unified::{Container, Fvk, Uitem};
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
 
         const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
         let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (net, ufvk_revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
         let filtered = container
             .items_as_parsed()
             .iter()
-            .filter(|item| !matches!(item, Fvk::P2pkh(_)))
+            .filter(|item| !matches!(item, Uitem::Data(Fvk::P2pkh(_))))
             .cloned()
             .collect::<Vec<_>>();
-        let ufvk_no_transparent = Ufvk::try_from_items(filtered).unwrap().encode(&net);
+        let ufvk_no_transparent = Ufvk::try_from_items(ufvk_revision, filtered)
+            .unwrap()
+            .encode(&net);
 
         // 100_000 in, 90_000 out, 10_000 fee → exactly 0 change.
         let req = CraftRequest {
@@ -1337,6 +1417,7 @@ mod tests {
             ufvk: Some(ufvk_no_transparent),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1373,12 +1454,9 @@ mod tests {
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
 
         let keys = derive_keys(TEST_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (_net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_net, _revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&container).unwrap();
-        let apk = ufvk
-            .transparent()
-            .expect("test UFVK has a P2PKH item")
-            .clone();
+        let apk = ufvk.p2pkh().expect("test UFVK has a P2PKH item").clone();
         let apk_hex = hex::encode(apk.serialize());
         (keys.ufvk, apk, apk_hex)
     }
@@ -1438,6 +1516,7 @@ mod tests {
             ufvk,
             transparent_account_pubkey_hex,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1589,6 +1668,7 @@ mod tests {
             ufvk: Some(keys.ufvk.clone()),
             transparent_account_pubkey_hex: None,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1656,19 +1736,21 @@ mod tests {
     /// supplied) and step 5 refuses the input it cannot verify.
     #[tokio::test]
     async fn transparent_input_unverifiable_under_the_supplied_ufvk_is_rejected() {
-        use zcash_address::unified::{Container, Fvk};
+        use zcash_address::unified::{Container, Fvk, Uitem};
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
 
         let (_ufvk, apk, _apk_hex) = test_account_keys();
         let keys = derive_keys(TEST_MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (net, ufvk_revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
         let filtered = container
             .items_as_parsed()
             .iter()
-            .filter(|item| !matches!(item, Fvk::P2pkh(_)))
+            .filter(|item| !matches!(item, Uitem::Data(Fvk::P2pkh(_))))
             .cloned()
             .collect::<Vec<_>>();
-        let ufvk_no_transparent = Ufvk::try_from_items(filtered).unwrap().encode(&net);
+        let ufvk_no_transparent = Ufvk::try_from_items(ufvk_revision, filtered)
+            .unwrap()
+            .encode(&net);
 
         // Exact balance, so the change guard does not fire first and the error
         // comes from input verification.
@@ -1698,11 +1780,11 @@ mod tests {
 
         let (ufvk, apk, _apk_hex) = test_account_keys();
         let other = derive_keys(TEST_MNEMONIC, 1, ZcashNetwork::Mainnet, None).unwrap();
-        let (_net, other_container) = Ufvk::decode(&other.ufvk).unwrap();
+        let (_net, _revision, other_container) = Ufvk::decode(&other.ufvk).unwrap();
         let other_apk_hex = hex::encode(
             UnifiedFullViewingKey::parse(&other_container)
                 .unwrap()
-                .transparent()
+                .p2pkh()
                 .unwrap()
                 .serialize(),
         );
@@ -1764,7 +1846,7 @@ mod tests {
         use zcash_protocol::consensus::Network;
 
         let (ufvk_str, apk, apk_hex) = test_account_keys();
-        let (_net, container) = Ufvk::decode(&ufvk_str).unwrap();
+        let (_net, _revision, container) = Ufvk::decode(&ufvk_str).unwrap();
         let (ua, _) = UnifiedFullViewingKey::parse(&container)
             .unwrap()
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
@@ -1832,6 +1914,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1850,6 +1933,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1871,6 +1955,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "this is not a UFVK".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1892,6 +1977,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: "uview1bogus".into(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1926,6 +2012,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: keys.ufvk,
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -1957,7 +2044,7 @@ mod tests {
         // A real (Orchard-family) destination address matching the UFVK — the
         // output must decode successfully so the request reaches the witness
         // fetch, not fail earlier on address decoding.
-        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_net, _revision, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
         let (ua, _) = ufvk
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
@@ -1975,6 +2062,7 @@ mod tests {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 10_000,
@@ -2019,7 +2107,7 @@ mod tests {
         const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
         let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_net, _revision, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
         let (ua, _) = ufvk
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
@@ -2037,6 +2125,7 @@ mod tests {
             grpc_url: format!("https://127.0.0.1:{}", addr.port()),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -2074,6 +2163,22 @@ mod tests {
     }
 
     /// Public→Ironwood request on a refused port, with the given anchor height.
+    #[tokio::test]
+    async fn ironwood_regtest_heights_with_named_network_returns_error() {
+        let req = IronwoodCraftRequest {
+            regtest_activation_heights: Some(RegtestActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            }),
+            ..public_to_ironwood_request(Some(1))
+        };
+        let err = craft_ironwood_transaction(req).await.unwrap_err();
+        assert!(
+            err.to_string().contains("only apply to \"regtest\""),
+            "got: {err}"
+        );
+    }
+
     fn public_to_ironwood_request(anchor_height: Option<u32>) -> IronwoodCraftRequest {
         use zcash_crypto::keys::{derive_keys, ZcashNetwork};
         use zcash_keys::keys::UnifiedAddressRequest;
@@ -2082,7 +2187,7 @@ mod tests {
         const MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
         let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-        let (_net, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
+        let (_net, _revision, ufvk_str) = Ufvk::decode(&keys.ufvk).unwrap();
         let ufvk = UnifiedFullViewingKey::parse(&ufvk_str).unwrap();
         let (ua, _) = ufvk
             .default_address(UnifiedAddressRequest::AllAvailableKeys)
@@ -2091,6 +2196,7 @@ mod tests {
             grpc_url: "https://127.0.0.1:1".into(),
             ufvk: keys.ufvk.clone(),
             network: Some("mainnet".into()),
+            regtest_activation_heights: None,
             seed_fingerprint_hex: "42".repeat(32),
             account_index: 0,
             fee_zat: 15_000,
@@ -2123,9 +2229,10 @@ mod tests {
     /// itself.
     #[tokio::test]
     async fn ironwood_craft_derives_the_anchor_from_the_injected_tip() {
-        let err = craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
-            .await
-            .unwrap_err();
+        let err =
+            craft_ironwood_transaction_with_tip(public_to_ironwood_request(None), offline_tip)
+                .await
+                .unwrap_err();
         assert!(
             err.to_string().contains("gRPC connect failed"),
             "expected anchor-fetch connect failure, got: {err}"

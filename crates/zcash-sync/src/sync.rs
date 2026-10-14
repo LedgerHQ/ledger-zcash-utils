@@ -826,8 +826,8 @@ fn parse_sync_keys(
 ) -> Result<(Network, Arc<PreparedIvks>, UnifiedFullViewingKey)> {
     let network = parse_network(network_str).map_err(|e| anyhow!("{}", e))?;
     let ivks = decrypt::prepare_ivks_arc(viewing_key).map_err(|e| anyhow!("{}", e))?;
-    let (_net, ufvk_str) = Ufvk::decode(viewing_key)
-        .map_err(|e| anyhow!("UFVK decode failed: {:?}", e))?;
+    let (_net, _revision, ufvk_str) =
+        Ufvk::decode(viewing_key).map_err(|e| anyhow!("UFVK decode failed: {:?}", e))?;
     let ufvk = UnifiedFullViewingKey::parse(&ufvk_str)
         .map_err(|e| anyhow!("UFVK parse failed: {:?}", e))?;
     Ok((network, ivks, ufvk))

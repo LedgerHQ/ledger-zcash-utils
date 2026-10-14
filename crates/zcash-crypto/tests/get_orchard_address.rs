@@ -1,4 +1,4 @@
-use zcash_address::unified::{Container, Encoding, Fvk, Ufvk};
+use zcash_address::unified::{Container, Encoding, Fvk, Ufvk, Uitem};
 use zcash_crypto::error::Error;
 use zcash_crypto::keys::{derive_keys, orchard_address_from_ufvk, ZcashNetwork};
 use zcash_protocol::consensus::NetworkType;
@@ -101,16 +101,18 @@ fn sapling_only_ufvk_returns_no_orchard_receiver_error() {
     // Derive a real UFVK, strip the Orchard component → valid Sapling-only UFVK.
     // Tests that the error is NoOrchardReceiver, distinct from InvalidUfvk.
     let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-    let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
+    let (net, revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
 
-    let sapling_only: Vec<Fvk> = container
+    let sapling_only: Vec<Uitem<Fvk>> = container
         .items_as_parsed()
         .iter()
-        .filter(|item| matches!(item, Fvk::Sapling(_)))
+        .filter(|item| matches!(item, Uitem::Data(Fvk::Sapling(_))))
         .cloned()
         .collect();
 
-    let encoded = Ufvk::try_from_items(sapling_only).unwrap().encode(&net);
+    let encoded = Ufvk::try_from_items(revision, sapling_only)
+        .unwrap()
+        .encode(&net);
 
     let err = orchard_address_from_ufvk(&encoded).unwrap_err();
     assert!(
@@ -123,9 +125,9 @@ fn sapling_only_ufvk_returns_no_orchard_receiver_error() {
 fn regtest_ufvk_returns_unsupported_network_error() {
     // Re-encode a valid mainnet UFVK with the regtest HRP to simulate a regtest UFVK.
     let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-    let (_, container) = Ufvk::decode(&keys.ufvk).unwrap();
-    let items: Vec<Fvk> = container.items_as_parsed().to_vec();
-    let regtest_ufvk = Ufvk::try_from_items(items)
+    let (_, ufvk_revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
+    let items: Vec<Uitem<Fvk>> = container.items_as_parsed().to_vec();
+    let regtest_ufvk = Ufvk::try_from_items(ufvk_revision, items)
         .unwrap()
         .encode(&NetworkType::Regtest);
 
@@ -142,14 +144,16 @@ fn invalid_and_no_orchard_errors_are_distinct() {
     assert!(matches!(invalid_err, Error::InvalidUfvk { .. }));
 
     let keys = derive_keys(MNEMONIC, 0, ZcashNetwork::Mainnet, None).unwrap();
-    let (net, container) = Ufvk::decode(&keys.ufvk).unwrap();
-    let sapling_only: Vec<Fvk> = container
+    let (net, ufvk_revision, container) = Ufvk::decode(&keys.ufvk).unwrap();
+    let sapling_only: Vec<Uitem<Fvk>> = container
         .items_as_parsed()
         .iter()
-        .filter(|item| matches!(item, Fvk::Sapling(_)))
+        .filter(|item| matches!(item, Uitem::Data(Fvk::Sapling(_))))
         .cloned()
         .collect();
-    let encoded = Ufvk::try_from_items(sapling_only).unwrap().encode(&net);
+    let encoded = Ufvk::try_from_items(ufvk_revision, sapling_only)
+        .unwrap()
+        .encode(&net);
     let no_orchard_err = orchard_address_from_ufvk(&encoded).unwrap_err();
 
     assert!(matches!(no_orchard_err, Error::NoOrchardReceiver));

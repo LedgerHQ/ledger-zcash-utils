@@ -114,8 +114,9 @@ const result: BuildTransactionResult = await buildTransaction({
 // The expiry is the upstream builder's default for the target block, lowered to
 // one block below the next network upgrade when one is ahead. "Ahead" means an
 // upgrade the bundled consensus parameters give a height for: with the current
-// `zcash_protocol` pin, mainnet and testnet have none past NU6.3, so the cap only
-// takes effect for NU7 once a release carrying NU7's heights ships. When the cap
+// `zcash_protocol` pin, testnet has NU7's height but mainnet has none past NU6.3,
+// so on mainnet the cap only takes effect for NU7 once a release carrying its
+// mainnet height ships. When the cap
 // leaves fewer than 8 blocks of validity (zcashd's 3-block expiring-soon rule, plus 5
 // blocks for signing on the device) the craft is refused with an error whose
 // message contains `expiry too close to activation`; retry once the upgrade has
@@ -131,6 +132,20 @@ const result: BuildTransactionResult = await buildTransaction({
 // result.nActionsOrchard — Orchard action count after dummy padding
 console.log(result.pcztHex);
 ```
+
+#### Regtest nodes with their own activation schedule
+
+`network: "regtest"` assumes the canonical regtest schedule: Overwinter through Canopy at height 1, NU5 through NU6.3 at height 2, NU7 unscheduled. A local node started with other `activation_heights` must pass them as `regtestActivationHeights`, so the builder picks the branch id that node enforces and caps the expiry before the upgrade it has scheduled. Each height given replaces the canonical value and each omitted one keeps it. The schedule is refused if a height is 0, if an upgrade activates before its predecessor, or if any other network is named.
+
+```typescript
+const result = await buildTransaction({
+  // ...same fields as above, with a regtest node behind grpcUrl
+  network: "regtest",
+  regtestActivationHeights: { nu7: 150 },
+});
+```
+
+`buildIronwoodTransaction` takes the same field.
 
 #### Transparent-only sends: no UFVK
 

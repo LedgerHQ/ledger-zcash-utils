@@ -489,7 +489,7 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
         seed_fingerprint,
         cmx: output.cmx().to_bytes(),
         ephemeral_key: note.epk_bytes,
-        enc_ciphertext: note.enc_ciphertext.to_vec(),
+        enc_ciphertext: note.enc_ciphertext.0.to_vec(),
         out_ciphertext: note.out_ciphertext.to_vec(),
         recipient,
         value,

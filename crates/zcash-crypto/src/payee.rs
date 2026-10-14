@@ -62,10 +62,12 @@ pub fn outgoing_payees(
 /// decryption that produced them was itself unsound.
 fn encode_orchard_receiver(bytes: &[u8; 43], network: Network) -> Option<String> {
     let address = orchard::Address::from_raw_address_bytes(bytes).into_option()?;
-    UnifiedAddress::from_receivers(Some(address), None, None).map(|ua| ua.encode(&network))
+    UnifiedAddress::from_receivers(Some(address), None, None, None, None)
+        .map(|ua| ua.encode(&network))
 }
 
 /// Encodes raw Sapling receiver bytes as a `zs`-prefixed address.
 fn encode_sapling_receiver(bytes: &[u8; 43], network: Network) -> Option<String> {
-    PaymentAddress::from_bytes(bytes).map(|address| Address::Sapling(address).encode(&network))
+    PaymentAddress::from_bytes(bytes)
+        .map(|address| Address::Sapling(Box::new(address)).encode(&network))
 }

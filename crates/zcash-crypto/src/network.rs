@@ -95,9 +95,9 @@ impl From<LocalNetwork> for AnyZcashNetwork {
 /// height 2, and NU6/NU6.1/NU6.2/NU6.3 at height 2. Mirrors a `zcashd`/`zebrad`
 /// regtest node's default `nuparams` configuration.
 ///
-/// This crate does not support per-caller regtest activation heights (see
-/// [`parse_any_network`]) — a caller running against a regtest node configured
-/// with different `nuparams` is not supported today.
+/// A caller whose regtest node schedules its upgrades differently overrides
+/// individual heights with [`RegtestActivationHeights`] (see
+/// [`resolve_any_network`]); every height it leaves unset keeps the value here.
 pub const ZCASH_REGTEST: LocalNetwork = LocalNetwork {
     overwinter: Some(BlockHeight::from_u32(1)),
     sapling: Some(BlockHeight::from_u32(1)),
@@ -109,7 +109,103 @@ pub const ZCASH_REGTEST: LocalNetwork = LocalNetwork {
     nu6_1: Some(BlockHeight::from_u32(2)),
     nu6_2: Some(BlockHeight::from_u32(2)),
     nu6_3: Some(BlockHeight::from_u32(2)),
+    // Not part of the canonical regtest set: a regtest node only reaches NU7 when its
+    // `nuparams` schedule it, which a caller then mirrors with
+    // `RegtestActivationHeights::nu7`.
+    nu7: None,
 };
+
+/// Caller-supplied regtest activation heights, one per network upgrade.
+///
+/// Mirrors the `nuparams` (zcashd) or `activation_heights` (zebrad) a local
+/// regtest node was started with, so the builder selects the same branch id
+/// and caps the expiry height at the same upcoming activation the node will
+/// enforce. Each `Some` replaces the matching [`ZCASH_REGTEST`] height; each
+/// `None` keeps it. There is no way to unschedule an upgrade the canonical set
+/// activates — no regtest node this crate targets runs without them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegtestActivationHeights {
+    pub overwinter: Option<u32>,
+    pub sapling: Option<u32>,
+    pub blossom: Option<u32>,
+    pub heartwood: Option<u32>,
+    pub canopy: Option<u32>,
+    pub nu5: Option<u32>,
+    pub nu6: Option<u32>,
+    pub nu6_1: Option<u32>,
+    pub nu6_2: Option<u32>,
+    pub nu6_3: Option<u32>,
+    pub nu7: Option<u32>,
+}
+
+impl RegtestActivationHeights {
+    /// Applies these overrides on top of [`ZCASH_REGTEST`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Derivation`] if a height is 0 (the genesis block
+    /// activates nothing) or if the resulting schedule is not ordered: each
+    /// scheduled upgrade must activate at or after its predecessor, and none
+    /// may follow an unscheduled one. A node rejects such a schedule too, so
+    /// accepting it here would only build against a chain that cannot exist.
+    pub fn to_local_network(&self) -> Result<LocalNetwork, Error> {
+        let pick = |name: &str,
+                    over: Option<u32>,
+                    base: Option<BlockHeight>|
+         -> Result<Option<BlockHeight>, Error> {
+            match over {
+                Some(0) => Err(Error::Derivation(format!(
+                    "regtest activation height for {name} must be at least 1"
+                ))),
+                Some(h) => Ok(Some(BlockHeight::from_u32(h))),
+                None => Ok(base),
+            }
+        };
+        let base = ZCASH_REGTEST;
+        let local = LocalNetwork {
+            overwinter: pick("overwinter", self.overwinter, base.overwinter)?,
+            sapling: pick("sapling", self.sapling, base.sapling)?,
+            blossom: pick("blossom", self.blossom, base.blossom)?,
+            heartwood: pick("heartwood", self.heartwood, base.heartwood)?,
+            canopy: pick("canopy", self.canopy, base.canopy)?,
+            nu5: pick("nu5", self.nu5, base.nu5)?,
+            nu6: pick("nu6", self.nu6, base.nu6)?,
+            nu6_1: pick("nu6_1", self.nu6_1, base.nu6_1)?,
+            nu6_2: pick("nu6_2", self.nu6_2, base.nu6_2)?,
+            nu6_3: pick("nu6_3", self.nu6_3, base.nu6_3)?,
+            nu7: pick("nu7", self.nu7, base.nu7)?,
+        };
+
+        let schedule = [
+            ("overwinter", local.overwinter),
+            ("sapling", local.sapling),
+            ("blossom", local.blossom),
+            ("heartwood", local.heartwood),
+            ("canopy", local.canopy),
+            ("nu5", local.nu5),
+            ("nu6", local.nu6),
+            ("nu6_1", local.nu6_1),
+            ("nu6_2", local.nu6_2),
+            ("nu6_3", local.nu6_3),
+            ("nu7", local.nu7),
+        ];
+        for pair in schedule.windows(2) {
+            let ((prev_name, prev), (name, cur)) = (pair[0], pair[1]);
+            match (prev, cur) {
+                (None, Some(_)) => {
+                    return Err(Error::Derivation(format!(
+                        "regtest activation schedule: {name} is scheduled but {prev_name} is not"
+                    )))
+                }
+                (Some(p), Some(c)) if c < p => return Err(Error::Derivation(format!(
+                    "regtest activation schedule: {name} ({c}) activates before {prev_name} ({p})"
+                ))),
+                _ => {}
+            }
+        }
+        Ok(local)
+    }
+}
 
 /// Parse a network name string into an [`AnyZcashNetwork`] for transaction
 /// building.
@@ -127,15 +223,48 @@ pub const ZCASH_REGTEST: LocalNetwork = LocalNetwork {
 ///
 /// Returns [`Error::Derivation`] if the string is not a recognised network name.
 pub fn parse_any_network(s: Option<&str>) -> Result<AnyZcashNetwork, Error> {
-    match s.unwrap_or("testnet") {
-        "testnet" => Ok(AnyZcashNetwork::Named(Network::TestNetwork)),
-        "mainnet" => Ok(AnyZcashNetwork::Named(Network::MainNetwork)),
-        "regtest" => Ok(AnyZcashNetwork::Local(ZCASH_REGTEST)),
-        other => Err(Error::Derivation(format!(
-            "unknown network {:?}, expected \"mainnet\", \"testnet\", or \"regtest\"",
-            other
-        ))),
+    resolve_any_network(s, None)
+}
+
+/// [`parse_any_network`], with the regtest activation heights optionally
+/// overridden by the caller.
+///
+/// `regtest_heights` only applies to `"regtest"`: the named networks'
+/// activation heights are consensus constants, so overrides passed with
+/// `"mainnet"` or `"testnet"` are refused rather than silently ignored.
+///
+/// # Errors
+///
+/// Returns [`Error::Derivation`] if the network name is not recognised, if
+/// overrides accompany a named network, or if the overridden schedule is
+/// invalid (see [`RegtestActivationHeights::to_local_network`]).
+pub fn resolve_any_network(
+    s: Option<&str>,
+    regtest_heights: Option<&RegtestActivationHeights>,
+) -> Result<AnyZcashNetwork, Error> {
+    let name = s.unwrap_or("testnet");
+    let named = match name {
+        "testnet" => Network::TestNetwork,
+        "mainnet" => Network::MainNetwork,
+        "regtest" => {
+            return Ok(AnyZcashNetwork::Local(match regtest_heights {
+                Some(heights) => heights.to_local_network()?,
+                None => ZCASH_REGTEST,
+            }))
+        }
+        other => {
+            return Err(Error::Derivation(format!(
+                "unknown network {:?}, expected \"mainnet\", \"testnet\", or \"regtest\"",
+                other
+            )))
+        }
+    };
+    if regtest_heights.is_some() {
+        return Err(Error::Derivation(format!(
+            "regtest activation heights were supplied for network {name:?}; they only apply to \"regtest\""
+        )));
     }
+    Ok(AnyZcashNetwork::Named(named))
 }
 
 #[cfg(test)]
@@ -277,5 +406,117 @@ mod tests {
         assert!(!local.is_nu_active(NetworkUpgrade::Nu5, BlockHeight::from_u32(1)));
         assert!(local.is_nu_active(NetworkUpgrade::Nu5, BlockHeight::from_u32(2)));
         assert!(local.is_nu_active(NetworkUpgrade::Nu6_3, BlockHeight::from_u32(3)));
+    }
+
+    #[test]
+    fn test_resolve_any_network_without_overrides_matches_parse() {
+        for name in [None, Some("mainnet"), Some("testnet"), Some("regtest")] {
+            assert_eq!(
+                resolve_any_network(name, None).unwrap(),
+                parse_any_network(name).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_any_network_empty_overrides_keep_canonical_regtest() {
+        let heights = RegtestActivationHeights::default();
+        assert_eq!(
+            resolve_any_network(Some("regtest"), Some(&heights)).unwrap(),
+            AnyZcashNetwork::Local(ZCASH_REGTEST)
+        );
+    }
+
+    #[test]
+    fn test_resolve_any_network_applies_regtest_overrides() {
+        let heights = RegtestActivationHeights {
+            nu6_3: Some(150),
+            nu7: Some(200),
+            ..Default::default()
+        };
+        let network = resolve_any_network(Some("regtest"), Some(&heights)).unwrap();
+        assert_eq!(
+            network.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(150))
+        );
+        assert_eq!(
+            network.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(200))
+        );
+        // Unset fields keep the canonical heights.
+        assert_eq!(
+            network.activation_height(NetworkUpgrade::Nu6_2),
+            Some(BlockHeight::from_u32(2))
+        );
+        assert_eq!(
+            network.activation_height(NetworkUpgrade::Canopy),
+            Some(BlockHeight::from_u32(1))
+        );
+    }
+
+    #[test]
+    fn test_resolve_any_network_rejects_overrides_on_named_networks() {
+        let heights = RegtestActivationHeights {
+            nu7: Some(10),
+            ..Default::default()
+        };
+        for name in [None, Some("mainnet"), Some("testnet")] {
+            let err = resolve_any_network(name, Some(&heights)).unwrap_err();
+            assert!(matches!(err, Error::Derivation(_)));
+            assert!(err.to_string().contains("only apply to \"regtest\""));
+        }
+    }
+
+    #[test]
+    fn test_resolve_any_network_still_rejects_unknown_names() {
+        let heights = RegtestActivationHeights::default();
+        let err = resolve_any_network(Some("devnet"), Some(&heights)).unwrap_err();
+        assert!(err.to_string().contains("devnet"));
+    }
+
+    #[test]
+    fn test_regtest_heights_reject_zero() {
+        let heights = RegtestActivationHeights {
+            nu5: Some(0),
+            ..Default::default()
+        };
+        let err = heights.to_local_network().unwrap_err();
+        assert!(err.to_string().contains("nu5 must be at least 1"));
+    }
+
+    #[test]
+    fn test_regtest_heights_reject_out_of_order_schedule() {
+        // NU6.3 moved past NU7.
+        let heights = RegtestActivationHeights {
+            nu6_3: Some(300),
+            nu7: Some(200),
+            ..Default::default()
+        };
+        let err = heights.to_local_network().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("nu7 (200) activates before nu6_3 (300)"));
+
+        // An upgrade moved below its (unchanged) predecessor.
+        let heights = RegtestActivationHeights {
+            nu5: Some(1),
+            canopy: Some(5),
+            ..Default::default()
+        };
+        let err = heights.to_local_network().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("nu5 (1) activates before canopy (5)"));
+    }
+
+    #[test]
+    fn test_regtest_heights_accept_equal_heights() {
+        let heights = RegtestActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        };
+        let local = heights.to_local_network().unwrap();
+        assert_eq!(local.nu7, Some(BlockHeight::from_u32(2)));
+        assert_eq!(local.nu6_3, Some(BlockHeight::from_u32(2)));
     }
 }

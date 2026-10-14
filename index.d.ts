@@ -211,6 +211,27 @@ export interface TransparentInputJs {
   addressIndex: number
 }
 /**
+ * Regtest activation heights a local node was started with, one optional
+ * height per network upgrade. Each height given replaces the canonical
+ * regtest value (Overwinter through Canopy at 1, NU5 through NU6.3 at 2, NU7
+ * unscheduled); each one omitted keeps it. Lets the builder pick the same
+ * branch id, and cap the expiry height at the same upcoming activation, as a
+ * node whose `activation_heights` differ from the canonical set.
+ */
+export interface RegtestActivationHeightsJs {
+  overwinter?: number
+  sapling?: number
+  blossom?: number
+  heartwood?: number
+  canopy?: number
+  nu5?: number
+  nu6?: number
+  nu6_1?: number
+  nu6_2?: number
+  nu6_3?: number
+  nu7?: number
+}
+/**
  * Arguments for [`build_transaction`].
  *
  * **Invariant: supply `ufvk`, or `transparentAccountPubkey`, or both.** The two
@@ -242,6 +263,12 @@ export interface BuildTransactionParams {
    */
   transparentAccountPubkey?: string
   network?: string
+  /**
+   * Only with `network: "regtest"`: activation heights of the local node,
+   * when its schedule differs from the canonical regtest set. Refused with
+   * any other network.
+   */
+  regtestActivationHeights?: RegtestActivationHeightsJs
   /**
    * 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
    * read from the device. Stamped onto each real spend so the device can
@@ -340,6 +367,12 @@ export interface BuildIronwoodTransactionParams {
   grpcUrl: string
   ufvk: string
   network?: string
+  /**
+   * Only with `network: "regtest"`: activation heights of the local node,
+   * when its schedule differs from the canonical regtest set. Refused with
+   * any other network.
+   */
+  regtestActivationHeights?: RegtestActivationHeightsJs
   /**
    * 64-char hex (32 bytes): ZIP-32 seed fingerprint of the wallet seed,
    * read from the device. Stamped onto each real spend so the device can

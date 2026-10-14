@@ -22,27 +22,34 @@ license = "Apache-2.0"
 [workspace.dependencies]
 
 # Zcash ecosystem
-zcash_client_backend  = { version = "0.24", default-features = false }
-zcash_keys            = { version = "0.16", features = ["orchard", "sapling"] }
+#
+# The librustzcash crates below are pinned exactly to the NU7 pre-releases: they are the first
+# releases that resolve `BranchId::Nu7` to the ZIP 259 value without an unstable cfg, and they
+# depend on one another with exact (`=`) requirements, so the whole set moves together. They
+# carry the NU7 testnet activation height but no mainnet one. Swap them for the stable releases
+# that carry the NU7 mainnet activation height as soon as those are published: until then a
+# mainnet transaction past activation would still be built under the NU6.3 branch id.
+zcash_client_backend  = { version = "=0.25.0-pre.1", default-features = false }
+zcash_keys            = { version = "=0.17.0-pre.1", features = ["orchard", "sapling"] }
 # Note: `transparent-inputs` is now a default feature of zcash-crypto.
-zcash_address         = "0.13"
-zcash_note_encryption = "0.4"
-zcash_primitives      = { version = "0.30", default-features = false }
+zcash_address         = "=0.14.0-pre.1"
+zcash_note_encryption = "0.5.1"
+zcash_primitives      = { version = "=0.31.0-pre.1", default-features = false }
 # Transparent-pool address + script types; pulled by zcash_primitives internally
 # under the local alias `transparent`. We depend on it directly to avoid that alias.
-zcash_transparent     = "0.10"
-zcash_protocol        = { version = "0.10", features = ["local-consensus"] }
-zip32                 = "0.2"
-orchard               = { version = "0.15", default-features = false }
-sapling-crypto        = { version = "0.7", default-features = false }
+zcash_transparent     = "=0.11.0-pre.1"
+zcash_protocol        = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
+zip32                 = "0.3"
+orchard               = { version = "0.16", default-features = false }
+sapling-crypto        = { version = "0.9", default-features = false }
 # Field-element trait (`PrimeField::to_repr`) used to serialize the Orchard
 # spend-auth randomizer `alpha` back to bytes when parsing a PCZT. Pinned to the
-# same 0.13 line that `orchard` already depends on (no lockfile churn).
-ff                    = "0.13"
+# same 0.14 line that `orchard` already depends on (no lockfile churn).
+ff                    = "0.14"
 # Transparent script (de)serialization: the `Evaluable::to_bytes` trait used to
-# read a PCZT input/output `script_pubkey` back to raw bytes. Pinned to the 0.4
+# read a PCZT input/output `script_pubkey` back to raw bytes. Pinned to the 0.6
 # line already pulled transitively by `zcash_transparent`.
-zcash_script          = "0.4"
+zcash_script          = "0.6"
 
 # Async / gRPC (only zcash-sync and its dependents need these)
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
@@ -57,34 +64,36 @@ bip39     = "2"
 # Keep the lock on the 0.32.x maintenance line: the parallel 0.32.10x feature line sorts
 # higher, so a broad `cargo update` silently drifts onto it.
 bitcoin   = "0.32"
-# secp256k1 0.29.x is already in Cargo.lock (transitive via bitcoin + zcash_transparent).
-# Declared explicitly here so zcash-crypto can name the secp256k1::PublicKey that
-# zcash_primitives::Builder::add_transparent_p2pkh_input expects.
-secp256k1 = { version = "0.29", features = ["alloc"] }
+# The secp256k1 line zcash_transparent links (0.33). Declared explicitly so zcash-crypto can
+# name the secp256k1::PublicKey that zcash_primitives::Builder::add_transparent_p2pkh_input
+# expects. `bitcoin` keeps its own 0.29 copy: keys cross between the two as serialized bytes.
+secp256k1 = { version = "0.33", features = ["alloc"] }
 
 # Parallelism
 rayon   = "1"
 futures = "0.3"
 
 # Merkle tree for on-demand witness computation.
-# Must match the copy zcash_client_backend links (0.7), or the tree types diverge under
+# Must match the copy zcash_client_backend links (0.8), or the tree types diverge under
 # identical names and witnesses cannot cross.
-incrementalmerkletree = "0.8"
-shardtree             = "0.7"
+incrementalmerkletree = "0.9"
+shardtree             = "0.8"
 
 # Partially Created Zcash Transaction format (wire format + role helpers).
 # Used to (a) wrap the PcztParts returned by zcash_primitives::Builder::build_for_pczt,
 # (b) drive the IoFinalizer + Prover roles, (c) emit the canonical PCZT byte stream.
 # Pinned exactly: this defines the byte stream the firmware parses, so it moves only as a
-# deliberate, tested step — never as a side effect of `cargo update`.
-pczt = { version = "=0.9.3", default-features = false, features = [
+# deliberate, tested step — never as a side effect of `cargo update`. 0.10 keeps the 0.9
+# encodings (v1 whenever the content fits it, v2 otherwise) and their field layout; it moves
+# with the NU7 pre-release set above.
+pczt = { version = "=0.10.0-pre.1", default-features = false, features = [
     "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
     "signer", "tx-extractor", "spend-finalizer",
 ] }
 
 # RNG plumbing for build_for_pczt(rng, &fee) and the PCZT Prover.
-rand      = "0.8"
-rand_core = "0.6"
+rand      = "0.10"
+rand_core = "0.10"
 
 # Utilities
 anyhow     = "1"
