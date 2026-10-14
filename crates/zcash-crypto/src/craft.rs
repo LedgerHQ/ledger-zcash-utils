@@ -663,9 +663,9 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
             n_transparent_outputs,
         )
     })
-    .map_err(|e| {
+    .map_err(|reason| {
         Error::Craft(format!(
-            "{e} — total_in={total_in}, total_out={total_out}, change={change}"
+            "{reason} — total_in={total_in}, total_out={total_out}, change={change}"
         ))
     })?;
     let fee_rule = zip317_fee_rule(marginal_fee)?;
@@ -1124,13 +1124,14 @@ fn standard_marginal_fee(network: &AnyZcashNetwork, target: BlockHeight) -> u64 
 ///
 /// # Errors
 ///
-/// [`Error::Craft`] when `fee` matches neither.
+/// The reason, unwrapped, when `fee` matches neither: each caller adds its own
+/// context and wraps it in [`Error::Craft`] once.
 fn caller_marginal_fee(
     network: &AnyZcashNetwork,
     target: BlockHeight,
     fee: u64,
     fee_for: impl Fn(u64) -> u64,
-) -> Result<u64, Error> {
+) -> Result<u64, String> {
     let standard = standard_marginal_fee(network, target);
     if fee == fee_for(standard) {
         return Ok(standard);
@@ -1138,11 +1139,11 @@ fn caller_marginal_fee(
     if standard != LEGACY_MARGINAL_FEE && fee == fee_for(LEGACY_MARGINAL_FEE) {
         return Ok(LEGACY_MARGINAL_FEE);
     }
-    Err(Error::Craft(format!(
+    Err(format!(
         "fee {fee} does not satisfy ZIP-317 for this transaction (requires {}); \
          fee selection is owned by the caller and must equal the ZIP-317 fee",
         fee_for(standard)
-    )))
+    ))
 }
 
 /// The builder's ZIP-317 fee rule at `marginal_fee`, every other parameter
@@ -1538,9 +1539,9 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
             n_transparent_outputs,
         )
     })
-    .map_err(|e| {
+    .map_err(|reason| {
         Error::Craft(format!(
-            "{e} — total_in={total_in}, total_out={total_out}, change={change}"
+            "{reason} — total_in={total_in}, total_out={total_out}, change={change}"
         ))
     })?;
     let fee_rule = zip317_fee_rule(marginal_fee)?;
@@ -2864,7 +2865,7 @@ mod tests {
         let err = build_transaction(inputs).unwrap_err();
         assert!(
             matches!(&err, Error::Craft(s)
-                if s.contains("does not satisfy ZIP-317") && s.contains("requires 15000")),
+                if s.starts_with("fee ") && s.contains("does not satisfy ZIP-317") && s.contains("requires 15000")),
             "got: {err}"
         );
     }
@@ -3073,7 +3074,7 @@ mod tests {
         let fee_for = |marginal_fee| zip317_fee_at(marginal_fee, 0, 0, 1, 2);
         let err = caller_marginal_fee(&mainnet, below, 2_000, fee_for).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("fee 2000 does not satisfy ZIP-317") && s.contains("requires 10000")),
+            err.starts_with("fee 2000 does not satisfy ZIP-317") && err.contains("requires 10000"),
             "got: {err}"
         );
     }
@@ -3085,7 +3086,7 @@ mod tests {
         let fee_for = |marginal_fee| zip317_fee_at(marginal_fee, 0, 0, 1, 2);
         let err = caller_marginal_fee(&testnet, target, 3_000, fee_for).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("requires 2000")),
+            err.starts_with("fee 3000 does not satisfy ZIP-317") && err.contains("requires 2000"),
             "got: {err}"
         );
     }
@@ -3109,7 +3110,7 @@ mod tests {
 
         let err = build_transaction(inputs).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("does not satisfy ZIP-317") && s.contains("requires 10000")),
+            matches!(&err, Error::Craft(s) if s.starts_with("fee ") && s.contains("does not satisfy ZIP-317") && s.contains("requires 10000")),
             "got: {err}"
         );
     }
@@ -3151,7 +3152,7 @@ mod tests {
 
         let err = build_ironwood_transaction(inputs).unwrap_err();
         assert!(
-            matches!(&err, Error::Craft(s) if s.contains("requires 15000")),
+            matches!(&err, Error::Craft(s) if s.starts_with("fee ") && s.contains("requires 15000")),
             "got: {err}"
         );
     }
