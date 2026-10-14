@@ -360,6 +360,11 @@ pub struct BuildTransactionParams {
     /// loss). Per FR-4 the fee is selected by ledger-live; this
     /// crate validates it against ZIP-317 and derives change from it rather
     /// than computing a fee itself.
+    ///
+    /// The ZIP-317 marginal fee depends on the target block (ZIP 2009): 1,000
+    /// zatoshis per logical action on mainnet from height 3,590,000 and on test
+    /// networks, 5,000 on mainnet below it. A fee computed at 5,000 is still
+    /// accepted past the switch; one computed at 1,000 is refused before it.
     pub fee_zat: String,
     pub spends: Vec<OrchardSpendInputJs>,
     /// Transparent (P2PKH) UTXOs to spend. Empty for Private→* flows.
@@ -532,6 +537,11 @@ pub struct BuildIronwoodTransactionParams {
     /// loss). Per FR-4 the fee is selected by ledger-live; this
     /// crate validates it against ZIP-317 Rev 1 and derives the (always
     /// Ironwood) change from it rather than computing a fee itself.
+    ///
+    /// The ZIP-317 marginal fee depends on the target block (ZIP 2009): 1,000
+    /// zatoshis per logical action on mainnet from height 3,590,000 and on test
+    /// networks, 5,000 on mainnet below it. A fee computed at 5,000 is still
+    /// accepted past the switch; one computed at 1,000 is refused before it.
     pub fee_zat: String,
     pub spends: Vec<IronwoodSpendInputJs>,
     /// Transparent (P2PKH) UTXOs to spend. Empty for Ironwood→* flows.
