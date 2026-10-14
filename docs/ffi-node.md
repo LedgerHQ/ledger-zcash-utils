@@ -61,7 +61,7 @@ const stats: SyncStats = await stream.stats();
 
 `buildTransaction` assembles, proves, and serializes a PCZT for a send from the Orchard pool, from the transparent pool, or from both. Orchard spend inputs come from notes previously found during scanning, and the result is the canonical PCZT hex ready for the device APDU streaming layer.
 
-> **Note:** The fee is selected by the caller (ledger-live), not computed here. It is validated against ZIP-317 and used to derive change. The `seedFingerprint` and `accountIndex` must come from the Ledger device so the device can confirm the PCZT belongs to its seed before signing.
+> **Note:** The fee is selected by the caller (ledger-live), not computed here. It is validated against ZIP-317 and used to derive change. The ZIP-317 marginal fee follows ZIP 2009: 1,000 zatoshis per logical action on mainnet from height 3,590,000 (the target block, `tip + 1`) and on test networks, 5,000 on mainnet below it. Past the switch a fee computed at 5,000 is still accepted, so a block found between fee selection and crafting does not fail the send; before it, a fee computed at 1,000 is refused. The `seedFingerprint` and `accountIndex` must come from the Ledger device so the device can confirm the PCZT belongs to its seed before signing.
 
 ```typescript
 import { buildTransaction, BuildTransactionResult, ShieldedNote } from "./index.js";

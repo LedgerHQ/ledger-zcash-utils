@@ -107,11 +107,11 @@ use pczt::{
 use rand::rngs::OsRng;
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
-    fees::zip317::{FeeError as Zip317FeeError, FeeRule},
+    fees::zip317::{self, FeeError as Zip317FeeError, FeeRule},
     TxVersion,
 };
 use zcash_protocol::{
-    consensus::{BlockHeight, BranchId, NetworkConstants, NetworkUpgrade, Parameters},
+    consensus::{BlockHeight, BranchId, NetworkConstants, NetworkType, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::Zatoshis,
 };
@@ -580,7 +580,6 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // FR-4: the fee is owned by the caller (ledger-live); this
     // builder never *chooses* a fee. We derive the change from the supplied fee
     // and use ZIP-317 only to *validate* that fee against the final layout.
-    let fee_rule = FeeRule::standard();
 
     let outflow = total_out
         .checked_add(fee)
@@ -651,24 +650,27 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     }
 
     // ZIP-317 validation (validation-only). The supplied fee must equal the
-    // ZIP-317 fee for the *final* action layout (after any change output).
-    let required_fee = zip317_fee(
-        n_spends,
-        n_orchard_outputs,
-        n_transparent_inputs,
-        n_transparent_outputs,
-    );
-    if fee != required_fee {
-        return Err(Error::Craft(format!(
-            "fee {fee} does not satisfy ZIP-317 for this transaction (requires {required_fee}); \
-             fee selection is owned by the caller and must equal the ZIP-317 fee — \
-             total_in={total_in}, total_out={total_out}, change={change}"
-        )));
-    }
+    // ZIP-317 fee for the *final* action layout (after any change output), at
+    // a marginal fee accepted for the target height (ZIP 2009).
+    let marginal_fee = caller_marginal_fee(&network, target, fee, |marginal_fee| {
+        zip317_fee_at(
+            marginal_fee,
+            n_spends,
+            n_orchard_outputs,
+            n_transparent_inputs,
+            n_transparent_outputs,
+        )
+    })
+    .map_err(|e| {
+        Error::Craft(format!(
+            "{e} — total_in={total_in}, total_out={total_out}, change={change}"
+        ))
+    })?;
+    let fee_rule = zip317_fee_rule(marginal_fee)?;
 
     // Defense-in-depth: cross-check against the builder's own fee rule. With the
     // validation above this should never fire; it guards against our ZIP-317
-    // model drifting from the library's `FeeRule::standard()`.
+    // model drifting from the library's.
     let builder_fee = builder.get_fee(&fee_rule).map(u64::from).map_err(
         |e: zcash_primitives::transaction::builder::FeeError<Zip317FeeError>| {
             Error::Craft(format!("get_fee: {e:?}"))
@@ -1082,18 +1084,83 @@ fn encode_memo(memo: Option<&[u8]>) -> Result<MemoBytes, Error> {
     }
 }
 
-/// ZIP-317 marginal fee (5_000 zat).
-const MARGINAL_FEE: u64 = 5_000;
+/// ZIP-317 marginal fee wallets paid before ZIP 2009, in zatoshis per logical
+/// action.
+const LEGACY_MARGINAL_FEE: u64 = 5_000;
+/// ZIP-317 marginal fee set by ZIP 2009, in zatoshis per logical action.
+const ZIP2009_MARGINAL_FEE: u64 = 1_000;
+/// Mainnet height from which ZIP 2009 has wallets pay [`ZIP2009_MARGINAL_FEE`].
+///
+/// A wallet convention, not a network upgrade: wallets switch together at this
+/// height so that the fee does not reveal which software built a transaction.
+/// Test networks pay [`ZIP2009_MARGINAL_FEE`] at every height, as zebra's
+/// `getstandardfee` reports.
+pub const ZIP2009_MAINNET_HEIGHT: u32 = 3_590_000;
 /// ZIP-317 grace actions (2).
 const GRACE_ACTIONS: u64 = 2;
 /// Orchard `BundleType::DEFAULT` pads to at least this many actions.
 /// Mirrors `MIN_ACTIONS` in `orchard::builder`.
 const ORCHARD_MIN_ACTIONS: u64 = 2;
 
+/// The ZIP-317 marginal fee a transaction targeting `target` on `network` pays.
+fn standard_marginal_fee(network: &AnyZcashNetwork, target: BlockHeight) -> u64 {
+    match network.network_type() {
+        NetworkType::Main if u32::from(target) < ZIP2009_MAINNET_HEIGHT => LEGACY_MARGINAL_FEE,
+        _ => ZIP2009_MARGINAL_FEE,
+    }
+}
+
+/// The marginal fee the caller's `fee` was computed with, given `fee_for`, the
+/// ZIP-317 fee of the transaction's final layout at a given marginal fee.
+///
+/// The standard marginal fee for `target` is accepted, and so is
+/// [`LEGACY_MARGINAL_FEE`] once the standard one is lower: a caller that chose
+/// its fee a block before the switch, or that has not adopted ZIP 2009 yet,
+/// overpays rather than fails. The reverse is refused: the lower fee before the
+/// switch would mark the transaction out, and nodes that have not upgraded drop
+/// it.
+///
+/// # Errors
+///
+/// [`Error::Craft`] when `fee` matches neither.
+fn caller_marginal_fee(
+    network: &AnyZcashNetwork,
+    target: BlockHeight,
+    fee: u64,
+    fee_for: impl Fn(u64) -> u64,
+) -> Result<u64, Error> {
+    let standard = standard_marginal_fee(network, target);
+    if fee == fee_for(standard) {
+        return Ok(standard);
+    }
+    if standard != LEGACY_MARGINAL_FEE && fee == fee_for(LEGACY_MARGINAL_FEE) {
+        return Ok(LEGACY_MARGINAL_FEE);
+    }
+    Err(Error::Craft(format!(
+        "fee {fee} does not satisfy ZIP-317 for this transaction (requires {}); \
+         fee selection is owned by the caller and must equal the ZIP-317 fee",
+        fee_for(standard)
+    )))
+}
+
+/// The builder's ZIP-317 fee rule at `marginal_fee`, every other parameter
+/// standard.
+fn zip317_fee_rule(marginal_fee: u64) -> Result<FeeRule, Error> {
+    let marginal_fee = Zatoshis::from_u64(marginal_fee)
+        .map_err(|e| Error::Craft(format!("marginal fee out of range: {e:?}")))?;
+    FeeRule::non_standard(
+        marginal_fee,
+        zip317::GRACE_ACTIONS,
+        zip317::P2PKH_STANDARD_INPUT_SIZE,
+        zip317::P2PKH_STANDARD_OUTPUT_SIZE,
+    )
+    .ok_or_else(|| Error::Craft("invalid ZIP-317 fee rule".into()))
+}
+
 /// ZIP-317 fee in zatoshis. Matches the formula implemented by
 /// `zcash_primitives::transaction::fees::zip317::FeeRule::fee_required`:
 ///
-/// `fee = MARGINAL_FEE × max(GRACE_ACTIONS, transparent_actions + sapling_actions + orchard_actions)`
+/// `fee = marginal_fee × max(GRACE_ACTIONS, transparent_actions + sapling_actions + orchard_actions)`
 ///
 /// where:
 ///   - `transparent_actions = max(t_in, t_out)` (standard P2PKH sizing: each
@@ -1101,7 +1168,8 @@ const ORCHARD_MIN_ACTIONS: u64 = 2;
 ///   - `sapling_actions = 0` (Sapling not in scope)
 ///   - `orchard_actions` is computed by `BundleType::DEFAULT::num_actions`
 ///     which pads to a minimum of `MIN_ACTIONS = 2` when any Orchard items present.
-fn zip317_fee(
+fn zip317_fee_at(
+    marginal_fee: u64,
     n_spends: u32,
     n_orchard_outputs: u32,
     n_transparent_inputs: u32,
@@ -1118,7 +1186,24 @@ fn zip317_fee(
     let transparent_actions = u64::from(std::cmp::max(n_transparent_inputs, n_transparent_outputs));
     let sapling_actions = 0u64;
     let logical = transparent_actions + sapling_actions + orchard_actions;
-    MARGINAL_FEE * std::cmp::max(GRACE_ACTIONS, logical)
+    marginal_fee * std::cmp::max(GRACE_ACTIONS, logical)
+}
+
+/// ZIP-317 fee in zatoshis at the legacy marginal fee.
+#[cfg(test)]
+fn zip317_fee(
+    n_spends: u32,
+    n_orchard_outputs: u32,
+    n_transparent_inputs: u32,
+    n_transparent_outputs: u32,
+) -> u64 {
+    zip317_fee_at(
+        LEGACY_MARGINAL_FEE,
+        n_spends,
+        n_orchard_outputs,
+        n_transparent_inputs,
+        n_transparent_outputs,
+    )
 }
 
 // ── Ironwood (NU6.3) — V6 transaction construction ──────────────────────────
@@ -1376,7 +1461,6 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     }
 
     // ── 2. Change derivation + fee validation ────────────────────────────────
-    let fee_rule = FeeRule::standard();
 
     let outflow = total_out
         .checked_add(fee)
@@ -1443,19 +1527,21 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     }
 
     // ZIP-317 Rev 1 validation (validation-only, mirrors `build_transaction`).
-    let required_fee = zip317_fee_ironwood(
-        n_spends,
-        n_ironwood_outputs,
-        n_transparent_inputs,
-        n_transparent_outputs,
-    );
-    if fee != required_fee {
-        return Err(Error::Craft(format!(
-            "fee {fee} does not satisfy ZIP-317 for this transaction (requires {required_fee}); \
-             fee selection is owned by the caller and must equal the ZIP-317 fee — \
-             total_in={total_in}, total_out={total_out}, change={change}"
-        )));
-    }
+    let marginal_fee = caller_marginal_fee(&network, target, fee, |marginal_fee| {
+        zip317_fee_ironwood_at(
+            marginal_fee,
+            n_spends,
+            n_ironwood_outputs,
+            n_transparent_inputs,
+            n_transparent_outputs,
+        )
+    })
+    .map_err(|e| {
+        Error::Craft(format!(
+            "{e} — total_in={total_in}, total_out={total_out}, change={change}"
+        ))
+    })?;
+    let fee_rule = zip317_fee_rule(marginal_fee)?;
 
     // Defense-in-depth: cross-check against the builder's own fee rule (which
     // already prices Ironwood actions under ZIP-317 Rev 1).
@@ -1643,8 +1729,9 @@ fn add_ironwood_output(
 /// Identical formula to [`zip317_fee`], except the Ironwood bundle's actions
 /// are priced exactly like Orchard actions (`nActionsIronwood`, ZIP-317
 /// Revision 1). Kept as a separate function — rather than an extra parameter
-/// on `zip317_fee` — so the shipped V5 fee model stays byte-identical.
-fn zip317_fee_ironwood(
+/// on `zip317_fee_at` — so the shipped V5 fee model stays byte-identical.
+fn zip317_fee_ironwood_at(
+    marginal_fee: u64,
     n_ironwood_spends: u32,
     n_ironwood_outputs: u32,
     n_transparent_inputs: u32,
@@ -1658,7 +1745,24 @@ fn zip317_fee_ironwood(
         std::cmp::max(ORCHARD_MIN_ACTIONS, requested)
     };
     let transparent_actions = u64::from(std::cmp::max(n_transparent_inputs, n_transparent_outputs));
-    MARGINAL_FEE * std::cmp::max(GRACE_ACTIONS, transparent_actions + ironwood_actions)
+    marginal_fee * std::cmp::max(GRACE_ACTIONS, transparent_actions + ironwood_actions)
+}
+
+/// ZIP-317 Revision 1 fee in zatoshis at the legacy marginal fee.
+#[cfg(test)]
+fn zip317_fee_ironwood(
+    n_ironwood_spends: u32,
+    n_ironwood_outputs: u32,
+    n_transparent_inputs: u32,
+    n_transparent_outputs: u32,
+) -> u64 {
+    zip317_fee_ironwood_at(
+        LEGACY_MARGINAL_FEE,
+        n_ironwood_spends,
+        n_ironwood_outputs,
+        n_transparent_inputs,
+        n_transparent_outputs,
+    )
 }
 
 /// Applies a representative upstream HW-signer PCZT redaction before v2
@@ -2915,6 +3019,142 @@ mod tests {
         );
     }
 
+    // ── ZIP 2009 marginal fee ────────────────────────────────────────────────
+
+    /// Public→Public inputs carrying `fee` instead of the legacy ZIP-317 fee.
+    fn public_to_public_with_fee(network: Network, target_height: u32, fee: u64) -> BuildInputs {
+        let mut inputs = make_public_to_public_inputs(network, target_height);
+        let surplus = inputs.transparent_inputs[0].value - inputs.fee;
+        inputs.transparent_inputs[0].value = surplus + fee;
+        inputs.fee = fee;
+        inputs
+    }
+
+    #[test]
+    fn standard_marginal_fee_switches_at_the_zip2009_mainnet_height() {
+        let mainnet: AnyZcashNetwork = Network::MainNetwork.into();
+        let below = BlockHeight::from_u32(ZIP2009_MAINNET_HEIGHT - 1);
+        let at = BlockHeight::from_u32(ZIP2009_MAINNET_HEIGHT);
+        assert_eq!(standard_marginal_fee(&mainnet, below), 5_000);
+        assert_eq!(standard_marginal_fee(&mainnet, at), 1_000);
+    }
+
+    #[test]
+    fn standard_marginal_fee_is_zip2009_at_every_height_on_test_networks() {
+        let testnet: AnyZcashNetwork = Network::TestNetwork.into();
+        let regtest = AnyZcashNetwork::Local(ZCASH_REGTEST);
+        for height in [1, ZIP2009_MAINNET_HEIGHT - 1, ZIP2009_MAINNET_HEIGHT] {
+            let target = BlockHeight::from_u32(height);
+            assert_eq!(standard_marginal_fee(&testnet, target), 1_000);
+            assert_eq!(standard_marginal_fee(&regtest, target), 1_000);
+        }
+    }
+
+    #[test]
+    fn caller_marginal_fee_accepts_the_legacy_fee_past_the_switch() {
+        let mainnet: AnyZcashNetwork = Network::MainNetwork.into();
+        let at = BlockHeight::from_u32(ZIP2009_MAINNET_HEIGHT);
+        let fee_for = |marginal_fee| zip317_fee_at(marginal_fee, 0, 0, 1, 2);
+        assert_eq!(
+            caller_marginal_fee(&mainnet, at, 2_000, fee_for).unwrap(),
+            1_000
+        );
+        assert_eq!(
+            caller_marginal_fee(&mainnet, at, 10_000, fee_for).unwrap(),
+            5_000
+        );
+    }
+
+    #[test]
+    fn caller_marginal_fee_refuses_the_zip2009_fee_before_the_switch() {
+        let mainnet: AnyZcashNetwork = Network::MainNetwork.into();
+        let below = BlockHeight::from_u32(ZIP2009_MAINNET_HEIGHT - 1);
+        let fee_for = |marginal_fee| zip317_fee_at(marginal_fee, 0, 0, 1, 2);
+        let err = caller_marginal_fee(&mainnet, below, 2_000, fee_for).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("fee 2000 does not satisfy ZIP-317") && s.contains("requires 10000")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn caller_marginal_fee_refuses_any_other_fee() {
+        let testnet: AnyZcashNetwork = Network::TestNetwork.into();
+        let target = BlockHeight::from_u32(nu5_activation_height(Network::TestNetwork) + 1);
+        let fee_for = |marginal_fee| zip317_fee_at(marginal_fee, 0, 0, 1, 2);
+        let err = caller_marginal_fee(&testnet, target, 3_000, fee_for).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("requires 2000")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn public_to_public_pays_the_zip2009_fee_from_the_mainnet_switch() {
+        let fee = zip317_fee_at(ZIP2009_MARGINAL_FEE, 0, 0, 1, 2);
+        assert_eq!(fee, 2_000);
+        let inputs = public_to_public_with_fee(Network::MainNetwork, ZIP2009_MAINNET_HEIGHT, fee);
+
+        let out = build_transaction(inputs).expect("the ZIP 2009 fee must build at the switch");
+        assert_eq!(out.fee, 2_000);
+        assert_eq!(out.n_transparent_outputs, 2, "recipient + change");
+    }
+
+    #[test]
+    fn public_to_public_keeps_the_legacy_fee_below_the_mainnet_switch() {
+        let fee = zip317_fee_at(ZIP2009_MARGINAL_FEE, 0, 0, 1, 2);
+        let inputs =
+            public_to_public_with_fee(Network::MainNetwork, ZIP2009_MAINNET_HEIGHT - 1, fee);
+
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("does not satisfy ZIP-317") && s.contains("requires 10000")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn public_to_public_still_accepts_the_legacy_fee_past_the_mainnet_switch() {
+        let fee = zip317_fee(0, 0, 1, 2);
+        let inputs = public_to_public_with_fee(Network::MainNetwork, ZIP2009_MAINNET_HEIGHT, fee);
+
+        let out = build_transaction(inputs).expect("the legacy fee must still build");
+        assert_eq!(out.fee, 10_000);
+    }
+
+    #[test]
+    fn public_to_public_pays_the_zip2009_fee_on_testnet() {
+        let network = Network::TestNetwork;
+        let fee = zip317_fee_at(ZIP2009_MARGINAL_FEE, 0, 0, 1, 2);
+        let inputs = public_to_public_with_fee(network, nu5_activation_height(network) + 1, fee);
+
+        let out = build_transaction(inputs).expect("test networks take the ZIP 2009 fee");
+        assert_eq!(out.fee, 2_000);
+    }
+
+    #[test]
+    fn public_to_ironwood_pays_the_zip2009_fee_from_the_mainnet_switch() {
+        let fee = zip317_fee_ironwood_at(ZIP2009_MARGINAL_FEE, 0, 1, 1, 0);
+        assert_eq!(fee, 3_000);
+        let inputs = public_to_ironwood_inputs(Network::MainNetwork, ZIP2009_MAINNET_HEIGHT, fee);
+
+        let out = build_ironwood_transaction(inputs).expect("the ZIP 2009 fee must build");
+        assert_eq!(out.fee, 3_000);
+    }
+
+    #[test]
+    fn public_to_ironwood_keeps_the_legacy_fee_below_the_mainnet_switch() {
+        let fee = zip317_fee_ironwood_at(ZIP2009_MARGINAL_FEE, 0, 1, 1, 0);
+        let inputs =
+            public_to_ironwood_inputs(Network::MainNetwork, ZIP2009_MAINNET_HEIGHT - 1, fee);
+
+        let err = build_ironwood_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("requires 15000")),
+            "got: {err}"
+        );
+    }
+
     /// Regression: past NU6.3 the Orchard bundle disables cross-address transfers,
     /// so the change must be added through the builder's change API. A z→t send —
     /// value leaving the pool through the bundle's value balance, with the remainder
@@ -3783,13 +4023,13 @@ mod tests {
         );
     }
 
-    /// Public→Ironwood: one transparent input + one Ironwood output (anchor-only,
-    /// no real Ironwood spends). Mirrors `public_to_private_produces_orchard_
-    /// output_pczt` (Orchard V5) — exercises `add_transparent_input` and
-    /// `stamp_transparent_derivations` on the Ironwood builder's success path.
-    #[test]
-    fn public_to_ironwood_via_transparent_input_produces_valid_pczt() {
-        let network = Network::MainNetwork;
+    /// One transparent input paying one Ironwood output with no change (exact
+    /// balance) and `fee`, targeting `target_height`.
+    fn public_to_ironwood_inputs(
+        network: Network,
+        target_height: u32,
+        fee: u64,
+    ) -> IronwoodBuildInputs {
         let fvk = make_fvk();
         let recipient = fvk.address_at(0u32, Scope::External);
 
@@ -3813,17 +4053,12 @@ mod tests {
             MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
         let (anchor, _path) = synthetic_anchor_and_path(leaf);
 
-        // 1 transparent input, 1 Ironwood output, no change (exact balance).
-        // ironwood_actions = max(MIN=2, max(0,1)) = 2; transparent = max(1,0) = 1;
-        // logical = 3 → 15_000.
-        let fee = zip317_fee_ironwood(0, 1, 1, 0);
-        assert_eq!(fee, 15_000);
         let out_value = 10_000u64;
         let total_in = out_value + fee;
 
-        let inputs = IronwoodBuildInputs {
+        IronwoodBuildInputs {
             network: network.into(),
-            target_height: nu6_3_activation_height(network) + 1,
+            target_height,
             anchor_height: 1,
             ironwood_fvk: None,
             ovk: Some(fvk.to_ovk(Scope::External)),
@@ -3842,7 +4077,22 @@ mod tests {
                 value: out_value,
                 memo: None,
             }],
-        };
+        }
+    }
+
+    /// Public→Ironwood: one transparent input + one Ironwood output (anchor-only,
+    /// no real Ironwood spends). Mirrors `public_to_private_produces_orchard_
+    /// output_pczt` (Orchard V5) — exercises `add_transparent_input` and
+    /// `stamp_transparent_derivations` on the Ironwood builder's success path.
+    #[test]
+    fn public_to_ironwood_via_transparent_input_produces_valid_pczt() {
+        let network = Network::MainNetwork;
+        // 1 transparent input, 1 Ironwood output, no change (exact balance).
+        // ironwood_actions = max(MIN=2, max(0,1)) = 2; transparent = max(1,0) = 1;
+        // logical = 3 → 15_000.
+        let fee = zip317_fee_ironwood(0, 1, 1, 0);
+        assert_eq!(fee, 15_000);
+        let inputs = public_to_ironwood_inputs(network, nu6_3_activation_height(network) + 1, fee);
 
         let out = build_ironwood_transaction(inputs).expect("public→ironwood must succeed");
         assert_eq!(&out.pczt_bytes[..4], b"PCZT");
@@ -4354,7 +4604,10 @@ mod tests {
             out.n_transparent_outputs, 1,
             "exact balance leaves no transparent change"
         );
-        assert_eq!(out.n_actions_orchard, 0, "Public→Public has no Orchard bundle");
+        assert_eq!(
+            out.n_actions_orchard, 0,
+            "Public→Public has no Orchard bundle"
+        );
         assert_eq!(out.fee, fee);
     }
 
@@ -4404,10 +4657,15 @@ mod tests {
         let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
             .into_option()
             .unwrap();
-        let anchor_note =
-            Note::from_parts(recipient, NoteValue::from_raw(1), rho, rseed, NoteVersion::V3)
-                .into_option()
-                .unwrap();
+        let anchor_note = Note::from_parts(
+            recipient,
+            NoteValue::from_raw(1),
+            rho,
+            rseed,
+            NoteVersion::V3,
+        )
+        .into_option()
+        .unwrap();
         let leaf =
             MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(anchor_note.commitment()));
         let (anchor, _path) = synthetic_anchor_and_path(leaf);
