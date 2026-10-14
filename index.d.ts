@@ -211,14 +211,6 @@ export interface TransparentInputJs {
   addressIndex: number
 }
 /**
- * Arguments for [`build_transaction`].
- *
- * **Invariant: supply `ufvk`, or `transparentAccountPubkey`, or both.** The two
- * are declared independently optional because this struct crosses into JS,
- * where "exactly one of" has no encoding — napi rejects a data-carrying enum —
- * so the rule cannot live in the type. Supplying neither is refused up front,
- * before any work, rather than deeper in the build. Which one a given flow
- * needs is on each field below.
  * Regtest activation heights a local node was started with, one optional
  * height per network upgrade. Each height given replaces the canonical
  * regtest value (Overwinter through Canopy at 1, NU5 through NU6.3 at 2, NU7
@@ -239,6 +231,16 @@ export interface RegtestActivationHeightsJs {
   nu6_3?: number
   nu7?: number
 }
+/**
+ * Arguments for [`build_transaction`].
+ *
+ * **Invariant: supply `ufvk`, or `transparentAccountPubkey`, or both.** The two
+ * are declared independently optional because this struct crosses into JS,
+ * where "exactly one of" has no encoding — napi rejects a data-carrying enum —
+ * so the rule cannot live in the type. Supplying neither is refused up front,
+ * before any work, rather than deeper in the build. Which one a given flow
+ * needs is on each field below.
+ */
 export interface BuildTransactionParams {
   grpcUrl: string
   /**
