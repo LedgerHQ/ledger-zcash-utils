@@ -91,6 +91,10 @@ pub struct OutputRequestDto {
     /// Optional UTF-8 memo. Encoded into `MemoBytes` for Orchard outputs;
     /// ignored for transparent outputs.
     pub memo: Option<String>,
+    /// ZIP 32 account of the same seed that the output pays, when the
+    /// recipient is another account of the wallet. Shielded destinations
+    /// only; see `zcash_crypto::craft::OutputRequest::account`.
+    pub account: Option<u32>,
 }
 
 pub struct CraftRequest {
@@ -208,6 +212,7 @@ where
         .map(|o| {
             let destination = decode_destination(&network, &o.address)?;
             Ok(OutputRequest {
+                account: o.account,
                 destination,
                 value: o.value_zat,
                 memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
@@ -547,6 +552,10 @@ pub struct IronwoodOutputRequestDto {
     /// Optional UTF-8 memo. Encoded into `MemoBytes` for Ironwood outputs;
     /// ignored for transparent outputs.
     pub memo: Option<String>,
+    /// ZIP 32 account of the same seed that the output pays, when the
+    /// recipient is another account of the wallet. Shielded destinations
+    /// only; see `zcash_crypto::craft::OutputRequest::account`.
+    pub account: Option<u32>,
 }
 
 pub struct IronwoodCraftRequest {
@@ -628,6 +637,7 @@ where
         .map(|o| {
             let destination = decode_ironwood_destination(&network, &o.address)?;
             Ok(IronwoodOutputRequest {
+                account: o.account,
                 destination,
                 value: o.value_zat,
                 memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
@@ -948,6 +958,7 @@ mod tests {
 
     fn dummy_output() -> OutputRequestDto {
         OutputRequestDto {
+            account: None,
             address: "u1somewhere".into(),
             value_zat: 10_000,
             memo: None,
@@ -968,6 +979,7 @@ mod tests {
 
     fn dummy_transparent_output() -> OutputRequestDto {
         OutputRequestDto {
+            account: None,
             address: "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs".into(),
             value_zat: 10_000,
             memo: None,
@@ -1304,6 +1316,7 @@ mod tests {
             spends: vec![], // no Orchard spends → anchor-only
             transparent_inputs: vec![dummy_transparent_input()],
             outputs: vec![OutputRequestDto {
+                account: None,
                 address: orchard_addr,
                 value_zat: 10_000,
                 memo: None,
@@ -1424,6 +1437,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![dummy_transparent_input()],
             outputs: vec![OutputRequestDto {
+                account: None,
                 value_zat: 90_000,
                 ..dummy_transparent_output()
             }],
@@ -1523,6 +1537,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![input],
             outputs: vec![OutputRequestDto {
+                account: None,
                 value_zat: output_value_zat,
                 ..dummy_transparent_output()
             }],
@@ -1855,6 +1870,7 @@ mod tests {
         let req = CraftRequest {
             // A unified address resolves to an Orchard destination.
             outputs: vec![OutputRequestDto {
+                account: None,
                 address: ua.encode(&Network::MainNetwork),
                 value_zat: 10_000,
                 memo: None,
@@ -1902,6 +1918,7 @@ mod tests {
 
     fn dummy_ironwood_output() -> IronwoodOutputRequestDto {
         IronwoodOutputRequestDto {
+            account: None,
             address: "u1somewhere".into(),
             value_zat: 10_000,
             memo: None,
@@ -2019,6 +2036,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![dummy_transparent_input()],
             outputs: vec![IronwoodOutputRequestDto {
+                account: None,
                 address: "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs".into(),
                 value_zat: 10_000,
                 memo: None,
@@ -2069,6 +2087,7 @@ mod tests {
             spends: vec![dummy_ironwood_spend()],
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequestDto {
+                account: None,
                 address: ironwood_addr,
                 value_zat: 10_000,
                 memo: None,
@@ -2132,6 +2151,7 @@ mod tests {
             spends: vec![], // no Ironwood spends → anchor-only
             transparent_inputs: vec![dummy_transparent_input()],
             outputs: vec![IronwoodOutputRequestDto {
+                account: None,
                 address: ironwood_addr,
                 value_zat: 10_000,
                 memo: None,
@@ -2203,6 +2223,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![dummy_transparent_input()],
             outputs: vec![IronwoodOutputRequestDto {
+                account: None,
                 address: ua.encode(&Network::MainNetwork),
                 value_zat: 10_000,
                 memo: None,
