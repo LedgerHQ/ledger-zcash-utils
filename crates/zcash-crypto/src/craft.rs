@@ -345,6 +345,14 @@ pub struct OutputRequest {
     /// paid receiver, or the build fails. PCZT metadata only: it changes neither
     /// the transaction id nor any sighash.
     pub user_address: Option<String>,
+    /// ZIP 32 account of the **same seed** that this output pays, when the
+    /// recipient is another account of the wallet. The PCZT then carries that
+    /// output's ZIP 32 derivation (seed fingerprint and
+    /// `m/32'/coin_type'/account'`) so the signer can recognize the recipient
+    /// as the user's own account. Metadata only: the transaction id and the
+    /// sighashes are unchanged. Shielded destinations only; must differ from
+    /// the account being spent and be at most [`MAX_DECLARED_OUTPUT_ACCOUNT`].
+    pub account: Option<u32>,
 }
 
 /// Inputs to [`build_transaction`].
@@ -506,6 +514,24 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     if outputs.is_empty() {
         return Err(Error::Craft("outputs list is empty".into()));
     }
+    for out in &outputs {
+        if let Some(account) = out.account {
+            validate_declared_account(
+                account,
+                account_index,
+                matches!(out.destination, Destination::Orchard(_)),
+            )?;
+        }
+    }
+    let declared =
+        declared_recipients(
+            outputs
+                .iter()
+                .filter_map(|o| match (&o.destination, o.account) {
+                    (Destination::Orchard(addr), Some(account)) => Some((addr, account)),
+                    _ => None,
+                }),
+        )?;
 
     // Determine whether an Orchard bundle will be present. An Orchard bundle
     // is created when there are Orchard spends OR any Orchard output.
@@ -656,6 +682,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
                 )
             })?;
             let change_req = OutputRequest {
+                account: None,
                 destination: Destination::Transparent(addr),
                 value: change,
                 memo: None,
@@ -724,7 +751,12 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     // For Public→Public there is no Orchard bundle; `update_orchard_with` errors
     // on an absent/empty bundle, so we gate it behind `has_orchard`.
     let pczt = if has_orchard {
-        stamp_spend_derivations(pczt, &network, seed_fingerprint, account_index)?
+        let pczt = stamp_spend_derivations(pczt, &network, seed_fingerprint, account_index)?;
+        if declared.is_empty() {
+            pczt
+        } else {
+            stamp_output_derivations(pczt, &network, seed_fingerprint, &declared)?
+        }
     } else {
         pczt
     };
@@ -834,6 +866,146 @@ fn stamp_spend_derivations(
             Ok(())
         })
         .map_err(|e| Error::Craft(format!("PCZT Updater (orchard zip32): {e:?}")))
+        .map(Updater::finish)
+}
+
+/// Highest ZIP 32 account a shielded output may declare as its destination.
+/// The Ledger app accepts declarations up to this index only.
+pub const MAX_DECLARED_OUTPUT_ACCOUNT: u32 = 100;
+
+/// Checks a declared destination account before anything is built.
+///
+/// `shielded` is false for a transparent destination, which cannot carry a
+/// ZIP 32 output derivation. The declared account must be another account of
+/// the same seed (not the one being spent), non-hardened as a raw index, and
+/// within [`MAX_DECLARED_OUTPUT_ACCOUNT`].
+fn validate_declared_account(
+    account: u32,
+    spent_account: u32,
+    shielded: bool,
+) -> Result<(), Error> {
+    if !shielded {
+        return Err(Error::Craft(format!(
+            "output account {account} declared on a transparent destination: only a shielded \
+             output carries a ZIP-32 derivation"
+        )));
+    }
+    if account >= (1 << 31) {
+        return Err(Error::Craft(format!(
+            "output account {account} exceeds the ZIP-32 hardened range"
+        )));
+    }
+    if account == spent_account {
+        return Err(Error::Craft(format!(
+            "output account {account} is the account being spent; declare another account of \
+             the same seed"
+        )));
+    }
+    if account > MAX_DECLARED_OUTPUT_ACCOUNT {
+        return Err(Error::Craft(format!(
+            "output account {account} exceeds the highest declarable account \
+             {MAX_DECLARED_OUTPUT_ACCOUNT}"
+        )));
+    }
+    Ok(())
+}
+
+/// Maps each declared recipient (raw Orchard address bytes) to its account.
+/// Two outputs to one recipient must name the same account.
+fn declared_recipients<'a>(
+    declared: impl Iterator<Item = (&'a OrchardAddress, u32)>,
+) -> Result<std::collections::BTreeMap<[u8; 43], u32>, Error> {
+    let mut map = std::collections::BTreeMap::new();
+    for (addr, account) in declared {
+        let previous = map.insert(addr.to_raw_address_bytes(), account);
+        if previous.is_some_and(|p| p != account) {
+            return Err(Error::Craft(
+                "one recipient is declared with two different output accounts".into(),
+            ));
+        }
+    }
+    Ok(map)
+}
+
+/// ZIP-32 path `m/32'/coin_type'/account'` as raw hardened indices.
+fn output_derivation_path(network: &AnyZcashNetwork, account: u32) -> Vec<u32> {
+    vec![
+        ChildIndex::hardened(32).index(),
+        ChildIndex::hardened(stamped_coin_type(network)).index(),
+        ChildIndex::hardened(account).index(),
+    ]
+}
+
+/// Stamps the ZIP-32 derivation on the **output** half of every Orchard action
+/// whose recipient is a declared one. Matching by recipient keeps the stamp
+/// independent of the order in which the builder shuffles actions; change and
+/// dummy outputs never match.
+fn stamp_output_derivations(
+    pczt: Pczt,
+    network: &AnyZcashNetwork,
+    seed_fingerprint: [u8; 32],
+    declared: &std::collections::BTreeMap<[u8; 43], u32>,
+) -> Result<Pczt, Error> {
+    Updater::new(pczt)
+        .update_orchard_with(|mut updater| {
+            let recipients: Vec<Option<[u8; 43]>> = updater
+                .bundle()
+                .actions()
+                .iter()
+                .map(|a| a.output().recipient().map(|r| r.to_raw_address_bytes()))
+                .collect();
+            for (i, recipient) in recipients.into_iter().enumerate() {
+                let Some(account) = recipient.and_then(|r| declared.get(&r)) else {
+                    continue;
+                };
+                let derivation = Zip32Derivation::parse(
+                    seed_fingerprint,
+                    output_derivation_path(network, *account),
+                )
+                .map_err(|_| orchard::pczt::UpdaterError::InvalidIndex)?;
+                updater.update_action_with(i, |mut action| {
+                    action.set_output_zip32_derivation(derivation);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Craft(format!("PCZT Updater (orchard output zip32): {e:?}")))
+        .map(Updater::finish)
+}
+
+/// Sibling of [`stamp_output_derivations`] for the Ironwood bundle.
+fn stamp_ironwood_output_derivations(
+    pczt: Pczt,
+    network: &AnyZcashNetwork,
+    seed_fingerprint: [u8; 32],
+    declared: &std::collections::BTreeMap<[u8; 43], u32>,
+) -> Result<Pczt, Error> {
+    Updater::new(pczt)
+        .update_ironwood_with(|mut updater| {
+            let recipients: Vec<Option<[u8; 43]>> = updater
+                .bundle()
+                .actions()
+                .iter()
+                .map(|a| a.output().recipient().map(|r| r.to_raw_address_bytes()))
+                .collect();
+            for (i, recipient) in recipients.into_iter().enumerate() {
+                let Some(account) = recipient.and_then(|r| declared.get(&r)) else {
+                    continue;
+                };
+                let derivation = Zip32Derivation::parse(
+                    seed_fingerprint,
+                    output_derivation_path(network, *account),
+                )
+                .map_err(|_| orchard::pczt::UpdaterError::InvalidIndex)?;
+                updater.update_action_with(i, |mut action| {
+                    action.set_output_zip32_derivation(derivation);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Craft(format!("PCZT Updater (ironwood output zip32): {e:?}")))
         .map(Updater::finish)
 }
 
@@ -1486,6 +1658,14 @@ pub struct IronwoodOutputRequest {
     /// paid receiver, or the build fails. PCZT metadata only: it changes neither
     /// the transaction id nor any sighash.
     pub user_address: Option<String>,
+    /// ZIP 32 account of the **same seed** that this output pays, when the
+    /// recipient is another account of the wallet. The PCZT then carries that
+    /// output's ZIP 32 derivation (seed fingerprint and
+    /// `m/32'/coin_type'/account'`) so the signer can recognize the recipient
+    /// as the user's own account. Metadata only: the transaction id and the
+    /// sighashes are unchanged. Shielded destinations only; must differ from
+    /// the account being spent and be at most [`MAX_DECLARED_OUTPUT_ACCOUNT`].
+    pub account: Option<u32>,
 }
 
 /// Inputs to [`build_ironwood_transaction`].
@@ -1605,6 +1785,24 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     if outputs.is_empty() {
         return Err(Error::Craft("outputs list is empty".into()));
     }
+    for out in &outputs {
+        if let Some(account) = out.account {
+            validate_declared_account(
+                account,
+                account_index,
+                matches!(out.destination, IronwoodDestination::Ironwood(_)),
+            )?;
+        }
+    }
+    let declared =
+        declared_recipients(
+            outputs
+                .iter()
+                .filter_map(|o| match (&o.destination, o.account) {
+                    (IronwoodDestination::Ironwood(addr), Some(account)) => Some((addr, account)),
+                    _ => None,
+                }),
+        )?;
 
     let has_ironwood = !spends.is_empty()
         || outputs
@@ -1719,6 +1917,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
                 Error::Craft("change_address required for Ironwood change but none supplied".into())
             })?;
             let change_req = IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(change_addr),
                 value: change,
                 memo: None,
@@ -1747,6 +1946,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
                 )
             })?;
             let change_req = IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Transparent(addr),
                 value: change,
                 memo: None,
@@ -1809,6 +2009,11 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     })?;
 
     let pczt = stamp_ironwood_spend_derivations(pczt, &network, seed_fingerprint, account_index)?;
+    let pczt = if declared.is_empty() {
+        pczt
+    } else {
+        stamp_ironwood_output_derivations(pczt, &network, seed_fingerprint, &declared)?
+    };
 
     let pczt = IoFinalizer::new(pczt)
         .finalize_io(UnwrapErr(SysRng))
@@ -2242,6 +2447,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: out_destination,
                 value: out_value,
                 memo: None,
@@ -2305,6 +2511,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: out_destination,
                 value: out_value,
                 memo: None,
@@ -2403,6 +2610,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(dummy_recipient),
                 value: 50,
                 memo: None,
@@ -2463,6 +2671,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: 10_000,
                 memo: None,
@@ -2499,6 +2708,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(fvk.address_at(0u32, Scope::External)),
                 value: 1,
                 memo: None,
@@ -2584,6 +2794,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(20_000)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(TransparentAddress::PublicKeyHash(
                     [0x11u8; 20],
                 )),
@@ -2757,6 +2968,7 @@ mod tests {
                 derivation_address_index: 0,
             }],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_dest),
                 value: out_value,
                 memo: None,
@@ -2795,6 +3007,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(30_000)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_dest),
                 value: 10_000,
                 memo: None,
@@ -3211,6 +3424,7 @@ mod tests {
 
     fn output_to(destination: Destination, user_address: Option<String>) -> OutputRequest {
         OutputRequest {
+            account: None,
             destination,
             value: 10_000,
             memo: None,
@@ -3648,6 +3862,7 @@ mod tests {
             spends,
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
@@ -3719,12 +3934,14 @@ mod tests {
             transparent_inputs: vec![],
             outputs: vec![
                 OutputRequest {
+                    account: None,
                     destination: Destination::Orchard(recipient),
                     value: 4_000,
                     memo: None,
                     user_address: None,
                 },
                 OutputRequest {
+                    account: None,
                     destination: Destination::Orchard(recipient),
                     value: 4_000,
                     memo: None,
@@ -3787,6 +4004,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: 10_000,
                 memo: None,
@@ -3843,6 +4061,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -4086,6 +4305,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_addr),
                 value: out_value,
                 memo: None,
@@ -4209,6 +4429,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -4289,6 +4510,7 @@ mod tests {
                 derivation_address_index: 3,
             }],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -4391,6 +4613,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -4465,6 +4688,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
@@ -4549,6 +4773,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
@@ -4815,6 +5040,7 @@ mod tests {
             spends,
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -4891,6 +5117,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -4954,6 +5181,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -5054,6 +5282,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -5243,6 +5472,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -5411,6 +5641,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(20_000)],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Transparent(t_addr),
                 value: 10_000,
                 memo: None,
@@ -5477,6 +5708,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -5521,6 +5753,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(20_000)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: 10_000,
                 memo: None,
@@ -5585,6 +5818,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(total_in)],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -5661,6 +5895,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(out_value + fee)],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
@@ -6034,6 +6269,7 @@ mod tests {
             spends: vec![],
             transparent_inputs: vec![make_transparent_input(out_value + fee)],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -6047,5 +6283,250 @@ mod tests {
             expiry_of(&out.pczt_bytes),
             target + zcash_primitives::transaction::builder::default_tx_expiry_delta(branch)
         );
+    }
+
+    // ── declared output account ───────────────────────────────────────────────
+
+    /// A recipient that is neither the spent note's address nor the change
+    /// address, standing for another account of the same seed.
+    fn other_account_recipient() -> OrchardAddress {
+        make_fvk().address_at(7u32, Scope::External)
+    }
+
+    fn orchard_inputs_paying_account(network: Network, account: Option<u32>) -> BuildInputs {
+        let mut inputs = make_single_spend_inputs(
+            network,
+            Destination::Orchard(other_account_recipient()),
+            10_000,
+        );
+        inputs.outputs[0].account = account;
+        inputs
+    }
+
+    fn ironwood_inputs_paying_account(
+        network: Network,
+        account: Option<u32>,
+    ) -> IronwoodBuildInputs {
+        let mut inputs = make_single_ironwood_spend_inputs(
+            network,
+            IronwoodDestination::Ironwood(other_account_recipient()),
+            10_000,
+        );
+        inputs.outputs[0].account = account;
+        inputs
+    }
+
+    fn craft_error_message(e: Error) -> String {
+        match e {
+            Error::Craft(msg) => msg,
+            other => panic!("expected Error::Craft, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orchard_output_account_is_declared_on_the_matching_action_only() {
+        let out = build_transaction(orchard_inputs_paying_account(Network::MainNetwork, Some(1)))
+            .expect("build with a declared account must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        let actions = parsed.orchard_bundle.expect("orchard bundle").actions;
+        assert!(actions.len() >= 2, "padding adds a dummy action");
+
+        let recipient = other_account_recipient().to_raw_address_bytes();
+        let declared: Vec<_> = actions
+            .iter()
+            .filter(|a| a.output_derivation.is_some())
+            .collect();
+        assert_eq!(declared.len(), 1, "exactly one action pays the account");
+        assert_eq!(declared[0].recipient, recipient);
+        let derivation = declared[0].output_derivation.as_ref().unwrap();
+        assert_eq!(derivation.signing_path, "32'/133'/1'");
+        assert_eq!(derivation.seed_fingerprint, [0x42; 32]);
+    }
+
+    #[test]
+    fn ironwood_output_account_is_declared_on_the_matching_action_only() {
+        let out = build_ironwood_transaction(ironwood_inputs_paying_account(
+            Network::MainNetwork,
+            Some(1),
+        ))
+        .expect("build with a declared account must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        let actions = parsed.ironwood_bundle.expect("ironwood bundle").actions;
+        assert!(actions.len() >= 2, "padding adds a dummy action");
+
+        let recipient = other_account_recipient().to_raw_address_bytes();
+        let declared: Vec<_> = actions
+            .iter()
+            .filter(|a| a.action.output_derivation.is_some())
+            .collect();
+        assert_eq!(declared.len(), 1, "exactly one action pays the account");
+        assert_eq!(declared[0].action.recipient, recipient);
+        let derivation = declared[0].action.output_derivation.as_ref().unwrap();
+        assert_eq!(derivation.signing_path, "32'/133'/1'");
+        assert_eq!(derivation.seed_fingerprint, [0x42; 32]);
+    }
+
+    #[test]
+    fn output_account_uses_the_testnet_coin_type() {
+        let out = build_transaction(orchard_inputs_paying_account(Network::TestNetwork, Some(1)))
+            .expect("build must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        let path = parsed
+            .orchard_bundle
+            .unwrap()
+            .actions
+            .into_iter()
+            .find_map(|a| a.output_derivation)
+            .expect("one action carries the declaration")
+            .signing_path;
+        assert_eq!(path, "32'/1'/1'");
+    }
+
+    #[test]
+    fn output_account_up_to_the_declarable_maximum_builds() {
+        build_transaction(orchard_inputs_paying_account(
+            Network::MainNetwork,
+            Some(MAX_DECLARED_OUTPUT_ACCOUNT),
+        ))
+        .expect("the highest declarable account must be accepted");
+    }
+
+    #[test]
+    fn without_a_declared_account_no_action_carries_an_output_derivation() {
+        let out = build_transaction(orchard_inputs_paying_account(Network::MainNetwork, None))
+            .expect("build must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        assert!(parsed
+            .orchard_bundle
+            .unwrap()
+            .actions
+            .iter()
+            .all(|a| a.output_derivation.is_none()));
+
+        let out =
+            build_ironwood_transaction(ironwood_inputs_paying_account(Network::MainNetwork, None))
+                .expect("build must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        assert!(parsed
+            .ironwood_bundle
+            .unwrap()
+            .actions
+            .iter()
+            .all(|a| a.action.output_derivation.is_none()));
+    }
+
+    /// The declaration is signer metadata: stamping it onto a built PCZT leaves
+    /// the bytes different but the shielded sighash (hence the txid) unchanged.
+    #[test]
+    fn declaring_an_output_account_does_not_change_the_sighash() {
+        use pczt::roles::signer::Signer;
+
+        let out = build_transaction(orchard_inputs_paying_account(Network::MainNetwork, None))
+            .expect("build must succeed");
+        let sighash_before = Signer::new(Pczt::parse(&out.pczt_bytes).unwrap())
+            .expect("signer")
+            .shielded_sighash();
+
+        let declared =
+            declared_recipients([(&other_account_recipient(), 1u32)].into_iter()).unwrap();
+        let stamped = stamp_output_derivations(
+            Pczt::parse(&out.pczt_bytes).unwrap(),
+            &Network::MainNetwork.into(),
+            [0x42; 32],
+            &declared,
+        )
+        .expect("stamping must succeed");
+        let unstamped_bytes = Pczt::parse(&out.pczt_bytes).unwrap().serialize().unwrap();
+        let stamped_bytes = Pczt::parse(&stamped.clone().serialize().unwrap())
+            .unwrap()
+            .serialize()
+            .unwrap();
+        assert_ne!(
+            stamped_bytes, unstamped_bytes,
+            "the declaration must be written into the PCZT"
+        );
+        let sighash_after = Signer::new(stamped).expect("signer").shielded_sighash();
+        assert_eq!(sighash_before, sighash_after);
+    }
+
+    #[test]
+    fn output_account_on_a_transparent_destination_is_refused() {
+        let mut inputs = make_single_spend_inputs(
+            Network::MainNetwork,
+            Destination::Transparent(TransparentAddress::PublicKeyHash([0x11; 20])),
+            10_000,
+        );
+        inputs.outputs[0].account = Some(1);
+        let msg = craft_error_message(build_transaction(inputs).unwrap_err());
+        assert!(msg.contains("transparent destination"), "{msg}");
+
+        let mut inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Transparent(TransparentAddress::PublicKeyHash([0x11; 20])),
+            10_000,
+        );
+        inputs.outputs[0].account = Some(1);
+        let msg = craft_error_message(build_ironwood_transaction(inputs).unwrap_err());
+        assert!(msg.contains("transparent destination"), "{msg}");
+    }
+
+    #[test]
+    fn output_account_equal_to_the_spent_account_is_refused() {
+        let msg = craft_error_message(
+            build_transaction(orchard_inputs_paying_account(Network::MainNetwork, Some(0)))
+                .unwrap_err(),
+        );
+        assert!(msg.contains("account being spent"), "{msg}");
+        let msg = craft_error_message(
+            build_ironwood_transaction(ironwood_inputs_paying_account(
+                Network::MainNetwork,
+                Some(0),
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("account being spent"), "{msg}");
+    }
+
+    #[test]
+    fn hardened_output_account_is_refused() {
+        let msg = craft_error_message(
+            build_transaction(orchard_inputs_paying_account(
+                Network::MainNetwork,
+                Some(1 << 31),
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("hardened range"), "{msg}");
+    }
+
+    #[test]
+    fn output_account_above_the_declarable_maximum_is_refused() {
+        let account = MAX_DECLARED_OUTPUT_ACCOUNT + 1;
+        let msg = craft_error_message(
+            build_transaction(orchard_inputs_paying_account(
+                Network::MainNetwork,
+                Some(account),
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("highest declarable"), "{msg}");
+        let msg = craft_error_message(
+            build_ironwood_transaction(ironwood_inputs_paying_account(
+                Network::MainNetwork,
+                Some(account),
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("highest declarable"), "{msg}");
+    }
+
+    #[test]
+    fn one_recipient_declared_with_two_accounts_is_refused() {
+        let recipient = other_account_recipient();
+        let err =
+            declared_recipients([(&recipient, 1u32), (&recipient, 2u32)].into_iter()).unwrap_err();
+        assert!(craft_error_message(err).contains("two different"));
+        // The same account twice is fine.
+        assert!(declared_recipients([(&recipient, 1u32), (&recipient, 1u32)].into_iter()).is_ok());
     }
 }
