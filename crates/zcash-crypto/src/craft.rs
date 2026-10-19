@@ -5496,7 +5496,7 @@ mod tests {
         );
         inputs.outputs[0].account = Some(1);
         let msg = craft_error_message(build_transaction(inputs).unwrap_err());
-        assert!(msg.contains("transparent destination"), "{msg}");
+        assert!(msg.contains("transparent destination"));
 
         let mut inputs = make_single_ironwood_spend_inputs(
             Network::MainNetwork,
@@ -5505,7 +5505,7 @@ mod tests {
         );
         inputs.outputs[0].account = Some(1);
         let msg = craft_error_message(build_ironwood_transaction(inputs).unwrap_err());
-        assert!(msg.contains("transparent destination"), "{msg}");
+        assert!(msg.contains("transparent destination"));
     }
 
     #[test]
@@ -5514,7 +5514,7 @@ mod tests {
             build_transaction(orchard_inputs_paying_account(Network::MainNetwork, Some(0)))
                 .unwrap_err(),
         );
-        assert!(msg.contains("account being spent"), "{msg}");
+        assert!(msg.contains("account being spent"));
         let msg = craft_error_message(
             build_ironwood_transaction(ironwood_inputs_paying_account(
                 Network::MainNetwork,
@@ -5522,7 +5522,7 @@ mod tests {
             ))
             .unwrap_err(),
         );
-        assert!(msg.contains("account being spent"), "{msg}");
+        assert!(msg.contains("account being spent"));
     }
 
     #[test]
@@ -5534,7 +5534,7 @@ mod tests {
             ))
             .unwrap_err(),
         );
-        assert!(msg.contains("hardened range"), "{msg}");
+        assert!(msg.contains("hardened range"));
     }
 
     #[test]
@@ -5547,7 +5547,7 @@ mod tests {
             ))
             .unwrap_err(),
         );
-        assert!(msg.contains("highest declarable"), "{msg}");
+        assert!(msg.contains("highest declarable"));
         let msg = craft_error_message(
             build_ironwood_transaction(ironwood_inputs_paying_account(
                 Network::MainNetwork,
@@ -5555,7 +5555,7 @@ mod tests {
             ))
             .unwrap_err(),
         );
-        assert!(msg.contains("highest declarable"), "{msg}");
+        assert!(msg.contains("highest declarable"));
     }
 
     #[test]
