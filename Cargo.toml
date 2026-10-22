@@ -23,22 +23,19 @@ license = "Apache-2.0"
 
 # Zcash ecosystem
 #
-# The librustzcash crates below are pinned exactly to the NU7 pre-releases: they are the first
-# releases that resolve `BranchId::Nu7` to the ZIP 259 value without an unstable cfg, and they
-# depend on one another with exact (`=`) requirements, so the whole set moves together. They
-# carry the NU7 testnet activation height but no mainnet one. Swap them for the stable releases
-# that carry the NU7 mainnet activation height as soon as those are published: until then a
-# mainnet transaction past activation would still be built under the NU6.3 branch id.
-zcash_client_backend  = { version = "=0.25.0-pre.1", default-features = false }
-zcash_keys            = { version = "=0.17.0-pre.1", features = ["orchard", "sapling"] }
+# The librustzcash crates below are pinned exactly to the first stable releases that carry the
+# NU7 mainnet activation height (3543405) and the ZIP 259 branch id. They depend on one another
+# with exact (`=`) requirements, so the whole set moves together.
+zcash_client_backend  = { version = "=0.25.0", default-features = false }
+zcash_keys            = { version = "=0.17.0", features = ["orchard", "sapling"] }
 # Note: `transparent-inputs` is now a default feature of zcash-crypto.
-zcash_address         = "=0.14.0-pre.1"
+zcash_address         = "=0.14.0"
 zcash_note_encryption = "0.5.1"
-zcash_primitives      = { version = "=0.31.0-pre.1", default-features = false }
+zcash_primitives      = { version = "=0.31.0", default-features = false }
 # Transparent-pool address + script types; pulled by zcash_primitives internally
 # under the local alias `transparent`. We depend on it directly to avoid that alias.
-zcash_transparent     = "=0.11.0-pre.1"
-zcash_protocol        = { version = "=0.11.0-pre.0", features = ["local-consensus"] }
+zcash_transparent     = "=0.11.0"
+zcash_protocol        = { version = "=0.11.0", features = ["local-consensus"] }
 zip32                 = "0.3"
 orchard               = { version = "0.16", default-features = false }
 sapling-crypto        = { version = "0.9", default-features = false }
@@ -85,8 +82,8 @@ shardtree             = "0.8"
 # Pinned exactly: this defines the byte stream the firmware parses, so it moves only as a
 # deliberate, tested step — never as a side effect of `cargo update`. 0.10 keeps the 0.9
 # encodings (v1 whenever the content fits it, v2 otherwise) and their field layout; it moves
-# with the NU7 pre-release set above.
-pczt = { version = "=0.10.0-pre.1", default-features = false, features = [
+# with the librustzcash set above.
+pczt = { version = "=0.10.0", default-features = false, features = [
     "std", "orchard", "transparent", "zcp-builder", "io-finalizer", "prover",
     "signer", "tx-extractor", "spend-finalizer",
 ] }

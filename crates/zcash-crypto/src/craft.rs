@@ -4828,6 +4828,78 @@ mod tests {
         );
     }
 
+    /// The NU7 mainnet activation height ZIP 259 assigns, stated literally so that a pin
+    /// carrying another height (or none) fails here rather than at the network.
+    const MAINNET_NU7_ACTIVATION_HEIGHT: u32 = 3_543_405;
+
+    #[test]
+    fn next_activation_height_after_nu6_3_is_nu7_on_mainnet() {
+        let network = AnyZcashNetwork::Named(Network::MainNetwork);
+        let past_nu6_3 = BlockHeight::from_u32(nu6_3_activation_height(Network::MainNetwork) + 1);
+        assert_eq!(
+            next_activation_height(&network, past_nu6_3),
+            Some(BlockHeight::from_u32(MAINNET_NU7_ACTIVATION_HEIGHT))
+        );
+    }
+
+    #[test]
+    fn mainnet_branch_id_switches_to_nu7_at_its_activation_height() {
+        let at = |h: u32| BranchId::for_height(&Network::MainNetwork, BlockHeight::from_u32(h));
+        assert_eq!(at(MAINNET_NU7_ACTIVATION_HEIGHT - 1), BranchId::Nu6_3);
+        assert_eq!(at(MAINNET_NU7_ACTIVATION_HEIGHT), BranchId::Nu7);
+        assert_eq!(u32::from(BranchId::Nu7), 0x7719_0ad9);
+    }
+
+    fn branch_id_of(pczt_bytes: &[u8]) -> u32 {
+        crate::parse::parse_pczt(pczt_bytes)
+            .expect("parse")
+            .global
+            .consensus_branch_id
+    }
+
+    #[test]
+    fn orchard_path_builds_a_mainnet_target_under_the_branch_id_of_its_side_of_nu7() {
+        let mainnet = || AnyZcashNetwork::Named(Network::MainNetwork);
+        let before = build_transaction(transparent_only_inputs(
+            mainnet(),
+            MAINNET_NU7_ACTIVATION_HEIGHT - 20,
+        ))
+        .unwrap();
+        assert_eq!(branch_id_of(&before.pczt_bytes), u32::from(BranchId::Nu6_3));
+        // NU7 is now ahead on mainnet, so the expiry is capped one block below it.
+        assert_eq!(
+            expiry_of(&before.pczt_bytes),
+            MAINNET_NU7_ACTIVATION_HEIGHT - 1
+        );
+        let past = build_transaction(transparent_only_inputs(
+            mainnet(),
+            MAINNET_NU7_ACTIVATION_HEIGHT,
+        ))
+        .unwrap();
+        assert_eq!(branch_id_of(&past.pczt_bytes), 0x7719_0ad9);
+        // 120 blocks from NU7 activation; no later upgrade caps it.
+        assert_eq!(
+            expiry_of(&past.pczt_bytes),
+            MAINNET_NU7_ACTIVATION_HEIGHT + 120
+        );
+    }
+
+    #[test]
+    fn ironwood_path_builds_a_mainnet_target_past_nu7_under_its_branch_id() {
+        let mut inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(make_fvk().address_at(0u32, Scope::External)),
+            10_000,
+        );
+        inputs.target_height = MAINNET_NU7_ACTIVATION_HEIGHT;
+        let out = build_ironwood_transaction(inputs).unwrap();
+        assert_eq!(branch_id_of(&out.pczt_bytes), 0x7719_0ad9);
+        assert_eq!(
+            expiry_of(&out.pczt_bytes),
+            MAINNET_NU7_ACTIVATION_HEIGHT + 120
+        );
+    }
+
     #[test]
     fn cap_refuses_a_testnet_target_too_close_to_nu7() {
         let network = AnyZcashNetwork::Named(Network::TestNetwork);
@@ -4979,14 +5051,12 @@ mod tests {
     #[test]
     fn orchard_path_keeps_the_builder_expiry_far_from_an_activation() {
         let target = 10u32;
-        let out = build_transaction(transparent_only_inputs(
-            regtest_with_next_upgrade_at(10_000),
-            target,
-        ))
-        .unwrap();
+        let network = regtest_with_next_upgrade_at(10_000);
+        let branch = BranchId::for_height(&network, BlockHeight::from_u32(target));
+        let out = build_transaction(transparent_only_inputs(network, target)).unwrap();
         assert_eq!(
             expiry_of(&out.pczt_bytes),
-            target + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
+            target + zcash_primitives::transaction::builder::default_tx_expiry_delta(branch)
         );
     }
 
@@ -5082,9 +5152,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out.anchor_height, 33);
+        let branch = BranchId::for_height(&ZCASH_REGTEST, BlockHeight::from_u32(target));
         assert_eq!(
             expiry_of(&out.pczt_bytes),
-            target + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
+            target + zcash_primitives::transaction::builder::default_tx_expiry_delta(branch)
         );
     }
 }
