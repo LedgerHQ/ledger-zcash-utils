@@ -1612,9 +1612,14 @@ mod tests {
         // The target (tip + 1) is not anchor + 40: the PCZT expiry is the
         // builder's default for it.
         let parsed = zcash_crypto::parse::parse_pczt(&out.pczt_bytes).unwrap();
+        let target = OFFLINE_TIP + 1;
+        let branch = zcash_protocol::consensus::BranchId::for_height(
+            &zcash_protocol::consensus::Network::MainNetwork,
+            target.into(),
+        );
         assert_eq!(
             parsed.global.expiry_height,
-            OFFLINE_TIP + 1 + zcash_primitives::transaction::builder::DEFAULT_TX_EXPIRY_DELTA
+            target + zcash_primitives::transaction::builder::default_tx_expiry_delta(branch)
         );
     }
 

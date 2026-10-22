@@ -1105,10 +1105,9 @@ mod tests {
 
     // ── Past NU7 activation ────────────────────────────────────────────────────
     //
-    // The named networks only resolve `BranchId::Nu7` once the pinned
-    // `zcash_protocol` carries their activation height, so these build on a
-    // local network with NU7 active, past its activation, and take each pool's
-    // transaction through signing to its serialized form.
+    // These build on a local network, where NU7 can activate at a low height
+    // that the synthetic fixtures reach, past its activation, and take each
+    // pool's transaction through signing to its serialized form.
 
     /// Regtest with every upgrade through NU7 active from height 2.
     fn nu7_network() -> AnyZcashNetwork {
