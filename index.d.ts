@@ -174,6 +174,14 @@ export interface OutputRequestJs {
   address: string
   valueZat: string
   memo?: string
+  /**
+   * ZIP 32 account of the **same seed** that this output pays, when the
+   * recipient is another account of the wallet. The PCZT then carries that
+   * output's ZIP 32 derivation, and `parsePczt` returns it as
+   * `outputZip32Derivation`. Shielded destinations only; must differ from
+   * the account being spent and be at most 100.
+   */
+  account?: number
 }
 /** One transparent (P2PKH) UTXO to spend. */
 export interface TransparentInputJs {
@@ -362,6 +370,14 @@ export interface IronwoodOutputRequestJs {
   address: string
   valueZat: string
   memo?: string
+  /**
+   * ZIP 32 account of the **same seed** that this output pays, when the
+   * recipient is another account of the wallet. The PCZT then carries that
+   * output's ZIP 32 derivation, and `parsePczt` returns it as
+   * `outputZip32Derivation`. Shielded destinations only; must differ from
+   * the account being spent and be at most 100.
+   */
+  account?: number
 }
 export interface BuildIronwoodTransactionParams {
   grpcUrl: string
@@ -600,6 +616,16 @@ export interface PcztTransparentOutput {
   /** Present (change output) or `null` (external recipient). */
   derivation?: PcztBip32Derivation
 }
+/**
+ * A ZIP-32 derivation declared on an action output: the account of the signing
+ * seed that the output pays. Same shape as the signer's `PcztZip32Derivation`.
+ */
+export interface PcztZip32Derivation {
+  /** ZIP-32 derivation path, e.g. `32'/133'/1'`. */
+  path: string
+  /** ZIP-32 seed fingerprint, 32 bytes. */
+  seedFingerprint: Uint8Array
+}
 /** A single Orchard action (spend + output halves), flattened for the device. */
 export interface PcztOrchardAction {
   /** Value commitment, 32 bytes. */
@@ -636,6 +662,11 @@ export interface PcztOrchardAction {
   rseed: Uint8Array
   /** Value commitment randomness, 32 bytes. */
   rcv: Uint8Array
+  /**
+   * Present when the output was declared to pay another account of the same
+   * seed (see the `account` of the output request); absent otherwise.
+   */
+  outputZip32Derivation?: PcztZip32Derivation
 }
 /** The Orchard action bundle plus its trailer. */
 export interface PcztOrchardBundle {
@@ -689,6 +720,11 @@ export interface PcztIronwoodAction {
   rseed: Uint8Array
   /** Value commitment randomness, 32 bytes. */
   rcv: Uint8Array
+  /**
+   * Present when the output was declared to pay another account of the same
+   * seed (see the `account` of the output request); absent otherwise.
+   */
+  outputZip32Derivation?: PcztZip32Derivation
   /** Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2. */
   notePlaintextVersion: number
 }
