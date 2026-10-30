@@ -36,9 +36,14 @@ use orchard::note::NoteVersion;
 use orchard::ValuePool;
 use pczt::roles::verifier::{OrchardError, TransparentError, Verifier};
 use pczt::Pczt;
+use zcash_address::unified::{
+    Address as UnifiedAddress, Container as _, Encoding as _, Receiver as UnifiedReceiver,
+};
+use zcash_keys::address::Address as ZcashAddress;
 use zcash_primitives::transaction::components::orchard::bundle_version_for_branch;
-use zcash_protocol::consensus::BranchId;
+use zcash_protocol::consensus::{BranchId, Network, NetworkType};
 use zcash_script::script::Evaluable;
+use zcash_transparent::address::TransparentAddress;
 
 use crate::error::Error;
 
@@ -84,6 +89,15 @@ pub struct ParsedTransparentInput {
     pub derivation: ParsedBip32Derivation,
 }
 
+/// One receiver of a unified address, as the device shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedReceiver {
+    /// ZIP 316 typecode: P2PKH `0x00`, P2SH `0x01`, Sapling `0x02`, Orchard `0x03`.
+    pub typecode: u8,
+    /// Raw receiver bytes.
+    pub receiver: Vec<u8>,
+}
+
 /// A single transparent output.
 #[derive(Debug, Clone)]
 pub struct ParsedTransparentOutput {
@@ -91,6 +105,12 @@ pub struct ParsedTransparentOutput {
     pub script_pubkey: Vec<u8>,
     /// Present only for change outputs the wallet controls.
     pub derivation: Option<ParsedBip32Derivation>,
+    /// The address the user entered (ZIP 374 `user_address`), when recorded.
+    pub user_address: Option<String>,
+    /// The receivers of `user_address` other than the one this output pays, in
+    /// ascending typecode order. `None` when no address was recorded or it holds
+    /// a receiver of a type this crate does not know.
+    pub user_address_receivers: Option<Vec<ParsedReceiver>>,
 }
 
 /// A single Orchard action (spend + output halves), flattened for the device.
@@ -114,6 +134,12 @@ pub struct ParsedOrchardAction {
     pub value: u64,
     pub rseed: [u8; 32],
     pub rcv: [u8; 32],
+    /// The address the user entered (ZIP 374 `user_address`), when recorded.
+    pub user_address: Option<String>,
+    /// The receivers of `user_address` other than the Orchard `recipient`, in
+    /// ascending typecode order. `None` when no address was recorded or it holds
+    /// a receiver of a type this crate does not know.
+    pub user_address_receivers: Option<Vec<ParsedReceiver>>,
 }
 
 /// The Orchard action bundle plus its trailing bundle-level fields.
@@ -194,8 +220,10 @@ pub fn parse_pczt(bytes: &[u8]) -> Result<ParsedPczt, Error> {
                     .push(convert_transparent_input(input).map_err(TransparentError::Custom)?);
             }
             for output in bundle.outputs() {
-                transparent_outputs
-                    .push(convert_transparent_output(output).map_err(TransparentError::Custom)?);
+                transparent_outputs.push(
+                    convert_transparent_output(output, global.coin_type)
+                        .map_err(TransparentError::Custom)?,
+                );
             }
             Ok(())
         })
@@ -203,8 +231,9 @@ pub fn parse_pczt(bytes: &[u8]) -> Result<ParsedPczt, Error> {
 
     let verifier = verifier
         .with_orchard::<String, _>(|bundle| {
-            orchard_bundle = convert_orchard_bundle(bundle, branch, ValuePool::Orchard)
-                .map_err(OrchardError::Custom)?;
+            orchard_bundle =
+                convert_orchard_bundle(bundle, branch, ValuePool::Orchard, global.coin_type)
+                    .map_err(OrchardError::Custom)?;
             Ok(())
         })
         .map_err(map_orchard_err)?;
@@ -216,8 +245,8 @@ pub fn parse_pczt(bytes: &[u8]) -> Result<ParsedPczt, Error> {
     if global.tx_version >= V6_TX_VERSION {
         verifier
             .with_ironwood::<String, _>(|bundle| {
-                ironwood_bundle =
-                    convert_ironwood_bundle(bundle, branch).map_err(OrchardError::Custom)?;
+                ironwood_bundle = convert_ironwood_bundle(bundle, branch, global.coin_type)
+                    .map_err(OrchardError::Custom)?;
                 Ok(())
             })
             .map_err(map_ironwood_err)?;
@@ -296,11 +325,24 @@ fn convert_transparent_input(
 
 fn convert_transparent_output(
     output: &zcash_transparent::pczt::Output,
+    coin_type: u32,
 ) -> Result<ParsedTransparentOutput, String> {
+    let script_pubkey = output.script_pubkey().to_bytes();
+    let user_address = output.user_address().clone();
+    let user_address_receivers = match &user_address {
+        Some(address) => {
+            let paid = paid_transparent_receiver(&script_pubkey)
+                .ok_or("transparent output with a user_address pays a non-standard script")?;
+            user_address_receivers(address, &paid, coin_type)?
+        }
+        None => None,
+    };
     Ok(ParsedTransparentOutput {
         value: output.value().into_u64(),
-        script_pubkey: output.script_pubkey().to_bytes(),
+        script_pubkey,
         derivation: single_derivation(output.bip32_derivation())?,
+        user_address,
+        user_address_receivers,
     })
 }
 
@@ -345,6 +387,7 @@ fn convert_orchard_bundle(
     bundle: &orchard::pczt::Bundle,
     branch: BranchId,
     pool: ValuePool,
+    coin_type: u32,
 ) -> Result<Option<ParsedOrchardBundle>, String> {
     if bundle.actions().is_empty() {
         return Ok(None);
@@ -354,7 +397,7 @@ fn convert_orchard_bundle(
 
     let mut actions = Vec::with_capacity(bundle.actions().len());
     for action in bundle.actions() {
-        actions.push(convert_orchard_action(action)?);
+        actions.push(convert_orchard_action(action, coin_type)?);
     }
 
     let (magnitude, sign) = bundle.value_sum().magnitude_sign();
@@ -383,8 +426,11 @@ fn convert_orchard_bundle(
 fn convert_ironwood_bundle(
     bundle: &orchard::pczt::Bundle,
     branch: BranchId,
+    coin_type: u32,
 ) -> Result<Option<ParsedIronwoodBundle>, String> {
-    let Some(orchard_shaped) = convert_orchard_bundle(bundle, branch, ValuePool::Ironwood)? else {
+    let Some(orchard_shaped) =
+        convert_orchard_bundle(bundle, branch, ValuePool::Ironwood, coin_type)?
+    else {
         return Ok(None);
     };
 
@@ -421,7 +467,10 @@ fn note_plaintext_lead_byte(version: NoteVersion) -> u8 {
     }
 }
 
-fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchardAction, String> {
+fn convert_orchard_action(
+    action: &orchard::pczt::Action,
+    coin_type: u32,
+) -> Result<ParsedOrchardAction, String> {
     let spend = action.spend();
     let output = action.output();
 
@@ -476,6 +525,14 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
         .map(|r| r.to_bytes())
         .ok_or("orchard action missing rcv")?;
 
+    let user_address = output.user_address().clone();
+    let user_address_receivers = match &user_address {
+        Some(address) => {
+            user_address_receivers(address, &PaidReceiver::Orchard(recipient), coin_type)?
+        }
+        None => None,
+    };
+
     Ok(ParsedOrchardAction {
         cv_net: action.cv_net().to_bytes(),
         nullifier: spend.nullifier().to_bytes(),
@@ -495,7 +552,124 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
         value,
         rseed,
         rcv,
+        user_address,
+        user_address_receivers,
     })
+}
+
+// ─── user address ────────────────────────────────────────────────────────────
+
+/// The receiver an output pays, which its `user_address` must contain.
+enum PaidReceiver {
+    Orchard([u8; 43]),
+    P2pkh([u8; 20]),
+    P2sh([u8; 20]),
+}
+
+/// Reads the receiver a standard transparent `script_pubkey` pays: P2PKH
+/// (`OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG`) or P2SH
+/// (`OP_HASH160 <20> OP_EQUAL`).
+fn paid_transparent_receiver(script: &[u8]) -> Option<PaidReceiver> {
+    match script {
+        [0x76, 0xa9, 0x14, hash @ .., 0x88, 0xac] if hash.len() == 20 => {
+            Some(PaidReceiver::P2pkh(hash.try_into().ok()?))
+        }
+        [0xa9, 0x14, hash @ .., 0x87] if hash.len() == 20 => {
+            Some(PaidReceiver::P2sh(hash.try_into().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// Checks an output's `user_address` against the receiver it pays and returns
+/// its other receivers.
+///
+/// A Signer must confirm that the address contains the paid receiver (ZIP 374),
+/// so a mismatch is an error. The list is `None` when the address holds a
+/// receiver of an unknown type, since the device cannot show what it cannot
+/// describe, and `Some(vec![])` when the paid receiver is the only one. A plain
+/// transparent address equal to the paid one is accepted, with no list.
+fn user_address_receivers(
+    user_address: &str,
+    paid: &PaidReceiver,
+    coin_type: u32,
+) -> Result<Option<Vec<ParsedReceiver>>, String> {
+    let Ok((network, _, unified)) = UnifiedAddress::decode(user_address) else {
+        return check_plain_transparent_address(user_address, paid, coin_type).map(|()| None);
+    };
+
+    let expected_coin_type = match network {
+        NetworkType::Main => 133,
+        NetworkType::Test | NetworkType::Regtest => 1,
+    };
+    if coin_type != expected_coin_type {
+        return Err(format!(
+            "user_address is for another network than coin type {coin_type}"
+        ));
+    }
+
+    let paid_receiver = match paid {
+        PaidReceiver::Orchard(bytes) => UnifiedReceiver::Orchard(*bytes),
+        PaidReceiver::P2pkh(hash) => UnifiedReceiver::P2pkh(*hash),
+        PaidReceiver::P2sh(hash) => UnifiedReceiver::P2sh(*hash),
+    };
+    if !unified.contains_receiver(&paid_receiver) {
+        return Err("user_address does not contain the receiver this output pays".to_string());
+    }
+
+    let mut others = Vec::new();
+    for receiver in unified.items() {
+        if receiver == paid_receiver {
+            continue;
+        }
+        others.push(match receiver {
+            UnifiedReceiver::P2pkh(h) => ParsedReceiver {
+                typecode: 0x00,
+                receiver: h.to_vec(),
+            },
+            UnifiedReceiver::P2sh(h) => ParsedReceiver {
+                typecode: 0x01,
+                receiver: h.to_vec(),
+            },
+            UnifiedReceiver::Sapling(b) => ParsedReceiver {
+                typecode: 0x02,
+                receiver: b.to_vec(),
+            },
+            UnifiedReceiver::Orchard(b) => ParsedReceiver {
+                typecode: 0x03,
+                receiver: b.to_vec(),
+            },
+            UnifiedReceiver::Unknown { .. } => return Ok(None),
+        });
+    }
+    others.sort_by_key(|r| r.typecode);
+    Ok(Some(others))
+}
+
+/// A `user_address` that is not a unified address must be the plain transparent
+/// address the output pays.
+fn check_plain_transparent_address(
+    user_address: &str,
+    paid: &PaidReceiver,
+    coin_type: u32,
+) -> Result<(), String> {
+    let params = if coin_type == 133 {
+        Network::MainNetwork
+    } else {
+        Network::TestNetwork
+    };
+    let paid_address = match paid {
+        PaidReceiver::P2pkh(hash) => Some(TransparentAddress::PublicKeyHash(*hash)),
+        PaidReceiver::P2sh(hash) => Some(TransparentAddress::ScriptHash(*hash)),
+        PaidReceiver::Orchard(_) => None,
+    };
+    match (ZcashAddress::decode(&params, user_address), paid_address) {
+        (Some(ZcashAddress::Transparent(decoded)), Some(paid)) if decoded == paid => Ok(()),
+        _ => Err(
+            "user_address is neither a unified address nor the paid transparent address"
+                .to_string(),
+        ),
+    }
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
@@ -651,5 +825,150 @@ mod tests {
         let path =
             format_derivation_path([0x8000_0000 + 44, 0x8000_0000 + 133, 0x8000_0000].into_iter());
         assert_eq!(path, "44'/133'/0'");
+    }
+
+    // ── user address ──────────────────────────────────────────────────────────
+
+    fn ua(items: Vec<UnifiedReceiver>, network: NetworkType) -> String {
+        use zcash_address::unified::{Revision, Uitem};
+        UnifiedAddress::try_from_items(Revision::R0, items.into_iter().map(Uitem::Data).collect())
+            .expect("valid unified address")
+            .encode(&network)
+    }
+
+    #[test]
+    fn user_address_receivers_lists_the_others_in_typecode_order() {
+        let address = ua(
+            vec![
+                UnifiedReceiver::Orchard([0x03; 43]),
+                UnifiedReceiver::Sapling([0x02; 43]),
+                UnifiedReceiver::P2pkh([0x00; 20]),
+            ],
+            NetworkType::Main,
+        );
+
+        let receivers = user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133)
+            .expect("accepted")
+            .expect("known receivers only");
+
+        assert_eq!(
+            receivers,
+            vec![
+                ParsedReceiver {
+                    typecode: 0x00,
+                    receiver: vec![0x00; 20]
+                },
+                ParsedReceiver {
+                    typecode: 0x02,
+                    receiver: vec![0x02; 43]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn user_address_receivers_for_a_transparent_payment_lists_sapling_and_orchard() {
+        let address = ua(
+            vec![
+                UnifiedReceiver::Orchard([0x03; 43]),
+                UnifiedReceiver::P2sh([0x01; 20]),
+            ],
+            NetworkType::Test,
+        );
+
+        let receivers = user_address_receivers(&address, &PaidReceiver::P2sh([0x01; 20]), 1)
+            .expect("accepted")
+            .expect("known receivers only");
+
+        assert_eq!(receivers.len(), 1);
+        assert_eq!(receivers[0].typecode, 0x03);
+    }
+
+    #[test]
+    fn user_address_receivers_is_empty_for_an_orchard_only_address() {
+        let address = ua(
+            vec![UnifiedReceiver::Orchard([0x03; 43])],
+            NetworkType::Main,
+        );
+        let receivers = user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133)
+            .expect("accepted");
+        assert_eq!(receivers, Some(vec![]));
+    }
+
+    #[test]
+    fn user_address_receivers_rejects_an_address_without_the_paid_receiver() {
+        let address = ua(
+            vec![UnifiedReceiver::Orchard([0x04; 43])],
+            NetworkType::Main,
+        );
+        let err =
+            user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133).unwrap_err();
+        assert!(err.contains("does not contain"), "got: {err}");
+    }
+
+    #[test]
+    fn user_address_receivers_rejects_the_wrong_network() {
+        let address = ua(
+            vec![UnifiedReceiver::Orchard([0x03; 43])],
+            NetworkType::Test,
+        );
+        let err =
+            user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133).unwrap_err();
+        assert!(err.contains("another network"), "got: {err}");
+    }
+
+    #[test]
+    fn user_address_receivers_is_none_when_a_receiver_type_is_unknown() {
+        let address = ua(
+            vec![
+                UnifiedReceiver::Orchard([0x03; 43]),
+                UnifiedReceiver::Unknown {
+                    typecode: 0x42,
+                    data: vec![1, 2, 3],
+                },
+            ],
+            NetworkType::Main,
+        );
+        let receivers = user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133)
+            .expect("an unknown receiver is still accepted");
+        assert_eq!(receivers, None);
+    }
+
+    #[test]
+    fn user_address_receivers_accepts_the_paid_plain_transparent_address() {
+        // The P2PKH t-address of hash [0x11; 20] on mainnet.
+        let t_addr = zcash_keys::address::Address::Transparent(TransparentAddress::PublicKeyHash(
+            [0x11; 20],
+        ))
+        .encode(&Network::MainNetwork);
+
+        let accepted = user_address_receivers(&t_addr, &PaidReceiver::P2pkh([0x11; 20]), 133)
+            .expect("the paid address is accepted");
+        assert_eq!(accepted, None);
+
+        let err =
+            user_address_receivers(&t_addr, &PaidReceiver::P2pkh([0x12; 20]), 133).unwrap_err();
+        assert!(err.contains("neither a unified address"), "got: {err}");
+    }
+
+    #[test]
+    fn paid_transparent_receiver_reads_p2pkh_and_p2sh_scripts() {
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend([0x11; 20]);
+        p2pkh.extend([0x88, 0xac]);
+        assert!(matches!(
+            paid_transparent_receiver(&p2pkh),
+            Some(PaidReceiver::P2pkh(h)) if h == [0x11; 20]
+        ));
+
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend([0x22; 20]);
+        p2sh.push(0x87);
+        assert!(matches!(
+            paid_transparent_receiver(&p2sh),
+            Some(PaidReceiver::P2sh(h)) if h == [0x22; 20]
+        ));
+
+        assert!(paid_transparent_receiver(&[0x6a, 0x01, 0x00]).is_none());
     }
 }

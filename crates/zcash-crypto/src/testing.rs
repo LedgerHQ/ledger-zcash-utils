@@ -489,6 +489,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: spend_value - 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
         build_transaction(inputs)
@@ -556,6 +557,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
         build_ironwood_transaction(inputs)
@@ -605,6 +607,7 @@ mod tests {
                 )),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -711,6 +714,7 @@ mod tests {
                 destination,
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -824,6 +828,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 

@@ -206,11 +206,12 @@ where
         .outputs
         .iter()
         .map(|o| {
-            let destination = decode_destination(&network, &o.address)?;
+            let (destination, user_address) = decode_destination(&network, &o.address)?;
             Ok(OutputRequest {
                 destination,
                 value: o.value_zat,
                 memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
+                user_address,
             })
         })
         .collect::<Result<_>>()?;
@@ -453,22 +454,26 @@ where
 
 /// Decode a destination address string into a builder [`Destination`].
 ///
+/// Also returns the address string when it is a unified address, so the builder
+/// can record it as the output's `user_address`; a transparent string yields
+/// `None`.
+///
 /// Accepts transparent (P2PKH/P2SH) addresses and unified addresses with an
 /// Orchard or transparent receiver. Sapling z-addresses and ZIP-320 TEX
 /// addresses are rejected.
 fn decode_destination(
     network: &AnyZcashNetwork,
     address: &str,
-) -> Result<Destination> {
+) -> Result<(Destination, Option<String>)> {
     let addr = Address::decode(network, address)
         .ok_or_else(|| anyhow!("invalid destination address: {address}"))?;
     match addr {
-        Address::Transparent(ta) => Ok(Destination::Transparent(ta)),
+        Address::Transparent(ta) => Ok((Destination::Transparent(ta), None)),
         Address::Unified(ua) => {
             if let Some(oa) = ua.orchard() {
-                Ok(Destination::Orchard(*oa))
+                Ok((Destination::Orchard(*oa), Some(address.to_owned())))
             } else if let Some(ta) = ua.transparent() {
-                Ok(Destination::Transparent(*ta))
+                Ok((Destination::Transparent(*ta), Some(address.to_owned())))
             } else {
                 Err(anyhow!(
                     "unified address has no Orchard or Transparent receiver: {address}"
@@ -626,11 +631,12 @@ where
         .outputs
         .iter()
         .map(|o| {
-            let destination = decode_ironwood_destination(&network, &o.address)?;
+            let (destination, user_address) = decode_ironwood_destination(&network, &o.address)?;
             Ok(IronwoodOutputRequest {
                 destination,
                 value: o.value_zat,
                 memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
+                user_address,
             })
         })
         .collect::<Result<_>>()?;
@@ -827,6 +833,10 @@ where
 
 /// Decode a destination address string into an [`IronwoodDestination`].
 ///
+/// Also returns the address string when it is a unified address, so the builder
+/// can record it as the output's `user_address`; a transparent string yields
+/// `None`.
+///
 /// Accepts transparent (P2PKH/P2SH) addresses and unified addresses with an
 /// Orchard receiver — the same receiver bytes as [`decode_destination`] uses
 /// for the Orchard pool: there is no separate "Ironwood" unified-address
@@ -836,16 +846,19 @@ where
 fn decode_ironwood_destination(
     network: &AnyZcashNetwork,
     address: &str,
-) -> Result<IronwoodDestination> {
+) -> Result<(IronwoodDestination, Option<String>)> {
     let addr = Address::decode(network, address)
         .ok_or_else(|| anyhow!("invalid destination address: {address}"))?;
     match addr {
-        Address::Transparent(ta) => Ok(IronwoodDestination::Transparent(ta)),
+        Address::Transparent(ta) => Ok((IronwoodDestination::Transparent(ta), None)),
         Address::Unified(ua) => {
             if let Some(oa) = ua.orchard() {
-                Ok(IronwoodDestination::Ironwood(*oa))
+                Ok((IronwoodDestination::Ironwood(*oa), Some(address.to_owned())))
             } else if let Some(ta) = ua.transparent() {
-                Ok(IronwoodDestination::Transparent(*ta))
+                Ok((
+                    IronwoodDestination::Transparent(*ta),
+                    Some(address.to_owned()),
+                ))
             } else {
                 Err(anyhow!(
                     "unified address has no Orchard or Transparent receiver: {address}"
@@ -2242,5 +2255,63 @@ mod tests {
             err.to_string().contains("gRPC connect failed"),
             "expected anchor-fetch connect failure, got: {err}"
         );
+    }
+
+    // ── user_address pass-through ─────────────────────────────────────────────
+
+    /// The default unified address (Orchard + transparent) of the test account.
+    fn test_unified_address() -> String {
+        use zcash_keys::keys::UnifiedAddressRequest;
+        use zcash_protocol::consensus::Network;
+
+        let (ufvk_str, _, _) = test_account_keys();
+        let (_net, _revision, container) = Ufvk::decode(&ufvk_str).unwrap();
+        let (ua, _) = UnifiedFullViewingKey::parse(&container)
+            .unwrap()
+            .default_address(UnifiedAddressRequest::AllAvailableKeys)
+            .unwrap();
+        ua.encode(&Network::MainNetwork)
+    }
+
+    fn mainnet() -> AnyZcashNetwork {
+        AnyZcashNetwork::Named(zcash_protocol::consensus::Network::MainNetwork)
+    }
+
+    #[test]
+    fn decode_destination_keeps_the_unified_address_string() {
+        let ua = test_unified_address();
+
+        let (destination, user_address) = decode_destination(&mainnet(), &ua).unwrap();
+
+        assert!(matches!(destination, Destination::Orchard(_)));
+        assert_eq!(user_address.as_deref(), Some(ua.as_str()));
+    }
+
+    #[test]
+    fn decode_destination_has_no_user_address_for_a_transparent_string() {
+        let (destination, user_address) =
+            decode_destination(&mainnet(), "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs").unwrap();
+
+        assert!(matches!(destination, Destination::Transparent(_)));
+        assert_eq!(user_address, None);
+    }
+
+    #[test]
+    fn decode_ironwood_destination_keeps_the_unified_address_string() {
+        let ua = test_unified_address();
+
+        let (destination, user_address) = decode_ironwood_destination(&mainnet(), &ua).unwrap();
+
+        assert!(matches!(destination, IronwoodDestination::Ironwood(_)));
+        assert_eq!(user_address.as_deref(), Some(ua.as_str()));
+    }
+
+    #[test]
+    fn decode_ironwood_destination_has_no_user_address_for_a_transparent_string() {
+        let (destination, user_address) =
+            decode_ironwood_destination(&mainnet(), "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs").unwrap();
+
+        assert!(matches!(destination, IronwoodDestination::Transparent(_)));
+        assert_eq!(user_address, None);
     }
 }

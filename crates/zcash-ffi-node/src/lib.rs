@@ -998,6 +998,15 @@ pub struct PcztTransparentInput {
     pub derivation: PcztBip32Derivation,
 }
 
+/// One receiver of a unified address the user entered.
+#[napi(object)]
+pub struct PcztUserAddressReceiver {
+    /// ZIP 316 typecode: P2PKH `0`, P2SH `1`, Sapling `2`, Orchard `3`.
+    pub typecode: u32,
+    /// Raw receiver bytes.
+    pub receiver: Uint8Array,
+}
+
 /// A single transparent output.
 #[napi(object)]
 pub struct PcztTransparentOutput {
@@ -1007,6 +1016,15 @@ pub struct PcztTransparentOutput {
     pub script_pubkey: Uint8Array,
     /// Present (change output) or `null` (external recipient).
     pub derivation: Option<PcztBip32Derivation>,
+    /// The unified address the user entered, as recorded in the PCZT (ZIP 374
+    /// `user_address`). `null` when none was recorded.
+    pub user_address: Option<String>,
+    /// The receivers of `userAddress` other than the one this output pays, in
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+    /// when no address was recorded, or when it holds a receiver of an unknown
+    /// type (the device then shows its fallback); empty when the paid receiver
+    /// is the only one.
+    pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
 }
 
 /// A single Orchard action (spend + output halves), flattened for the device.
@@ -1046,6 +1064,15 @@ pub struct PcztOrchardAction {
     pub rseed: Uint8Array,
     /// Value commitment randomness, 32 bytes.
     pub rcv: Uint8Array,
+    /// The unified address the user entered, as recorded in the PCZT (ZIP 374
+    /// `user_address`). `null` when none was recorded.
+    pub user_address: Option<String>,
+    /// The receivers of `userAddress` other than the one this output pays, in
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+    /// when no address was recorded, or when it holds a receiver of an unknown
+    /// type (the device then shows its fallback); empty when the paid receiver
+    /// is the only one.
+    pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
 }
 
 /// The Orchard action bundle plus its trailer.
@@ -1101,6 +1128,15 @@ pub struct PcztIronwoodAction {
     pub rseed: Uint8Array,
     /// Value commitment randomness, 32 bytes.
     pub rcv: Uint8Array,
+    /// The unified address the user entered, as recorded in the PCZT (ZIP 374
+    /// `user_address`). `null` when none was recorded.
+    pub user_address: Option<String>,
+    /// The receivers of `userAddress` other than the one this output pays, in
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+    /// when no address was recorded, or when it holds a receiver of an unknown
+    /// type (the device then shows its fallback); empty when the paid receiver
+    /// is the only one.
+    pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
     /// Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2.
     pub note_plaintext_version: u32,
 }
@@ -1192,7 +1228,22 @@ fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOr
         value: a.value.to_string(),
         rseed: bytes_to_napi(a.rseed.to_vec()),
         rcv: bytes_to_napi(a.rcv.to_vec()),
+        user_address: a.user_address,
+        user_address_receivers: receivers_to_napi(a.user_address_receivers),
     }
+}
+
+fn receivers_to_napi(
+    receivers: Option<Vec<zcash_crypto::parse::ParsedReceiver>>,
+) -> Option<Vec<PcztUserAddressReceiver>> {
+    receivers.map(|list| {
+        list.into_iter()
+            .map(|r| PcztUserAddressReceiver {
+                typecode: u32::from(r.typecode),
+                receiver: bytes_to_napi(r.receiver),
+            })
+            .collect()
+    })
 }
 
 /// Flattens the composed Ironwood action into the signer's flat shape.
@@ -1217,6 +1268,8 @@ fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> Pczt
         value,
         rseed,
         rcv,
+        user_address,
+        user_address_receivers,
     } = orchard_action_to_napi(a.action);
 
     PcztIronwoodAction {
@@ -1238,6 +1291,8 @@ fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> Pczt
         value,
         rseed,
         rcv,
+        user_address,
+        user_address_receivers,
         note_plaintext_version,
     }
 }
@@ -1274,6 +1329,8 @@ fn parsed_pczt_to_napi(parsed: zcash_crypto::parse::ParsedPczt) -> PcztTransacti
             value: o.value.to_string(),
             script_pubkey: bytes_to_napi(o.script_pubkey),
             derivation: o.derivation.map(derivation_to_napi),
+            user_address: o.user_address,
+            user_address_receivers: receivers_to_napi(o.user_address_receivers),
         })
         .collect();
 
@@ -2063,6 +2120,8 @@ mod tests {
             value: 222_222,
             rseed: [0x0eu8; 32],
             rcv: [0x0fu8; 32],
+            user_address: None,
+            user_address_receivers: None,
         }
     }
 
@@ -2085,6 +2144,8 @@ mod tests {
                 value: 400_000,
                 script_pubkey: vec![0xa9, 0x14],
                 derivation: Some(make_derivation()),
+                user_address: None,
+                user_address_receivers: None,
             }],
             orchard_bundle: Some(ParsedOrchardBundle {
                 actions: vec![make_parsed_orchard_action()],
@@ -2095,6 +2156,53 @@ mod tests {
             // The fixture models a V5 transaction, which has no Ironwood pool.
             ironwood_bundle: None,
         }
+    }
+
+    #[test]
+    fn parsed_pczt_to_napi_maps_user_address_and_receivers() {
+        use zcash_crypto::parse::ParsedReceiver;
+
+        let mut parsed = make_parsed_pczt();
+        let receivers = vec![
+            ParsedReceiver {
+                typecode: 0x00,
+                receiver: vec![0x41u8; 20],
+            },
+            ParsedReceiver {
+                typecode: 0x02,
+                receiver: vec![0x42u8; 43],
+            },
+        ];
+        parsed.transparent_outputs[0].user_address = Some("u1transparent".into());
+        parsed.transparent_outputs[0].user_address_receivers = Some(receivers.clone());
+        let action = &mut parsed.orchard_bundle.as_mut().unwrap().actions[0];
+        action.user_address = Some("u1shielded".into());
+        action.user_address_receivers = Some(receivers);
+
+        let napi = parsed_pczt_to_napi(parsed);
+
+        let out = &napi.transparent_outputs[0];
+        assert_eq!(out.user_address.as_deref(), Some("u1transparent"));
+        let list = out.user_address_receivers.as_ref().expect("receivers");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].typecode, 0);
+        assert_eq!(list[0].receiver.to_vec(), vec![0x41u8; 20]);
+        assert_eq!(list[1].typecode, 2);
+        assert_eq!(list[1].receiver.to_vec(), vec![0x42u8; 43]);
+
+        let a = &napi.orchard_bundle.as_ref().unwrap().actions[0];
+        assert_eq!(a.user_address.as_deref(), Some("u1shielded"));
+        assert_eq!(a.user_address_receivers.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn parsed_pczt_to_napi_user_address_absent_maps_to_null() {
+        let napi = parsed_pczt_to_napi(make_parsed_pczt());
+        assert!(napi.transparent_outputs[0].user_address.is_none());
+        assert!(napi.transparent_outputs[0].user_address_receivers.is_none());
+        let a = &napi.orchard_bundle.as_ref().unwrap().actions[0];
+        assert!(a.user_address.is_none());
+        assert!(a.user_address_receivers.is_none());
     }
 
     #[test]

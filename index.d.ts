@@ -592,6 +592,13 @@ export interface PcztTransparentInput {
   sighashType: number
   derivation: PcztBip32Derivation
 }
+/** One receiver of a unified address the user entered. */
+export interface PcztUserAddressReceiver {
+  /** ZIP 316 typecode: P2PKH `0`, P2SH `1`, Sapling `2`, Orchard `3`. */
+  typecode: number
+  /** Raw receiver bytes. */
+  receiver: Uint8Array
+}
 /** A single transparent output. */
 export interface PcztTransparentOutput {
   /** Output value in zatoshis (decimal string to avoid f64 precision loss). */
@@ -599,6 +606,19 @@ export interface PcztTransparentOutput {
   scriptPubKey: Uint8Array
   /** Present (change output) or `null` (external recipient). */
   derivation?: PcztBip32Derivation
+  /**
+   * The unified address the user entered, as recorded in the PCZT (ZIP 374
+   * `user_address`). `null` when none was recorded.
+   */
+  userAddress?: string
+  /**
+   * The receivers of `userAddress` other than the one this output pays, in
+   * ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+   * when no address was recorded, or when it holds a receiver of an unknown
+   * type (the device then shows its fallback); empty when the paid receiver
+   * is the only one.
+   */
+  userAddressReceivers?: Array<PcztUserAddressReceiver>
 }
 /** A single Orchard action (spend + output halves), flattened for the device. */
 export interface PcztOrchardAction {
@@ -636,6 +656,19 @@ export interface PcztOrchardAction {
   rseed: Uint8Array
   /** Value commitment randomness, 32 bytes. */
   rcv: Uint8Array
+  /**
+   * The unified address the user entered, as recorded in the PCZT (ZIP 374
+   * `user_address`). `null` when none was recorded.
+   */
+  userAddress?: string
+  /**
+   * The receivers of `userAddress` other than the one this output pays, in
+   * ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+   * when no address was recorded, or when it holds a receiver of an unknown
+   * type (the device then shows its fallback); empty when the paid receiver
+   * is the only one.
+   */
+  userAddressReceivers?: Array<PcztUserAddressReceiver>
 }
 /** The Orchard action bundle plus its trailer. */
 export interface PcztOrchardBundle {
@@ -689,6 +722,19 @@ export interface PcztIronwoodAction {
   rseed: Uint8Array
   /** Value commitment randomness, 32 bytes. */
   rcv: Uint8Array
+  /**
+   * The unified address the user entered, as recorded in the PCZT (ZIP 374
+   * `user_address`). `null` when none was recorded.
+   */
+  userAddress?: string
+  /**
+   * The receivers of `userAddress` other than the one this output pays, in
+   * ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
+   * when no address was recorded, or when it holds a receiver of an unknown
+   * type (the device then shows its fallback); empty when the paid receiver
+   * is the only one.
+   */
+  userAddressReceivers?: Array<PcztUserAddressReceiver>
   /** Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2. */
   notePlaintextVersion: number
 }
