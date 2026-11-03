@@ -184,9 +184,11 @@ const pczt: PcztTransaction = parsePczt(pcztHex);
 
 // pczt.global               — txVersion, coinType, expiryHeight, ...
 // pczt.transparentInputs[]  — prevoutTxid, value (string), derivation, ...
-// pczt.transparentOutputs[] — value (string), scriptPubKey, derivation?
+// pczt.transparentOutputs[] — value (string), scriptPubKey, derivation?,
+//                             userAddress?, userAddressReceivers?
 // pczt.orchardBundle        — actions[], flags, valueBalance (string), anchor
-//                             (null when there are no Orchard actions)
+//                             (null when there are no Orchard actions); each
+//                             action also has userAddress?, userAddressReceivers?
 // pczt.ironwoodBundle       — same shape, plus each action's
 //                             notePlaintextVersion. Always null below tx
 //                             version 6 — the Ironwood pool is V6-only.

@@ -157,7 +157,7 @@ Full signatures, every field, and its constraints are in [`index.d.ts`](index.d.
 | --- | --- |
 | `buildTransaction(params)` | Builds, proves, and serializes a V5 PCZT from Orchard notes, transparent UTXOs, or both. Halo 2 proving runs on every core, off the JavaScript thread: about five times faster than on a single core (roughly 0.35–0.4 s per action on an Apple M1 Max), plus a one-time proving-key build per circuit (cached process-wide). The Node addon enables this. A consumer of the `zcash-crypto` Rust crate proves on a single core unless it enables the crate's `multicore` feature; inside this workspace, feature unification turns it on for every build and test. |
 | `buildIronwoodTransaction(params)` | Same, for an Ironwood (NU6.3) source — a redacted V6 PCZT. See [Ironwood (NU6.3)](#ironwood-nu63) below. |
-| `parsePczt(pcztHex)` | Decodes canonical PCZT bytes into the `PcztTransaction` the device signer consumes. Fails if a field the device needs to sign is missing. |
+| `parsePczt(pcztHex)` | Decodes canonical PCZT bytes into the `PcztTransaction` the device signer consumes. Fails if a field the device needs to sign is missing. See [Unified address display](#unified-address-display) for `userAddress` and `userAddressReceivers`. |
 | `finalizeTransaction(params)` | Injects device signatures, computes the binding signature, extracts the signed transaction and its txid. CPU-bound (proof verification), dispatched to a blocking thread. |
 | `broadcastTransaction(grpcUrl, txHex)` | Submits a signed transaction to a lightwalletd / Zaino endpoint; returns the txid. |
 
@@ -184,6 +184,17 @@ The same quantity is not spelled the same way everywhere in this API. Read this 
 | `PcztTransparentInput.prevoutTxid` | Internal byte order, as stored in the PCZT. |
 
 **`scriptPubKey`** keeps its canonical Bitcoin/Zcash casing, rather than napi's default camelCasing of the Rust field name (`scriptPubkey`).
+
+## Unified address display
+
+When an output's `address` is a unified address, `buildTransaction` and `buildIronwoodTransaction` record the string as the output's ZIP 374 `user_address`: on the Orchard (or Ironwood) action that pays it, or on the transparent output when the paid receiver is the address's transparent one. Change and padding outputs carry none, and a plain transparent `address` records nothing. The build fails if a recorded address does not contain the receiver it pays. The field is PCZT metadata outside every digest, so the transaction id and the signature hashes are unchanged.
+
+`parsePczt` returns, on every transparent output and every Orchard and Ironwood action:
+
+- `userAddress`: the recorded string, absent (`undefined`) when none was recorded.
+- `userAddressReceivers`: the address's receivers other than the paid one, as `{ typecode, receiver }` in ascending typecode order (P2PKH `0`, P2SH `1`, Sapling `2`, Orchard `3`), meant for `@ledgerhq/device-signer-kit-zcash`. It is absent (`undefined`) when no address was recorded, when the recorded address is a plain transparent address, or when it holds a receiver of an unknown type, and empty when the paid receiver is the only one.
+
+`parsePczt` fails if a recorded unified address does not contain the paid receiver or belongs to another network than the PCZT's coin type. A recorded plain transparent address is accepted only when it is the paid address, since ZIP 374 allows any address encoding there; this library's builders only ever record unified addresses.
 
 ## Ironwood (NU6.3)
 
