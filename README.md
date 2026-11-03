@@ -14,7 +14,7 @@ npm install @ledgerhq/zcash-utils
 
 Published on the public npm registry under the `@ledgerhq` scope; no registry configuration is needed.
 
-Prebuilt `.node` binaries are bundled for six targets — `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc` — so there is no compilation step and no Rust toolchain to install. On any other platform, build from source: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Prebuilt `.node` binaries are published for six targets — `darwin-arm64`, `darwin-x64`, `linux-x64-gnu`, `linux-arm64-gnu`, `win32-x64-msvc`, `win32-arm64-msvc` — each in its own `@ledgerhq/zcash-utils-<target>` package, an optional dependency that the package manager installs only on the matching platform. There is no compilation step and no Rust toolchain to install. On any other platform, build from source: see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 Node.js 24 or later. The addon is a native module, so it runs in Node and in the Electron main process, not in a browser or a renderer without `nodeIntegration`.
 

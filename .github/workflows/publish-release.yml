@@ -78,9 +78,11 @@ jobs:
 
       # Commits go through the GitHub API, so they are signed by GitHub and
       # satisfy the signed-commit rule on main once the pull request merges.
+      # The script also carries the new version into the npm/* platform packages.
       - name: Version packages
         uses: changesets/action/version@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
+          script: pnpm version-packages
           commit-message: "release: version packages"
           pr-title: "release: version packages"
 
@@ -238,7 +240,19 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: napi-*
-          merge-multiple: true
+          path: artifacts
+
+      # Each binary ships in its own npm/<triple> package, which the main
+      # package lists as an optional dependency pinned to the same version.
+      - name: Move .node binaries into their platform packages
+        run: |
+          set -euo pipefail
+          pnpm napi artifacts
+          node scripts/sync-platform-packages.mjs --optional-dependencies
+          for dir in npm/*/; do
+            main=$(node -p "require('./${dir}package.json').main")
+            test -f "${dir}${main}" || { echo "::error::missing ${dir}${main}"; exit 1; }
+          done
 
       - name: Regenerate index.js and index.d.ts from Rust source
         run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node
@@ -273,14 +287,27 @@ jobs:
       # yet, which is why it runs after the npmrc above points at JFrog; it
       # writes `packages/*.tgz` plus `publish-plan.json` (the tarball integrity)
       # into the output directory, and an already-published version yields an
-      # empty plan, keeping a re-run idempotent.
-      - name: 📦 Pack the package
+      # empty plan, keeping a re-run idempotent. Changesets only knows the main
+      # package, so each platform package the registry does not have yet is
+      # packed next to it with pnpm, to be attested and published alongside.
+      - name: 📦 Pack the packages
         id: pack
         env:
           OUT_DIR: ${{ runner.temp }}/changesets-pack
         run: |
           set -euo pipefail
           pnpm exec changeset pack --out-dir "$OUT_DIR"
+
+          : > "$OUT_DIR/platform-tarballs.txt"
+          for dir in npm/*/; do
+            name=$(node -p "require('./${dir}package.json').name")
+            version=$(node -p "require('./${dir}package.json').version")
+            if [ "$(pnpm view "$name@$version" version 2>/dev/null)" = "$version" ]; then
+              echo "$name@$version is already published"
+            else
+              pnpm pack --dir "$dir" --pack-destination "$OUT_DIR/packages" | tail -n 1 >> "$OUT_DIR/platform-tarballs.txt"
+            fi
+          done
 
           shopt -s nullglob
           tarballs=("$OUT_DIR"/packages/*.tgz)
@@ -295,12 +322,23 @@ jobs:
       # Provenance must be generated on a GitHub-hosted runner, which this
       # runner is. Skipped on an empty plan: the action fails when it finds
       # nothing to attest.
-      - name: 🔏 Attest the tarball
+      - name: 🔏 Attest the tarballs
         if: steps.pack.outputs.count != '0'
         # actions/attest-for-npmsjs-com-0.1.2
         uses: LedgerHQ/actions-security/actions/attest-for-npmsjs-com@c92cff0840fbb28663c0061698e5e8ac5228dcce
         with:
           subject-path: ${{ steps.pack.outputs.out-dir }}/packages
+
+      # Platform packages go first, so the main package never resolves to an
+      # optional dependency the registry does not have yet.
+      - name: 🚀 Publish the platform packages to JFrog
+        env:
+          OUT_DIR: ${{ steps.pack.outputs.out-dir }}
+        run: |
+          set -euo pipefail
+          while read -r tarball; do
+            pnpm publish "$tarball" --no-git-checks
+          done < "$OUT_DIR/platform-tarballs.txt"
 
       # Publishes the attested tarball byte for byte, then pushes the `v<version>`
       # tag and creates the GitHub Release through the API.

@@ -7,7 +7,6 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node",
     "CHANGELOG.md"
   ],
   "repository": {
@@ -16,6 +15,20 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "napi": {
+    "name": "index",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
   },
   "scripts": {
     "// ── NAPI (Node.js / Electron) ──────────────────────────────────────": "",
@@ -32,6 +45,8 @@
     "// ── Coverage ───────────────────────────────────────────────────────": "",
     "coverage": "./scripts/coverage.sh",
     "coverage:open": "OPEN_REPORT=1 ./scripts/coverage.sh",
+    "// ── Release ─────────────────────────────────────────────────────────": "",
+    "version-packages": "changeset version && node scripts/sync-platform-packages.mjs",
     "// ── Formatting ─────────────────────────────────────────────────────": "",
     "format": "prettier --write \"**/*.md\"",
     "format:check": "prettier --check \"**/*.md\"",

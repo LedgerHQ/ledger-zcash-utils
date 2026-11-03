@@ -1,0 +1,23 @@
+{
+  "name": "@ledgerhq/zcash-utils-darwin-arm64",
+  "version": "2.8.0",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "index.darwin-arm64.node",
+  "files": [
+    "index.darwin-arm64.node"
+  ],
+  "description": "Native Zcash key derivation and shielded sync — Node.js (NAPI)",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LedgerHQ/ledger-zcash-utils.git"
+  }
+}

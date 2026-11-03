@@ -1,0 +1,23 @@
+{
+  "name": "@ledgerhq/zcash-utils-win32-arm64-msvc",
+  "version": "2.8.0",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "index.win32-arm64-msvc.node",
+  "files": [
+    "index.win32-arm64-msvc.node"
+  ],
+  "description": "Native Zcash key derivation and shielded sync — Node.js (NAPI)",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LedgerHQ/ledger-zcash-utils.git"
+  }
+}

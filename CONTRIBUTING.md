@@ -115,12 +115,12 @@ Versioning is managed with [Changesets](https://changesets.dev) v3, which needs 
 ### Publishing a new version
 
 1. Each pull request carrying a user-visible change commits its changeset (`pnpm changeset`, see [Contributing workflow](#contributing-workflow)).
-2. When it merges, the **Publish Release** workflow (`.github/workflows/publish-release.yml`) opens or updates a pull request titled **"release: version packages"**. It consumes the pending changesets: it bumps `package.json` and writes `CHANGELOG.md`. Further merges keep updating it.
+2. When it merges, the **Publish Release** workflow (`.github/workflows/publish-release.yml`) opens or updates a pull request titled **"release: version packages"**. It consumes the pending changesets: it bumps `package.json`, carries the version into the platform packages under `npm/` and writes `CHANGELOG.md`. Further merges keep updating it.
 3. Merging that pull request is the release. The workflow then:
    1. builds the `.node` binaries and the CLI binaries in parallel on their platforms;
-   2. packs the package once (`changeset pack`);
-   3. attests that exact tarball (SLSA provenance) with `LedgerHQ/actions-security`'s `attest-for-npmsjs-com`. The attestation is bound to the tarball bytes, which is why packing and publishing are separate steps;
-   4. publishes that same tarball (`changeset publish --from-pack-dir`), pushes the `v{version}` tag, creates the GitHub Release and attaches the CLI binaries to it.
+   2. moves each `.node` binary into its platform package (`npm/<triple>`, published as `@ledgerhq/zcash-utils-<triple>`), pins those packages as `optionalDependencies` of the main package, and packs all of them once (`changeset pack` for the main package, `pnpm pack` for the platform ones);
+   3. attests those exact tarballs (SLSA provenance) with `LedgerHQ/actions-security`'s `attest-for-npmsjs-com`. The attestation is bound to the tarball bytes, which is why packing and publishing are separate steps;
+   4. publishes the platform tarballs, then the main one (`changeset publish --from-pack-dir`), pushes the `v{version}` tag, creates the GitHub Release and attaches the CLI binaries to it.
 
 On each push to `main`, the workflow first selects a mode: `version` when changesets are pending, `publish` when `package.json` holds a version the registry does not have, and nothing otherwise. Pending changesets take precedence, so a version is published only by the run of the commit that merged its version pull request. The workflow can also be started from the Actions tab, on `main` only; on any other branch every job is skipped. A version already on the registry is never packed or published again.
 
@@ -145,13 +145,14 @@ A re-run cannot finish a release whose publish already reached the registry, bec
 
 ### Artifacts produced per release
 
-| Artifact                           | Distribution        | Platforms                   |
-| ---------------------------------- | ------------------- | --------------------------- |
-| `@ledgerhq/zcash-utils`            | Public npm registry | All (bundled `.node` files) |
-| `ledger-zcash-cli-macos-universal` | GitHub Release      | macOS arm64 + x64           |
-| `ledger-zcash-cli-linux-x86_64`    | GitHub Release      | Linux x64 (static musl)     |
+| Artifact                           | Distribution        | Platforms                 |
+| ---------------------------------- | ------------------- | ------------------------- |
+| `@ledgerhq/zcash-utils`            | Public npm registry | All (JS loader and types) |
+| `@ledgerhq/zcash-utils-<triple>`   | Public npm registry | One `.node` each          |
+| `ledger-zcash-cli-macos-universal` | GitHub Release      | macOS arm64 + x64         |
+| `ledger-zcash-cli-linux-x86_64`    | GitHub Release      | Linux x64 (static musl)   |
 
-The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and included in the npm package via the `files` field. The `index.js` NAPI-RS loader looks for a local `.node` file first, then falls back to a separate `@ledgerhq/zcash-utils-{platform}` package if needed.
+The `.node` binaries are built in a CI matrix for each OS/architecture target, collected in the publish job, and moved into their `npm/<triple>` platform package. The main package lists those as `optionalDependencies`, so a package manager installs only the one matching the host. The `index.js` NAPI-RS loader looks for a local `.node` file first (a development build), then falls back to the `@ledgerhq/zcash-utils-<triple>` package. A consumer that packages for another platform or architecture than the one it installs on (an Electron universal macOS build, for instance) must install the matching platform packages too, e.g. with pnpm's `supportedArchitectures`.
 
 The package is published to Ledger's JFrog registry, which relays it to the **public npm registry** together with its attestation, so consumers need no registry configuration. The publish job authenticates through Ledger's release infrastructure via OIDC rather than a long-lived token, which is why no npm credential appears among the secrets below.
 
