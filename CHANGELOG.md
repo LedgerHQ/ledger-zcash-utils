@@ -1,5 +1,11 @@
 # @ledgerhq/zcash-utils
 
+## 2.9.0
+
+### Minor Changes
+
+- 0db4f69: Ship each native binary in its own optional package (`@ledgerhq/zcash-utils-<triple>`), so an install only downloads the binary for its platform instead of all six.
+
 ## 2.8.0
 
 ### Minor Changes
