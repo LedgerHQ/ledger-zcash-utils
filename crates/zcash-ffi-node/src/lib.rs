@@ -1017,13 +1017,13 @@ pub struct PcztTransparentOutput {
     /// Present (change output) or `null` (external recipient).
     pub derivation: Option<PcztBip32Derivation>,
     /// The unified address the user entered, as recorded in the PCZT (ZIP 374
-    /// `user_address`). `null` when none was recorded.
+    /// `user_address`). Absent (`undefined`) when none was recorded.
     pub user_address: Option<String>,
     /// The receivers of `userAddress` other than the one this output pays, in
-    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
-    /// when no address was recorded, or when it holds a receiver of an unknown
-    /// type (the device then shows its fallback); empty when the paid receiver
-    /// is the only one.
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. Absent
+    /// (`undefined`) when no address was recorded, when it is a plain transparent
+    /// address, or when it holds a receiver of an unknown type (the device then
+    /// shows its fallback); empty when the paid receiver is the only one.
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
 }
 
@@ -1065,13 +1065,13 @@ pub struct PcztOrchardAction {
     /// Value commitment randomness, 32 bytes.
     pub rcv: Uint8Array,
     /// The unified address the user entered, as recorded in the PCZT (ZIP 374
-    /// `user_address`). `null` when none was recorded.
+    /// `user_address`). Absent (`undefined`) when none was recorded.
     pub user_address: Option<String>,
     /// The receivers of `userAddress` other than the one this output pays, in
-    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
-    /// when no address was recorded, or when it holds a receiver of an unknown
-    /// type (the device then shows its fallback); empty when the paid receiver
-    /// is the only one.
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. Absent
+    /// (`undefined`) when no address was recorded, when it is a plain transparent
+    /// address, or when it holds a receiver of an unknown type (the device then
+    /// shows its fallback); empty when the paid receiver is the only one.
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
 }
 
@@ -1129,13 +1129,13 @@ pub struct PcztIronwoodAction {
     /// Value commitment randomness, 32 bytes.
     pub rcv: Uint8Array,
     /// The unified address the user entered, as recorded in the PCZT (ZIP 374
-    /// `user_address`). `null` when none was recorded.
+    /// `user_address`). Absent (`undefined`) when none was recorded.
     pub user_address: Option<String>,
     /// The receivers of `userAddress` other than the one this output pays, in
-    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. `null`
-    /// when no address was recorded, or when it holds a receiver of an unknown
-    /// type (the device then shows its fallback); empty when the paid receiver
-    /// is the only one.
+    /// ascending typecode order, for `@ledgerhq/device-signer-kit-zcash`. Absent
+    /// (`undefined`) when no address was recorded, when it is a plain transparent
+    /// address, or when it holds a receiver of an unknown type (the device then
+    /// shows its fallback); empty when the paid receiver is the only one.
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
     /// Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2.
     pub note_plaintext_version: u32,

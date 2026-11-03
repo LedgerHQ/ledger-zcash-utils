@@ -191,10 +191,10 @@ When an output's `address` is a unified address, `buildTransaction` and `buildIr
 
 `parsePczt` returns, on every transparent output and every Orchard and Ironwood action:
 
-- `userAddress`: the recorded string, or `null`.
-- `userAddressReceivers`: the address's receivers other than the paid one, as `{ typecode, receiver }` in ascending typecode order (P2PKH `0`, P2SH `1`, Sapling `2`, Orchard `3`), meant for `@ledgerhq/device-signer-kit-zcash`. It is `null` when no address was recorded or the address holds a receiver of an unknown type, and empty when the paid receiver is the only one.
+- `userAddress`: the recorded string, absent (`undefined`) when none was recorded.
+- `userAddressReceivers`: the address's receivers other than the paid one, as `{ typecode, receiver }` in ascending typecode order (P2PKH `0`, P2SH `1`, Sapling `2`, Orchard `3`), meant for `@ledgerhq/device-signer-kit-zcash`. It is absent (`undefined`) when no address was recorded, when the recorded address is a plain transparent address, or when it holds a receiver of an unknown type, and empty when the paid receiver is the only one.
 
-`parsePczt` fails if a recorded address does not contain the paid receiver.
+`parsePczt` fails if a recorded unified address does not contain the paid receiver or belongs to another network than the PCZT's coin type. A recorded plain transparent address is accepted only when it is the paid address, since ZIP 374 allows any address encoding there; this library's builders only ever record unified addresses.
 
 ## Ironwood (NU6.3)
 

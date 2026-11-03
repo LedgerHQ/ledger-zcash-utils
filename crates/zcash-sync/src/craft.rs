@@ -202,19 +202,7 @@ where
     // Decode destination addresses once, up front. The resulting destinations
     // both drive the flow-type detection below and are reused when assembling
     // the builder's `OutputRequest`s in step 6.
-    let outputs: Vec<OutputRequest> = req
-        .outputs
-        .iter()
-        .map(|o| {
-            let (destination, user_address) = decode_destination(&network, &o.address)?;
-            Ok(OutputRequest {
-                destination,
-                value: o.value_zat,
-                memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
-                user_address,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let outputs = output_requests(&network, &req.outputs)?;
 
     // Determine flow type from the already-decoded destinations.
     let has_orchard_outputs = outputs
@@ -452,6 +440,26 @@ where
     .map_err(|e| anyhow!("build_transaction: {e}"))
 }
 
+/// Turns the requested outputs into the builder's requests, decoding each
+/// address and keeping a unified one as the output's `user_address`.
+fn output_requests(
+    network: &AnyZcashNetwork,
+    outputs: &[OutputRequestDto],
+) -> Result<Vec<OutputRequest>> {
+    outputs
+        .iter()
+        .map(|o| {
+            let (destination, user_address) = decode_destination(network, &o.address)?;
+            Ok(OutputRequest {
+                destination,
+                value: o.value_zat,
+                memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
+                user_address,
+            })
+        })
+        .collect()
+}
+
 /// Decode a destination address string into a builder [`Destination`].
 ///
 /// Also returns the address string when it is a unified address, so the builder
@@ -627,19 +635,7 @@ where
     // Decode destination addresses once, up front — both drives the
     // Ironwood-bundle-presence check below and is reused when assembling the
     // builder's `IronwoodOutputRequest`s in step 5.
-    let outputs: Vec<IronwoodOutputRequest> = req
-        .outputs
-        .iter()
-        .map(|o| {
-            let (destination, user_address) = decode_ironwood_destination(&network, &o.address)?;
-            Ok(IronwoodOutputRequest {
-                destination,
-                value: o.value_zat,
-                memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
-                user_address,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let outputs = ironwood_output_requests(&network, &req.outputs)?;
 
     let has_ironwood_outputs = outputs
         .iter()
@@ -829,6 +825,26 @@ where
         outputs,
     })
     .map_err(|e| anyhow!("build_ironwood_transaction: {e}"))
+}
+
+/// Turns the requested outputs into the Ironwood builder's requests, decoding
+/// each address and keeping a unified one as the output's `user_address`.
+fn ironwood_output_requests(
+    network: &AnyZcashNetwork,
+    outputs: &[IronwoodOutputRequestDto],
+) -> Result<Vec<IronwoodOutputRequest>> {
+    outputs
+        .iter()
+        .map(|o| {
+            let (destination, user_address) = decode_ironwood_destination(network, &o.address)?;
+            Ok(IronwoodOutputRequest {
+                destination,
+                value: o.value_zat,
+                memo: o.memo.as_ref().map(|s| s.as_bytes().to_vec()),
+                user_address,
+            })
+        })
+        .collect()
 }
 
 /// Decode a destination address string into an [`IronwoodDestination`].
@@ -2304,6 +2320,99 @@ mod tests {
 
         assert!(matches!(destination, IronwoodDestination::Ironwood(_)));
         assert_eq!(user_address.as_deref(), Some(ua.as_str()));
+    }
+
+    /// A mainnet unified address with a P2PKH and a Sapling receiver and no Orchard
+    /// one: the first ZIP 316 test vector.
+    const TRANSPARENT_AND_SAPLING_UA: &str = "u1l8xunezsvhq8fgzfl7404m450nwnd76zshscn6nfys7vyz2ywyh4cc5daaq0c7q2su5lqfh23sp7fkf3kt27ve5948mzpfdvckzaect2jtte308mkwlycj2u0eac077wu70vqcetkxf";
+    const TRANSPARENT_AND_SAPLING_UA_P2PKH: [u8; 20] = [
+        0x7b, 0xb8, 0x35, 0x70, 0xb8, 0xfa, 0xe1, 0x46, 0xe0, 0x3c, 0x53, 0x31, 0xa0, 0x20, 0xb1,
+        0xe0, 0x89, 0x2f, 0x63, 0x1d,
+    ];
+
+    #[test]
+    fn decode_destination_pays_the_transparent_receiver_of_a_unified_address_without_orchard() {
+        let (destination, user_address) =
+            decode_destination(&mainnet(), TRANSPARENT_AND_SAPLING_UA).unwrap();
+
+        assert!(matches!(
+            destination,
+            Destination::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash(h))
+                if h == TRANSPARENT_AND_SAPLING_UA_P2PKH
+        ));
+        assert_eq!(user_address.as_deref(), Some(TRANSPARENT_AND_SAPLING_UA));
+    }
+
+    #[test]
+    fn decode_ironwood_destination_pays_the_transparent_receiver_of_a_unified_address_without_orchard(
+    ) {
+        let (destination, user_address) =
+            decode_ironwood_destination(&mainnet(), TRANSPARENT_AND_SAPLING_UA).unwrap();
+
+        assert!(matches!(
+            destination,
+            IronwoodDestination::Transparent(zcash_transparent::address::TransparentAddress::PublicKeyHash(h))
+                if h == TRANSPARENT_AND_SAPLING_UA_P2PKH
+        ));
+        assert_eq!(user_address.as_deref(), Some(TRANSPARENT_AND_SAPLING_UA));
+    }
+
+    #[test]
+    fn output_requests_carry_each_user_address_and_the_rest_of_the_output() {
+        let ua = test_unified_address();
+        let t_addr = "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs";
+        let requested = [
+            (ua.as_str(), 1_000u64, Some("hi")),
+            (TRANSPARENT_AND_SAPLING_UA, 2_000, None),
+            (t_addr, 3_000, None),
+        ];
+
+        let outputs = output_requests(
+            &mainnet(),
+            &requested
+                .iter()
+                .map(|(address, value_zat, memo)| OutputRequestDto {
+                    address: address.to_string(),
+                    value_zat: *value_zat,
+                    memo: memo.map(str::to_owned),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let ironwood = ironwood_output_requests(
+            &mainnet(),
+            &requested
+                .iter()
+                .map(|(address, value_zat, memo)| IronwoodOutputRequestDto {
+                    address: address.to_string(),
+                    value_zat: *value_zat,
+                    memo: memo.map(str::to_owned),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let expected = [Some(ua.as_str()), Some(TRANSPARENT_AND_SAPLING_UA), None];
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|o| o.user_address.as_deref())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            ironwood
+                .iter()
+                .map(|o| o.user_address.as_deref())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+            vec![1_000, 2_000, 3_000]
+        );
+        assert_eq!(outputs[0].memo.as_deref(), Some(&b"hi"[..]));
+        assert_eq!(ironwood[0].memo.as_deref(), Some(&b"hi"[..]));
     }
 
     #[test]

@@ -588,14 +588,24 @@ fn paid_transparent_receiver(script: &[u8]) -> Option<PaidReceiver> {
 /// so a mismatch is an error. The list is `None` when the address holds a
 /// receiver of an unknown type, since the device cannot show what it cannot
 /// describe, and `Some(vec![])` when the paid receiver is the only one. A plain
-/// transparent address equal to the paid one is accepted, with no list.
+/// transparent address equal to the paid one is accepted, with no list: ZIP 374
+/// allows any address encoding here, even though this library's builder only ever
+/// records unified addresses.
 fn user_address_receivers(
     user_address: &str,
     paid: &PaidReceiver,
     coin_type: u32,
 ) -> Result<Option<Vec<ParsedReceiver>>, String> {
-    let Ok((network, _, unified)) = UnifiedAddress::decode(user_address) else {
-        return check_plain_transparent_address(user_address, paid, coin_type).map(|()| None);
+    let (network, _, unified) = match UnifiedAddress::decode(user_address) {
+        Ok(decoded) => decoded,
+        // A string with a unified address prefix is a malformed unified address:
+        // report why it failed rather than comparing it to the transparent one.
+        Err(e) if has_unified_address_prefix(user_address) => {
+            return Err(format!("user_address is not a valid unified address: {e}"));
+        }
+        Err(_) => {
+            return check_plain_transparent_address(user_address, paid, coin_type).map(|()| None)
+        }
     };
 
     let expected_coin_type = match network {
@@ -644,6 +654,32 @@ fn user_address_receivers(
     }
     others.sort_by_key(|r| r.typecode);
     Ok(Some(others))
+}
+
+/// Whether `address` starts with the human-readable part of a unified address
+/// (any revision, any network) followed by the Bech32m `1` separator. No
+/// transparent address starts that way: their Base58Check prefixes are `t1`,
+/// `t3`, `tm` and `t2`.
+fn has_unified_address_prefix(address: &str) -> bool {
+    use zcash_address::constants::{mainnet, regtest, testnet};
+
+    [
+        mainnet::HRP_UNIFIED_ADDRESS,
+        mainnet::HRP_UNIFIED_ADDRESS_R2,
+        mainnet::HRP_UNIFIED_ADDRESS_R2_TI,
+        testnet::HRP_UNIFIED_ADDRESS,
+        testnet::HRP_UNIFIED_ADDRESS_R2,
+        testnet::HRP_UNIFIED_ADDRESS_R2_TI,
+        regtest::HRP_UNIFIED_ADDRESS,
+        regtest::HRP_UNIFIED_ADDRESS_R2,
+        regtest::HRP_UNIFIED_ADDRESS_R2_TI,
+    ]
+    .iter()
+    .any(|hrp| {
+        address
+            .strip_prefix(hrp)
+            .is_some_and(|rest| rest.starts_with('1'))
+    })
 }
 
 /// A `user_address` that is not a unified address must be the plain transparent
@@ -949,6 +985,75 @@ mod tests {
         let err =
             user_address_receivers(&t_addr, &PaidReceiver::P2pkh([0x12; 20]), 133).unwrap_err();
         assert!(err.contains("neither a unified address"), "got: {err}");
+    }
+
+    #[test]
+    fn user_address_receivers_reports_why_a_malformed_unified_address_fails() {
+        let mut address = ua(
+            vec![UnifiedReceiver::Orchard([0x03; 43])],
+            NetworkType::Main,
+        );
+        // Break the Bech32m checksum.
+        let last = address.pop().expect("non-empty");
+        address.push(if last == 'q' { 'p' } else { 'q' });
+
+        let err =
+            user_address_receivers(&address, &PaidReceiver::Orchard([0x03; 43]), 133).unwrap_err();
+        assert!(err.contains("not a valid unified address"), "got: {err}");
+    }
+
+    #[test]
+    fn unified_address_prefixes_are_told_apart_from_transparent_ones() {
+        assert!(has_unified_address_prefix("u1qqqq"));
+        assert!(has_unified_address_prefix("utest1qqqq"));
+        assert!(has_unified_address_prefix("uregtest1qqqq"));
+        assert!(!has_unified_address_prefix(
+            "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs"
+        ));
+        assert!(!has_unified_address_prefix("tmqqqq"));
+        // "u" followed by anything other than the separator is not a prefix match.
+        assert!(!has_unified_address_prefix("uview1qqqq"));
+    }
+
+    #[test]
+    fn user_address_receivers_accepts_the_paid_plain_transparent_address_on_testnet() {
+        let t_addr = zcash_keys::address::Address::Transparent(TransparentAddress::PublicKeyHash(
+            [0x11; 20],
+        ))
+        .encode(&Network::TestNetwork);
+
+        let accepted = user_address_receivers(&t_addr, &PaidReceiver::P2pkh([0x11; 20]), 1)
+            .expect("the paid testnet address is accepted");
+        assert_eq!(accepted, None);
+
+        // The same address read against mainnet does not decode as the paid one.
+        let err =
+            user_address_receivers(&t_addr, &PaidReceiver::P2pkh([0x11; 20]), 133).unwrap_err();
+        assert!(err.contains("neither a unified address"), "got: {err}");
+    }
+
+    #[test]
+    fn transparent_output_with_a_user_address_on_a_non_standard_script_is_refused() {
+        let address = ua(
+            vec![
+                UnifiedReceiver::P2pkh([0x11; 20]),
+                UnifiedReceiver::Orchard([0x03; 43]),
+            ],
+            NetworkType::Main,
+        );
+        // OP_RETURN: no receiver a unified address could hold.
+        let output = zcash_transparent::pczt::Output::parse(
+            1_000,
+            vec![0x6a, 0x01, 0x00],
+            None,
+            BTreeMap::new(),
+            Some(address),
+            BTreeMap::new(),
+        )
+        .expect("a well-formed output");
+
+        let err = convert_transparent_output(&output, 133).unwrap_err();
+        assert!(err.contains("non-standard script"), "got: {err}");
     }
 
     #[test]
