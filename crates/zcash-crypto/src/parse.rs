@@ -93,6 +93,17 @@ pub struct ParsedTransparentOutput {
     pub derivation: Option<ParsedBip32Derivation>,
 }
 
+/// A ZIP-32 derivation entry declared on an action output: the account of the
+/// signing seed that the output pays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedZip32Derivation {
+    /// Derivation path formatted for the device, without the `m/` prefix and
+    /// with hardened indices suffixed by `'` (e.g. `32'/133'/1'`).
+    pub signing_path: String,
+    /// ZIP-32 seed fingerprint (32 bytes).
+    pub seed_fingerprint: [u8; 32],
+}
+
 /// A single Orchard action (spend + output halves), flattened for the device.
 #[derive(Debug, Clone)]
 pub struct ParsedOrchardAction {
@@ -114,6 +125,9 @@ pub struct ParsedOrchardAction {
     pub value: u64,
     pub rseed: [u8; 32],
     pub rcv: [u8; 32],
+    /// ZIP-32 derivation declared on the output half, when the transaction
+    /// builder was told the output pays another account of the same seed.
+    pub output_derivation: Option<ParsedZip32Derivation>,
 }
 
 /// The Orchard action bundle plus its trailing bundle-level fields.
@@ -470,6 +484,14 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
         .map(|r| *r.as_bytes())
         .ok_or("orchard output missing rseed")?;
 
+    let output_derivation = output
+        .zip32_derivation()
+        .as_ref()
+        .map(|d| ParsedZip32Derivation {
+            signing_path: format_derivation_path(d.derivation_path().iter().map(|c| c.index())),
+            seed_fingerprint: *d.seed_fingerprint(),
+        });
+
     let rcv = action
         .rcv()
         .as_ref()
@@ -495,6 +517,7 @@ fn convert_orchard_action(action: &orchard::pczt::Action) -> Result<ParsedOrchar
         value,
         rseed,
         rcv,
+        output_derivation,
     })
 }
 

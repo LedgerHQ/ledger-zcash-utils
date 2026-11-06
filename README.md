@@ -161,6 +161,12 @@ Full signatures, every field, and its constraints are in [`index.d.ts`](index.d.
 | `finalizeTransaction(params)` | Injects device signatures, computes the binding signature, extracts the signed transaction and its txid. CPU-bound (proof verification), dispatched to a blocking thread. |
 | `broadcastTransaction(grpcUrl, txHex)` | Submits a signed transaction to a lightwalletd / Zaino endpoint; returns the txid. |
 
+#### Paying another account of the same seed
+
+An output request of `buildTransaction` or `buildIronwoodTransaction` takes an optional `account`: the ZIP 32 account of the **same seed** that the output pays. The PCZT then carries that output's derivation (the seed fingerprint and `32'/<coin type>'/<account>'`), so the signer can recognize the recipient as another account of the user's own wallet. `parsePczt` returns it on the matching Orchard or Ironwood action as `outputZip32Derivation: { path, seedFingerprint }`, absent when no account was declared.
+
+The declaration is metadata only: the transaction id and the sighashes are unchanged. It is refused on a transparent destination, for the account being spent, for a hardened index, and above account 100.
+
 ### Receiving
 
 | Export | Purpose |

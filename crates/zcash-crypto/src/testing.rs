@@ -486,6 +486,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Orchard(recipient),
                 value: spend_value - 10_000,
                 memo: None,
@@ -553,6 +554,7 @@ mod tests {
             }],
             transparent_inputs: vec![],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
@@ -600,6 +602,7 @@ mod tests {
                 derivation_address_index: 0,
             }],
             outputs: vec![OutputRequest {
+                account: None,
                 destination: Destination::Transparent(TransparentAddress::PublicKeyHash(
                     hash160::Hash::hash(&[0x22u8; 33]).to_byte_array(),
                 )),
@@ -708,6 +711,7 @@ mod tests {
                 derivation_address_index: address_index,
             }],
             outputs: vec![OutputRequest {
+                account: None,
                 destination,
                 value: out_value,
                 memo: None,
@@ -821,6 +825,7 @@ mod tests {
                 derivation_address_index: address_index,
             }],
             outputs: vec![IronwoodOutputRequest {
+                account: None,
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
