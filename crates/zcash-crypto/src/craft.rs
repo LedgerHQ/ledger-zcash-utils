@@ -106,18 +106,21 @@ use pczt::{
 };
 use rand::rngs::SysRng;
 use rand_core::UnwrapErr;
+use zcash_address::unified::{
+    Address as UnifiedAddress, Encoding as _, Receiver as UnifiedReceiver,
+};
 use zcash_primitives::transaction::{
     builder::{BuildConfig, Builder, BundlePadding},
     fees::zip317::{self, FeeError as Zip317FeeError, FeeRule},
     TxVersion,
 };
+#[cfg(test)]
+use zcash_protocol::consensus::Network;
 use zcash_protocol::{
     consensus::{BlockHeight, BranchId, NetworkConstants, NetworkType, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::Zatoshis,
 };
-#[cfg(test)]
-use zcash_protocol::consensus::Network;
 use zcash_transparent::{
     address::TransparentAddress, pczt::Bip32Derivation as TransparentBip32Derivation,
 };
@@ -335,6 +338,13 @@ pub struct OutputRequest {
     pub value: u64,
     /// Memo bytes for Orchard outputs. Ignored for transparent outputs.
     pub memo: Option<Vec<u8>>,
+    /// The unified address string the user entered, when the destination was
+    /// decoded from one. Recorded as the output's ZIP 374 `user_address` so a
+    /// signer can show the whole address rather than only the paid receiver.
+    /// Must decode as a unified address of the build's network that contains the
+    /// paid receiver, or the build fails. PCZT metadata only: it changes neither
+    /// the transaction id nor any sighash.
+    pub user_address: Option<String>,
 }
 
 /// Inputs to [`build_transaction`].
@@ -564,6 +574,13 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     }
     let n_transparent_inputs = transparent_inputs.len() as u32;
 
+    let user_addresses = collect_user_addresses(
+        &network,
+        outputs
+            .iter()
+            .map(|o| (o.user_address.as_deref(), paid_receiver(&o.destination))),
+    )?;
+
     let mut total_out: u64 = 0;
     let mut n_orchard_outputs: u32 = 0;
     let mut n_transparent_outputs: u32 = 0;
@@ -642,6 +659,7 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
                 destination: Destination::Transparent(addr),
                 value: change,
                 memo: None,
+                user_address: None,
             };
             let change_output_index = n_transparent_outputs as usize;
             add_output(&mut builder, None, &change_req)?;
@@ -745,6 +763,8 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
     } else {
         pczt
     };
+
+    let pczt = stamp_user_addresses(pczt, OrchardPool::Orchard, &user_addresses)?;
 
     // Serialize as PCZT v1 for every flow, matching the device signing contract:
     // app-zcash rejects any header version other than v1. v1 encoding succeeds for
@@ -936,6 +956,198 @@ fn stamp_transparent_derivations(
             Ok(())
         })
         .map_err(|e| Error::Craft(format!("PCZT Updater (transparent bip32): {e:?}")))
+        .map(Updater::finish)
+}
+
+/// The receiver an output actually pays, which a recorded `user_address` must
+/// contain.
+#[derive(Clone, Copy, Debug)]
+enum PaidReceiver {
+    Orchard([u8; 43]),
+    Transparent(TransparentAddress),
+}
+
+fn paid_receiver(destination: &Destination) -> PaidReceiver {
+    match destination {
+        Destination::Orchard(addr) => PaidReceiver::Orchard(addr.to_raw_address_bytes()),
+        Destination::Transparent(addr) => PaidReceiver::Transparent(*addr),
+    }
+}
+
+fn paid_receiver_ironwood(destination: &IronwoodDestination) -> PaidReceiver {
+    match destination {
+        IronwoodDestination::Ironwood(addr) => PaidReceiver::Orchard(addr.to_raw_address_bytes()),
+        IronwoodDestination::Transparent(addr) => PaidReceiver::Transparent(*addr),
+    }
+}
+
+impl PaidReceiver {
+    fn as_unified_receiver(&self) -> UnifiedReceiver {
+        match self {
+            PaidReceiver::Orchard(bytes) => UnifiedReceiver::Orchard(*bytes),
+            PaidReceiver::Transparent(TransparentAddress::PublicKeyHash(h)) => {
+                UnifiedReceiver::P2pkh(*h)
+            }
+            PaidReceiver::Transparent(TransparentAddress::ScriptHash(h)) => {
+                UnifiedReceiver::P2sh(*h)
+            }
+        }
+    }
+}
+
+/// The `user_address` strings to record, keyed the way each pool is stamped.
+///
+/// Orchard and Ironwood actions are shuffled by the builder, so they are matched
+/// by recipient. Transparent outputs keep their insertion order, so they are
+/// matched by position among the transparent outputs.
+#[derive(Debug, Default)]
+struct UserAddresses {
+    orchard: Vec<([u8; 43], String)>,
+    transparent: Vec<(usize, String)>,
+}
+
+impl UserAddresses {
+    fn is_empty(&self) -> bool {
+        self.orchard.is_empty() && self.transparent.is_empty()
+    }
+}
+
+/// Validates the `user_address` of every output and returns the ones to record.
+///
+/// Each recorded address must decode as a unified address of `network` that
+/// contains the paid receiver (the check ZIP 374 asks of a Signer, run here so a
+/// caller error never reaches the device). Two outputs paying the same Orchard
+/// receiver must agree on the address, absent included: their actions are matched
+/// by recipient, so the PCZT cannot tell them apart. Transparent outputs are
+/// matched by position and need no such check.
+fn collect_user_addresses<'a>(
+    network: &AnyZcashNetwork,
+    outputs: impl Iterator<Item = (Option<&'a str>, PaidReceiver)>,
+) -> Result<UserAddresses, Error> {
+    let mut seen: std::collections::BTreeMap<[u8; 43], Option<&'a str>> =
+        std::collections::BTreeMap::new();
+    let mut found = UserAddresses::default();
+    let mut transparent_index = 0usize;
+
+    for (user_address, paid) in outputs {
+        if let PaidReceiver::Orchard(bytes) = paid {
+            match seen.get(&bytes) {
+                Some(previous) if *previous != user_address => {
+                    return Err(Error::Craft(
+                        "two outputs pay the same Orchard receiver with different user \
+                         addresses (one may have none)"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    seen.insert(bytes, user_address);
+                }
+            }
+        }
+
+        if let Some(address) = user_address {
+            let (decoded_network, _, unified) = UnifiedAddress::decode(address)
+                .map_err(|e| Error::Craft(format!("user address is not a unified address: {e}")))?;
+            if decoded_network != network.network_type() {
+                return Err(Error::Craft(
+                    "user address belongs to a different network than the build".into(),
+                ));
+            }
+            if !unified.contains_receiver(&paid.as_unified_receiver()) {
+                return Err(Error::Craft(
+                    "user address does not contain the receiver the output pays".into(),
+                ));
+            }
+            match paid {
+                PaidReceiver::Orchard(bytes) => found.orchard.push((bytes, address.to_owned())),
+                PaidReceiver::Transparent(_) => {
+                    found
+                        .transparent
+                        .push((transparent_index, address.to_owned()));
+                }
+            }
+        }
+        if matches!(paid, PaidReceiver::Transparent(_)) {
+            transparent_index += 1;
+        }
+    }
+    Ok(found)
+}
+
+/// Which shielded bundle of the PCZT an output pass applies to.
+#[derive(Clone, Copy)]
+enum OrchardPool {
+    Orchard,
+    Ironwood,
+}
+
+/// Records each `user_address` on its output of the PCZT.
+///
+/// Runs after the proof and the derivation stamps: `user_address` is signer
+/// metadata outside every digest, so it cannot change the txid or a sighash.
+/// Change and padding outputs never match a caller-supplied receiver and stay
+/// untouched. Skipped entirely when no output carries an address.
+fn stamp_user_addresses(
+    pczt: Pczt,
+    pool: OrchardPool,
+    user_addresses: &UserAddresses,
+) -> Result<Pczt, Error> {
+    if user_addresses.is_empty() {
+        return Ok(pczt);
+    }
+
+    let updater = Updater::new(pczt);
+    let updater = if user_addresses.orchard.is_empty() {
+        updater
+    } else {
+        let stamp = |mut bundle: orchard::pczt::Updater<'_>| {
+            for i in 0..bundle.bundle().actions().len() {
+                let recipient = bundle.bundle().actions()[i]
+                    .output()
+                    .recipient()
+                    .map(|r| r.to_raw_address_bytes());
+                let Some(recipient) = recipient else { continue };
+                if let Some((_, address)) =
+                    user_addresses.orchard.iter().find(|(r, _)| *r == recipient)
+                {
+                    let address = address.clone();
+                    bundle.update_action_with(i, |mut action| {
+                        action.set_output_user_address(address);
+                        Ok(())
+                    })?;
+                }
+            }
+            Ok(())
+        };
+        match pool {
+            OrchardPool::Orchard => updater.update_orchard_with(stamp),
+            OrchardPool::Ironwood => updater.update_ironwood_with(stamp),
+        }
+        .map_err(|e| Error::Craft(format!("PCZT Updater (user address): {e:?}")))?
+    };
+
+    if user_addresses.transparent.is_empty() {
+        return Ok(updater.finish());
+    }
+    stamp_transparent_user_addresses(updater.finish(), &user_addresses.transparent)
+}
+
+fn stamp_transparent_user_addresses(
+    pczt: Pczt,
+    addresses: &[(usize, String)],
+) -> Result<Pczt, Error> {
+    Updater::new(pczt)
+        .update_transparent_with(|mut updater| {
+            for (index, address) in addresses {
+                let address = address.clone();
+                updater.update_output_with(*index, |mut output| {
+                    output.set_user_address(address);
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        })
+        .map_err(|e| Error::Craft(format!("PCZT Updater (transparent user address): {e:?}")))
         .map(Updater::finish)
 }
 
@@ -1267,6 +1479,13 @@ pub struct IronwoodOutputRequest {
     pub value: u64,
     /// Memo bytes for Ironwood outputs. Ignored for transparent outputs.
     pub memo: Option<Vec<u8>>,
+    /// The unified address string the user entered, when the destination was
+    /// decoded from one. Recorded as the output's ZIP 374 `user_address` so a
+    /// signer can show the whole address rather than only the paid receiver.
+    /// Must decode as a unified address of the build's network that contains the
+    /// paid receiver, or the build fails. PCZT metadata only: it changes neither
+    /// the transaction id nor any sighash.
+    pub user_address: Option<String>,
 }
 
 /// Inputs to [`build_ironwood_transaction`].
@@ -1449,6 +1668,16 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     }
     let n_transparent_inputs = transparent_inputs.len() as u32;
 
+    let user_addresses = collect_user_addresses(
+        &network,
+        outputs.iter().map(|o| {
+            (
+                o.user_address.as_deref(),
+                paid_receiver_ironwood(&o.destination),
+            )
+        }),
+    )?;
+
     let mut total_out: u64 = 0;
     let mut n_ironwood_outputs: u32 = 0;
     let mut n_transparent_outputs: u32 = 0;
@@ -1493,6 +1722,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
                 destination: IronwoodDestination::Ironwood(change_addr),
                 value: change,
                 memo: None,
+                user_address: None,
             };
             add_ironwood_output(&mut builder, ovk.as_ref(), &change_req)?;
             n_ironwood_outputs += 1;
@@ -1520,6 +1750,7 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
                 destination: IronwoodDestination::Transparent(addr),
                 value: change,
                 memo: None,
+                user_address: None,
             };
             let change_output_index = n_transparent_outputs as usize;
             add_ironwood_output(&mut builder, None, &change_req)?;
@@ -1606,6 +1837,8 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
     } else {
         pczt
     };
+
+    let pczt = stamp_user_addresses(pczt, OrchardPool::Ironwood, &user_addresses)?;
 
     // Upstream HW-signer redaction, then serialize as PCZT v2 — the only
     // encoding able to represent a V6 / Ironwood-bearing PCZT (`pczt::v1`
@@ -2012,6 +2245,7 @@ mod tests {
                 destination: out_destination,
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -2074,6 +2308,7 @@ mod tests {
                 destination: out_destination,
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -2171,6 +2406,7 @@ mod tests {
                 destination: Destination::Orchard(dummy_recipient),
                 value: 50,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2230,6 +2466,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2265,6 +2502,7 @@ mod tests {
                 destination: Destination::Orchard(fvk.address_at(0u32, Scope::External)),
                 value: 1,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2351,6 +2589,7 @@ mod tests {
                 )),
                 value: 1,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2521,6 +2760,7 @@ mod tests {
                 destination: Destination::Transparent(t_dest),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2558,6 +2798,7 @@ mod tests {
                 destination: Destination::Transparent(t_dest),
                 value: 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -2571,6 +2812,633 @@ mod tests {
     //
     // These tests exercise the full PCZT pipeline. They are NOT `#[ignore]`'d
     // because we need the coverage they produce on craft.rs.
+
+    // ── user_address ──────────────────────────────────────────────────────────
+
+    const SAPLING_RECEIVER: [u8; 43] = [0x55; 43];
+    const P2PKH_RECEIVER: [u8; 20] = [0x66; 20];
+
+    fn encode_ua(items: Vec<UnifiedReceiver>, network: NetworkType) -> String {
+        UnifiedAddress::try_from_items(
+            zcash_address::unified::Revision::R0,
+            items
+                .into_iter()
+                .map(zcash_address::unified::Uitem::Data)
+                .collect(),
+        )
+        .expect("valid unified address")
+        .encode(&network)
+    }
+
+    /// A unified address holding P2PKH, Sapling and the given Orchard receiver.
+    fn three_receiver_ua(orchard: &OrchardAddress) -> String {
+        encode_ua(
+            vec![
+                UnifiedReceiver::P2pkh(P2PKH_RECEIVER),
+                UnifiedReceiver::Sapling(SAPLING_RECEIVER),
+                UnifiedReceiver::Orchard(orchard.to_raw_address_bytes()),
+            ],
+            NetworkType::Main,
+        )
+    }
+
+    fn sapling_p2pkh_ua(hash: [u8; 20]) -> String {
+        encode_ua(
+            vec![
+                UnifiedReceiver::P2pkh(hash),
+                UnifiedReceiver::Sapling(SAPLING_RECEIVER),
+            ],
+            NetworkType::Main,
+        )
+    }
+
+    fn receiver_pairs(receivers: &Option<Vec<crate::parse::ParsedReceiver>>) -> Vec<(u8, Vec<u8>)> {
+        receivers
+            .as_ref()
+            .expect("receivers present")
+            .iter()
+            .map(|r| (r.typecode, r.receiver.clone()))
+            .collect()
+    }
+
+    fn orchard_inputs_with_user_address(
+        user_address: Option<String>,
+    ) -> (BuildInputs, OrchardAddress) {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let mut inputs = make_single_spend_inputs(
+            Network::MainNetwork,
+            Destination::Orchard(recipient),
+            10_000,
+        );
+        inputs.outputs[0].user_address = user_address;
+        (inputs, recipient)
+    }
+
+    #[test]
+    fn v5_records_the_user_address_on_the_matching_action_only() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let ua = three_receiver_ua(&recipient);
+        let (inputs, _) = orchard_inputs_with_user_address(Some(ua.clone()));
+
+        let out = build_transaction(inputs).expect("build with a user address");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        let actions = parsed.orchard_bundle.expect("orchard bundle").actions;
+        assert!(
+            actions.len() >= 2,
+            "the bundle is padded with dummy actions"
+        );
+        let tagged: Vec<_> = actions
+            .iter()
+            .filter(|a| a.user_address.is_some())
+            .collect();
+        assert_eq!(tagged.len(), 1, "only the paid output carries the address");
+        assert_eq!(tagged[0].user_address.as_deref(), Some(ua.as_str()));
+        assert_eq!(tagged[0].recipient, recipient.to_raw_address_bytes());
+        assert_eq!(
+            receiver_pairs(&tagged[0].user_address_receivers),
+            vec![
+                (0x00, P2PKH_RECEIVER.to_vec()),
+                (0x02, SAPLING_RECEIVER.to_vec())
+            ]
+        );
+        assert!(actions
+            .iter()
+            .filter(|a| a.user_address.is_none())
+            .all(|a| a.user_address_receivers.is_none()));
+    }
+
+    #[test]
+    fn v6_records_the_user_address_on_the_matching_ironwood_action_only() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let ua = three_receiver_ua(&recipient);
+        let mut inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        inputs.outputs[0].user_address = Some(ua.clone());
+
+        let out = build_ironwood_transaction(inputs).expect("build with a user address");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        let actions = parsed.ironwood_bundle.expect("ironwood bundle").actions;
+        let tagged: Vec<_> = actions
+            .iter()
+            .filter(|a| a.action.user_address.is_some())
+            .collect();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].action.user_address.as_deref(), Some(ua.as_str()));
+        assert_eq!(
+            receiver_pairs(&tagged[0].action.user_address_receivers),
+            vec![
+                (0x00, P2PKH_RECEIVER.to_vec()),
+                (0x02, SAPLING_RECEIVER.to_vec())
+            ]
+        );
+    }
+
+    #[test]
+    fn transparent_output_records_the_user_address_and_change_does_not() {
+        let network = Network::MainNetwork;
+        let mut inputs = make_public_to_public_inputs(network, nu5_activation_height(network) + 1);
+        let ua = sapling_p2pkh_ua([0x22; 20]);
+        inputs.outputs[0].user_address = Some(ua.clone());
+
+        let out = build_transaction(inputs).expect("build with a user address");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        assert_eq!(parsed.transparent_outputs.len(), 2);
+        let recipient = &parsed.transparent_outputs[0];
+        assert_eq!(recipient.user_address.as_deref(), Some(ua.as_str()));
+        assert_eq!(
+            receiver_pairs(&recipient.user_address_receivers),
+            vec![(0x02, SAPLING_RECEIVER.to_vec())]
+        );
+        let change = &parsed.transparent_outputs[1];
+        assert!(change.user_address.is_none() && change.user_address_receivers.is_none());
+    }
+
+    #[test]
+    fn orchard_only_user_address_yields_an_empty_receiver_list() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let ua = encode_ua(
+            vec![UnifiedReceiver::Orchard(recipient.to_raw_address_bytes())],
+            NetworkType::Main,
+        );
+        let (inputs, _) = orchard_inputs_with_user_address(Some(ua));
+
+        let out = build_transaction(inputs).expect("build");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        let action = parsed
+            .orchard_bundle
+            .unwrap()
+            .actions
+            .into_iter()
+            .find(|a| a.user_address.is_some())
+            .expect("tagged action");
+        assert_eq!(action.user_address_receivers, Some(vec![]));
+    }
+
+    #[test]
+    fn no_user_address_leaves_every_output_untagged() {
+        let (inputs, _) = orchard_inputs_with_user_address(None);
+        let out = build_transaction(inputs).expect("build");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+        assert!(parsed
+            .orchard_bundle
+            .unwrap()
+            .actions
+            .iter()
+            .all(|a| a.user_address.is_none() && a.user_address_receivers.is_none()));
+
+        let t_addr = TransparentAddress::PublicKeyHash([0x11u8; 20]);
+        let inputs = make_single_spend_inputs(
+            Network::MainNetwork,
+            Destination::Transparent(t_addr),
+            10_000,
+        );
+        let out = build_transaction(inputs).expect("build");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+        assert!(parsed.transparent_outputs[0].user_address.is_none());
+        assert!(parsed.transparent_outputs[0]
+            .user_address_receivers
+            .is_none());
+    }
+
+    /// The transaction id and every signature hash of `pczt`, as the Signer computes them.
+    fn digests(pczt: Pczt) -> (String, [u8; 32], Vec<[u8; 32]>) {
+        use pczt::roles::signer::Signer;
+        use zcash_primitives::transaction::txid::TxIdDigester;
+
+        let txid = format!(
+            "{:?}",
+            pczt.clone()
+                .into_effects()
+                .expect("effects")
+                .digest(TxIdDigester)
+        );
+        let n_inputs = pczt.transparent().inputs().len();
+        let signer = Signer::new(pczt).expect("signer");
+        let transparent = (0..n_inputs)
+            .map(|i| signer.transparent_sighash(i).expect("transparent sighash"))
+            .collect();
+        (txid, signer.shielded_sighash(), transparent)
+    }
+
+    /// Stamps `user_addresses` on `bare` and checks that the PCZT changed while its
+    /// transaction id and signature hashes did not.
+    fn assert_stamp_keeps_every_digest(
+        bare: Pczt,
+        pool: OrchardPool,
+        user_addresses: &UserAddresses,
+    ) {
+        let tagged = stamp_user_addresses(bare.clone(), pool, user_addresses).expect("stamp");
+        assert_ne!(
+            format!("{bare:?}"),
+            format!("{tagged:?}"),
+            "the stamp must change the PCZT"
+        );
+        assert_eq!(digests(bare), digests(tagged));
+    }
+
+    /// `user_address` is outside every digest: stamping it on a finished PCZT must
+    /// leave the transaction id and the signature hashes exactly as they were, on
+    /// each of the three stamp passes.
+    #[test]
+    fn user_address_does_not_change_the_transaction_digests() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let orchard_stamp = UserAddresses {
+            orchard: vec![(
+                recipient.to_raw_address_bytes(),
+                three_receiver_ua(&recipient),
+            )],
+            transparent: vec![],
+        };
+
+        let (inputs, _) = orchard_inputs_with_user_address(None);
+        let out = build_transaction(inputs).expect("build");
+        let bare = Pczt::parse(&out.pczt_bytes).expect("parse");
+        assert_stamp_keeps_every_digest(bare, OrchardPool::Orchard, &orchard_stamp);
+
+        let inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        let out = build_ironwood_transaction(inputs).expect("build");
+        let bare = Pczt::parse(&out.pczt_bytes).expect("parse");
+        assert_stamp_keeps_every_digest(bare, OrchardPool::Ironwood, &orchard_stamp);
+
+        let network = Network::MainNetwork;
+        let inputs = make_public_to_public_inputs(network, nu5_activation_height(network) + 1);
+        let out = build_transaction(inputs).expect("build");
+        let bare = Pczt::parse(&out.pczt_bytes).expect("parse");
+        assert!(!bare.transparent().inputs().is_empty());
+        let transparent_stamp = UserAddresses {
+            orchard: vec![],
+            transparent: vec![(0, sapling_p2pkh_ua([0x22; 20]))],
+        };
+        assert_stamp_keeps_every_digest(bare, OrchardPool::Orchard, &transparent_stamp);
+    }
+
+    #[test]
+    fn user_address_not_containing_the_paid_receiver_is_refused() {
+        let other = make_fvk().address_at(1u32, Scope::External);
+        let (inputs, _) = orchard_inputs_with_user_address(Some(three_receiver_ua(&other)));
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("does not contain")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_address_of_another_network_is_refused() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let ua = encode_ua(
+            vec![UnifiedReceiver::Orchard(recipient.to_raw_address_bytes())],
+            NetworkType::Test,
+        );
+        let (inputs, _) = orchard_inputs_with_user_address(Some(ua));
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("different network")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_user_address_is_refused() {
+        let (inputs, _) = orchard_inputs_with_user_address(Some("not an address".into()));
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("not a unified address")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn conflicting_user_addresses_for_one_receiver_are_refused() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let with_sapling = three_receiver_ua(&recipient);
+        let orchard_only = encode_ua(
+            vec![UnifiedReceiver::Orchard(recipient.to_raw_address_bytes())],
+            NetworkType::Main,
+        );
+        let paid = PaidReceiver::Orchard(recipient.to_raw_address_bytes());
+
+        let err = collect_user_addresses(
+            &AnyZcashNetwork::Named(Network::MainNetwork),
+            [
+                (Some(with_sapling.as_str()), paid),
+                (Some(orchard_only.as_str()), paid),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("different user addresses")),
+            "got: {err}"
+        );
+
+        // The same string twice is not a conflict.
+        let found = collect_user_addresses(
+            &AnyZcashNetwork::Named(Network::MainNetwork),
+            [
+                (Some(with_sapling.as_str()), paid),
+                (Some(with_sapling.as_str()), paid),
+            ]
+            .into_iter(),
+        )
+        .expect("agreeing duplicates are accepted");
+        assert_eq!(found.orchard.len(), 2);
+    }
+
+    /// Inputs spending one transparent coin into `outputs` with no change. Orchard
+    /// outputs get a valid anchor; the fee is the ZIP 317 fee of the shape.
+    fn public_inputs_paying(network: Network, outputs: Vec<OutputRequest>) -> BuildInputs {
+        let fvk = make_fvk();
+        let n_orchard = outputs
+            .iter()
+            .filter(|o| matches!(o.destination, Destination::Orchard(_)))
+            .count() as u32;
+        let n_transparent = outputs.len() as u32 - n_orchard;
+        let fee = zip317_fee(0, n_orchard, 1, n_transparent);
+        let total_in = outputs.iter().map(|o| o.value).sum::<u64>() + fee;
+
+        let anchor = if n_orchard == 0 {
+            [0u8; 32]
+        } else {
+            let rho = Rho::from_bytes(&[0u8; 32]).into_option().unwrap();
+            let rseed = RandomSeed::from_bytes([0xab; 32], &rho)
+                .into_option()
+                .unwrap();
+            let note = Note::from_parts(
+                fvk.address_at(0u32, Scope::External),
+                NoteValue::from_raw(1),
+                rho,
+                rseed,
+                NoteVersion::V2,
+            )
+            .into_option()
+            .unwrap();
+            let leaf =
+                MerkleHashOrchard::from_cmx(&ExtractedNoteCommitment::from(note.commitment()));
+            synthetic_anchor_and_path(leaf).0
+        };
+
+        BuildInputs {
+            network: network.into(),
+            target_height: nu5_activation_height(network) + 1,
+            anchor_height: 1,
+            orchard_fvk: Some(fvk.clone()),
+            ovk: Some(fvk.to_ovk(Scope::External)),
+            change_address: Some(fvk.address_at(0u32, Scope::Internal)),
+            transparent_change_address: None,
+            transparent_change_pubkey: None,
+            transparent_change_address_index: None,
+            anchor,
+            seed_fingerprint: [0x42; 32],
+            account_index: 0,
+            fee,
+            spends: vec![],
+            transparent_inputs: vec![make_transparent_input(total_in)],
+            outputs,
+        }
+    }
+
+    fn output_to(destination: Destination, user_address: Option<String>) -> OutputRequest {
+        OutputRequest {
+            destination,
+            value: 10_000,
+            memo: None,
+            user_address,
+        }
+    }
+
+    /// The P2PKH hash a standard transparent script pays.
+    fn p2pkh_hash_of(script: &[u8]) -> [u8; 20] {
+        assert_eq!(script.len(), 25, "a P2PKH script");
+        script[3..23].try_into().unwrap()
+    }
+
+    #[test]
+    fn each_transparent_output_records_its_own_user_address_beside_an_orchard_one() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let first = [0x22u8; 20];
+        let second = [0x44u8; 20];
+        let orchard_ua = three_receiver_ua(&recipient);
+        let inputs = public_inputs_paying(
+            Network::MainNetwork,
+            vec![
+                output_to(
+                    Destination::Transparent(TransparentAddress::PublicKeyHash(first)),
+                    Some(sapling_p2pkh_ua(first)),
+                ),
+                output_to(Destination::Orchard(recipient), Some(orchard_ua.clone())),
+                output_to(
+                    Destination::Transparent(TransparentAddress::PublicKeyHash(second)),
+                    Some(sapling_p2pkh_ua(second)),
+                ),
+            ],
+        );
+
+        let out = build_transaction(inputs).expect("build with three user addresses");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        assert_eq!(parsed.transparent_outputs.len(), 2);
+        let mut paid = Vec::new();
+        for output in &parsed.transparent_outputs {
+            let hash = p2pkh_hash_of(&output.script_pubkey);
+            assert_eq!(
+                output.user_address.as_deref(),
+                Some(sapling_p2pkh_ua(hash).as_str()),
+                "each output carries the address holding its own receiver"
+            );
+            paid.push(hash);
+        }
+        paid.sort();
+        assert_eq!(paid, vec![first, second]);
+
+        let tagged: Vec<_> = parsed
+            .orchard_bundle
+            .expect("orchard bundle")
+            .actions
+            .into_iter()
+            .filter(|a| a.user_address.is_some())
+            .collect();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].recipient, recipient.to_raw_address_bytes());
+        assert_eq!(tagged[0].user_address.as_deref(), Some(orchard_ua.as_str()));
+    }
+
+    #[test]
+    fn ironwood_transparent_output_records_the_user_address() {
+        let hash = [0x11u8; 20];
+        let ua = sapling_p2pkh_ua(hash);
+        let mut inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Transparent(TransparentAddress::PublicKeyHash(hash)),
+            10_000,
+        );
+        inputs.outputs[0].user_address = Some(ua.clone());
+
+        let out = build_ironwood_transaction(inputs).expect("build with a user address");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        assert_eq!(parsed.transparent_outputs.len(), 1);
+        let output = &parsed.transparent_outputs[0];
+        assert_eq!(p2pkh_hash_of(&output.script_pubkey), hash);
+        assert_eq!(output.user_address.as_deref(), Some(ua.as_str()));
+        assert_eq!(
+            receiver_pairs(&output.user_address_receivers),
+            vec![(0x02, SAPLING_RECEIVER.to_vec())]
+        );
+        assert!(parsed
+            .ironwood_bundle
+            .expect("ironwood bundle")
+            .actions
+            .iter()
+            .all(|a| a.action.user_address.is_none()));
+    }
+
+    #[test]
+    fn one_transparent_receiver_paid_with_and_without_a_user_address_builds() {
+        let hash = [0x22u8; 20];
+        let destination = Destination::Transparent(TransparentAddress::PublicKeyHash(hash));
+        let ua = sapling_p2pkh_ua(hash);
+        let inputs = public_inputs_paying(
+            Network::MainNetwork,
+            vec![
+                output_to(destination.clone(), None),
+                output_to(destination, Some(ua.clone())),
+            ],
+        );
+
+        let out = build_transaction(inputs).expect("transparent outputs are matched by position");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+
+        let addresses: Vec<_> = parsed
+            .transparent_outputs
+            .iter()
+            .map(|o| o.user_address.as_deref())
+            .collect();
+        assert_eq!(addresses, vec![None, Some(ua.as_str())]);
+    }
+
+    #[test]
+    fn one_orchard_receiver_paid_with_and_without_a_user_address_is_refused() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let (mut inputs, _) = orchard_inputs_with_user_address(None);
+        inputs.outputs.push(output_to(
+            Destination::Orchard(recipient),
+            Some(three_receiver_ua(&recipient)),
+        ));
+
+        let err = build_transaction(inputs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Craft(s) if s.contains("different user addresses")),
+            "got: {err}"
+        );
+    }
+
+    /// A PCZT whose `user_address` does not hold the paid receiver, as a third-party
+    /// Updater could write it: the stamp passes skip the builder's own check.
+    fn assert_parse_refuses(pczt: Pczt, expected: &str) {
+        // The wire version each builder emits: v2 for a V6 transaction, v1 otherwise.
+        let bytes = if pczt.ironwood().actions().is_empty() {
+            pczt::v1::Pczt::try_from(pczt).expect("v1").serialize()
+        } else {
+            pczt::v2::Pczt::try_from(pczt).expect("v2").serialize()
+        };
+        let err = crate::parse::parse_pczt(&bytes).unwrap_err();
+        assert!(err.to_string().contains(expected), "got: {err}");
+    }
+
+    #[test]
+    fn parse_pczt_refuses_a_user_address_without_the_paid_receiver_in_every_pool() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let other = make_fvk().address_at(1u32, Scope::External);
+        let wrong_orchard = UserAddresses {
+            orchard: vec![(recipient.to_raw_address_bytes(), three_receiver_ua(&other))],
+            transparent: vec![],
+        };
+
+        let (inputs, _) = orchard_inputs_with_user_address(None);
+        let bare = Pczt::parse(&build_transaction(inputs).unwrap().pczt_bytes).unwrap();
+        let stamped = stamp_user_addresses(bare, OrchardPool::Orchard, &wrong_orchard).unwrap();
+        assert_parse_refuses(stamped, "does not contain");
+
+        let inputs = make_single_ironwood_spend_inputs(
+            Network::MainNetwork,
+            IronwoodDestination::Ironwood(recipient),
+            10_000,
+        );
+        let bare = Pczt::parse(&build_ironwood_transaction(inputs).unwrap().pczt_bytes).unwrap();
+        let stamped = stamp_user_addresses(bare, OrchardPool::Ironwood, &wrong_orchard).unwrap();
+        assert_parse_refuses(stamped, "does not contain");
+
+        let network = Network::MainNetwork;
+        let inputs = make_public_to_public_inputs(network, nu5_activation_height(network) + 1);
+        let bare = Pczt::parse(&build_transaction(inputs).unwrap().pczt_bytes).unwrap();
+        // The recipient pays [0x22; 20]; this address holds [0x23; 20].
+        let stamped =
+            stamp_transparent_user_addresses(bare, &[(0, sapling_p2pkh_ua([0x23; 20]))]).unwrap();
+        assert_parse_refuses(stamped, "does not contain");
+    }
+
+    #[test]
+    fn testnet_pczt_keeps_a_testnet_user_address_and_refuses_a_mainnet_one() {
+        let recipient = make_fvk().address_at(0u32, Scope::External);
+        let testnet_ua = encode_ua(
+            vec![
+                UnifiedReceiver::Sapling(SAPLING_RECEIVER),
+                UnifiedReceiver::Orchard(recipient.to_raw_address_bytes()),
+            ],
+            NetworkType::Test,
+        );
+        let mut inputs = make_single_spend_inputs(
+            Network::TestNetwork,
+            Destination::Orchard(recipient),
+            10_000,
+        );
+        inputs.outputs[0].user_address = Some(testnet_ua.clone());
+
+        let out = build_transaction(inputs).expect("build on testnet");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse");
+        assert_eq!(parsed.global.coin_type, 1);
+        let action = parsed
+            .orchard_bundle
+            .expect("orchard bundle")
+            .actions
+            .into_iter()
+            .find(|a| a.user_address.is_some())
+            .expect("tagged action");
+        assert_eq!(action.user_address.as_deref(), Some(testnet_ua.as_str()));
+        assert_eq!(
+            receiver_pairs(&action.user_address_receivers),
+            vec![(0x02, SAPLING_RECEIVER.to_vec())]
+        );
+
+        let mut inputs = make_single_spend_inputs(
+            Network::TestNetwork,
+            Destination::Orchard(recipient),
+            10_000,
+        );
+        inputs.outputs[0].user_address = None;
+        let bare = Pczt::parse(&build_transaction(inputs).unwrap().pczt_bytes).unwrap();
+        let mainnet = UserAddresses {
+            orchard: vec![(
+                recipient.to_raw_address_bytes(),
+                three_receiver_ua(&recipient),
+            )],
+            transparent: vec![],
+        };
+        let stamped = stamp_user_addresses(bare, OrchardPool::Orchard, &mainnet).unwrap();
+        assert_parse_refuses(stamped, "another network");
+    }
 
     #[test]
     fn private_to_private_produces_valid_pczt() {
@@ -2783,6 +3651,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -2853,11 +3722,13 @@ mod tests {
                     destination: Destination::Orchard(recipient),
                     value: 4_000,
                     memo: None,
+                    user_address: None,
                 },
                 OutputRequest {
                     destination: Destination::Orchard(recipient),
                     value: 4_000,
                     memo: None,
+                    user_address: None,
                 },
             ],
         };
@@ -2919,6 +3790,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -2974,6 +3846,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -3216,6 +4089,7 @@ mod tests {
                 destination: Destination::Transparent(t_addr),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3338,6 +4212,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3417,6 +4292,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3518,6 +4394,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3591,6 +4468,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3674,6 +4552,7 @@ mod tests {
                 destination: Destination::Orchard(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -3939,6 +4818,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -4014,6 +4894,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_ironwood_transaction(inputs).unwrap_err();
@@ -4076,6 +4957,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -4175,6 +5057,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -4363,6 +5246,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -4530,6 +5414,7 @@ mod tests {
                 destination: IronwoodDestination::Transparent(t_addr),
                 value: 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_ironwood_transaction(inputs).unwrap_err();
@@ -4595,6 +5480,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -4638,6 +5524,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: 10_000,
                 memo: None,
+                user_address: None,
             }],
         };
         let err = build_transaction(inputs).unwrap_err();
@@ -4701,6 +5588,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         };
 
@@ -4776,6 +5664,7 @@ mod tests {
                 destination: Destination::Transparent(t_recv),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         }
     }
@@ -5148,6 +6037,7 @@ mod tests {
                 destination: IronwoodDestination::Ironwood(recipient),
                 value: out_value,
                 memo: None,
+                user_address: None,
             }],
         })
         .unwrap();

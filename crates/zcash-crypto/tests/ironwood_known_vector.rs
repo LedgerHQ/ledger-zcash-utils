@@ -192,6 +192,7 @@ fn build_ironwood_transaction_with_real_testnet_anchor_produces_valid_v6_pczt() 
             destination: IronwoodDestination::Ironwood(recipient),
             value: 10_000,
             memo: None,
+            user_address: None,
         }],
     };
 
