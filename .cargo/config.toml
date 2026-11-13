@@ -7,3 +7,13 @@ linker = "x86_64-linux-musl-gcc"
 # apt-get install -y gcc-aarch64-linux-gnu
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+# ─── Windows: link the C runtime statically ───────────────────────────────────
+# The default MSVC build imports VCRUNTIME140.dll, which Windows does not ship and
+# Electron does not bundle. On a machine without the Visual C++ Redistributable,
+# loading the .node then fails with "The specified module could not be found".
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
