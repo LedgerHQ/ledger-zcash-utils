@@ -151,6 +151,27 @@ jobs:
       - name: Build NAPI addon
         run: pnpm napi build --platform --release --cargo-cwd crates/zcash-ffi-node ${{ matrix.args }}
 
+      # The published Windows addons must load on a machine without the Visual
+      # C++ Redistributable, so they may import no DLL of the MSVC runtime.
+      - name: Check the addon links the C runtime statically
+        if: startsWith(matrix.target, 'win32-')
+        shell: pwsh
+        env:
+          ADDON: index.${{ matrix.target }}.node
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $deps = & $dumpbin.FullName /dependents $env:ADDON | Out-String
+          Write-Output $deps
+          if ($LASTEXITCODE -ne 0 -or $deps -notmatch '(?i)kernel32\.dll') {
+            Write-Output "::error::could not read the imports of $env:ADDON"
+            exit 1
+          }
+          if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') {
+            Write-Output "::error::$env:ADDON imports the MSVC C runtime"
+            exit 1
+          }
+
       - name: Upload .node artifact
         uses: actions/upload-artifact@v4
         with:
