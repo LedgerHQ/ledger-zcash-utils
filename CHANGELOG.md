@@ -1,5 +1,15 @@
 # @ledgerhq/zcash-utils
 
+## 2.10.0
+
+### Minor Changes
+
+- f722d51: Record the unified address the user entered as the output's ZIP 374 `user_address`, and return it from `parsePczt` with its receivers other than the paid one (`userAddress`, `userAddressReceivers`).
+
+### Patch Changes
+
+- 08ad3d1: Link the C runtime statically into the Windows binaries, so the addon loads on a machine without the Visual C++ Redistributable instead of failing with "The specified module could not be found".
+
 ## 2.9.0
 
 ### Minor Changes
