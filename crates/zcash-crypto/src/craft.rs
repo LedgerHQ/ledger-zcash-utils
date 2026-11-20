@@ -352,6 +352,8 @@ pub struct OutputRequest {
     /// as the user's own account. Metadata only: the transaction id and the
     /// sighashes are unchanged. Shielded destinations only; must differ from
     /// the account being spent and be at most [`MAX_DECLARED_OUTPUT_ACCOUNT`].
+    /// Every output paying the same recipient must name the same account, or
+    /// none of them.
     pub account: Option<u32>,
 }
 
@@ -523,15 +525,10 @@ pub fn build_transaction(inputs: BuildInputs) -> Result<BuildOutput, Error> {
             )?;
         }
     }
-    let declared =
-        declared_recipients(
-            outputs
-                .iter()
-                .filter_map(|o| match (&o.destination, o.account) {
-                    (Destination::Orchard(addr), Some(account)) => Some((addr, account)),
-                    _ => None,
-                }),
-        )?;
+    let declared = declared_recipients(outputs.iter().filter_map(|o| match &o.destination {
+        Destination::Orchard(addr) => Some((addr, o.account)),
+        _ => None,
+    }))?;
 
     // Determine whether an Orchard bundle will be present. An Orchard bundle
     // is created when there are Orchard spends OR any Orchard output.
@@ -911,20 +908,34 @@ fn validate_declared_account(
 }
 
 /// Maps each declared recipient (raw Orchard address bytes) to its account.
-/// Two outputs to one recipient must name the same account.
+///
+/// Takes every shielded output, with its account or none. Two outputs paying
+/// one recipient must agree on the account, absent included: the output
+/// derivation is stamped by recipient, so the PCZT cannot tell their actions
+/// apart, and an undeclared output would otherwise carry the other's declaration.
 fn declared_recipients<'a>(
-    declared: impl Iterator<Item = (&'a OrchardAddress, u32)>,
+    outputs: impl Iterator<Item = (&'a OrchardAddress, Option<u32>)>,
 ) -> Result<std::collections::BTreeMap<[u8; 43], u32>, Error> {
-    let mut map = std::collections::BTreeMap::new();
-    for (addr, account) in declared {
-        let previous = map.insert(addr.to_raw_address_bytes(), account);
-        if previous.is_some_and(|p| p != account) {
-            return Err(Error::Craft(
-                "one recipient is declared with two different output accounts".into(),
-            ));
+    let mut seen = std::collections::BTreeMap::new();
+    for (addr, account) in outputs {
+        match seen.insert(addr.to_raw_address_bytes(), account) {
+            Some(previous) if previous != account && previous.is_some() && account.is_some() => {
+                return Err(Error::Craft(
+                    "one recipient is declared with two different output accounts".into(),
+                ));
+            }
+            Some(previous) if previous != account => {
+                return Err(Error::Craft(
+                    "one recipient is paid both with and without an output account".into(),
+                ));
+            }
+            _ => {}
         }
     }
-    Ok(map)
+    Ok(seen
+        .into_iter()
+        .filter_map(|(recipient, account)| account.map(|a| (recipient, a)))
+        .collect())
 }
 
 /// ZIP-32 path `m/32'/coin_type'/account'` as raw hardened indices.
@@ -1665,6 +1676,8 @@ pub struct IronwoodOutputRequest {
     /// as the user's own account. Metadata only: the transaction id and the
     /// sighashes are unchanged. Shielded destinations only; must differ from
     /// the account being spent and be at most [`MAX_DECLARED_OUTPUT_ACCOUNT`].
+    /// Every output paying the same recipient must name the same account, or
+    /// none of them.
     pub account: Option<u32>,
 }
 
@@ -1794,15 +1807,10 @@ pub fn build_ironwood_transaction(inputs: IronwoodBuildInputs) -> Result<BuildOu
             )?;
         }
     }
-    let declared =
-        declared_recipients(
-            outputs
-                .iter()
-                .filter_map(|o| match (&o.destination, o.account) {
-                    (IronwoodDestination::Ironwood(addr), Some(account)) => Some((addr, account)),
-                    _ => None,
-                }),
-        )?;
+    let declared = declared_recipients(outputs.iter().filter_map(|o| match &o.destination {
+        IronwoodDestination::Ironwood(addr) => Some((addr, o.account)),
+        _ => None,
+    }))?;
 
     let has_ironwood = !spends.is_empty()
         || outputs
@@ -6428,7 +6436,7 @@ mod tests {
             .shielded_sighash();
 
         let declared =
-            declared_recipients([(&other_account_recipient(), 1u32)].into_iter()).unwrap();
+            declared_recipients([(&other_account_recipient(), Some(1u32))].into_iter()).unwrap();
         let stamped = stamp_output_derivations(
             Pczt::parse(&out.pczt_bytes).unwrap(),
             &Network::MainNetwork.into(),
@@ -6524,9 +6532,49 @@ mod tests {
     fn one_recipient_declared_with_two_accounts_is_refused() {
         let recipient = other_account_recipient();
         let err =
-            declared_recipients([(&recipient, 1u32), (&recipient, 2u32)].into_iter()).unwrap_err();
+            declared_recipients([(&recipient, Some(1u32)), (&recipient, Some(2u32))].into_iter())
+                .unwrap_err();
         assert!(craft_error_message(err).contains("two different"));
         // The same account twice is fine.
-        assert!(declared_recipients([(&recipient, 1u32), (&recipient, 1u32)].into_iter()).is_ok());
+        assert!(declared_recipients(
+            [(&recipient, Some(1u32)), (&recipient, Some(1u32))].into_iter()
+        )
+        .is_ok());
+    }
+
+    /// Both actions pay one recipient, so a declaration on one would be stamped
+    /// on the other too: the request is refused, in either order.
+    #[test]
+    fn one_recipient_paid_with_and_without_an_account_is_refused() {
+        let recipient = other_account_recipient();
+        for outputs in [
+            [(&recipient, Some(1u32)), (&recipient, None)],
+            [(&recipient, None), (&recipient, Some(1u32))],
+        ] {
+            let err = declared_recipients(outputs.into_iter()).unwrap_err();
+            assert!(craft_error_message(err).contains("with and without"));
+        }
+        // Undeclared outputs to one recipient stay allowed and declare nothing.
+        let declared =
+            declared_recipients([(&recipient, None), (&recipient, None)].into_iter()).unwrap();
+        assert!(declared.is_empty());
+    }
+
+    /// The builders refuse it before building, in both pools.
+    #[test]
+    fn builders_refuse_one_recipient_paid_with_and_without_an_account() {
+        let mut inputs = orchard_inputs_paying_account(Network::MainNetwork, Some(1));
+        let mut undeclared = inputs.outputs[0].clone();
+        undeclared.account = None;
+        inputs.outputs.push(undeclared);
+        let msg = craft_error_message(build_transaction(inputs).unwrap_err());
+        assert!(msg.contains("with and without"));
+
+        let mut inputs = ironwood_inputs_paying_account(Network::MainNetwork, Some(1));
+        let mut undeclared = inputs.outputs[0].clone();
+        undeclared.account = None;
+        inputs.outputs.push(undeclared);
+        let msg = craft_error_message(build_ironwood_transaction(inputs).unwrap_err());
+        assert!(msg.contains("with and without"));
     }
 }

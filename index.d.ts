@@ -179,7 +179,8 @@ export interface OutputRequestJs {
    * recipient is another account of the wallet. The PCZT then carries that
    * output's ZIP 32 derivation, and `parsePczt` returns it as
    * `outputZip32Derivation`. Shielded destinations only; must differ from
-   * the account being spent and be at most 100.
+   * the account being spent and be at most 100. Every output paying the
+   * same recipient must name the same account, or none of them.
    */
   account?: number
 }
@@ -375,7 +376,8 @@ export interface IronwoodOutputRequestJs {
    * recipient is another account of the wallet. The PCZT then carries that
    * output's ZIP 32 derivation, and `parsePczt` returns it as
    * `outputZip32Derivation`. Shielded destinations only; must differ from
-   * the account being spent and be at most 100.
+   * the account being spent and be at most 100. Every output paying the
+   * same recipient must name the same account, or none of them.
    */
   account?: number
 }

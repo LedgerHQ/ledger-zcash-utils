@@ -2439,6 +2439,49 @@ mod tests {
     }
 
     #[test]
+    fn output_requests_carry_each_declared_account() {
+        let ua = test_unified_address();
+        let requested = [(ua.as_str(), Some(3u32)), (ua.as_str(), None)];
+
+        let outputs = output_requests(
+            &mainnet(),
+            &requested
+                .iter()
+                .map(|(address, account)| OutputRequestDto {
+                    account: *account,
+                    address: address.to_string(),
+                    value_zat: 1_000,
+                    memo: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let ironwood = ironwood_output_requests(
+            &mainnet(),
+            &requested
+                .iter()
+                .map(|(address, account)| IronwoodOutputRequestDto {
+                    account: *account,
+                    address: address.to_string(),
+                    value_zat: 1_000,
+                    memo: None,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let expected = vec![Some(3), None];
+        assert_eq!(
+            outputs.iter().map(|o| o.account).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            ironwood.iter().map(|o| o.account).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
     fn decode_ironwood_destination_has_no_user_address_for_a_transparent_string() {
         let (destination, user_address) =
             decode_ironwood_destination(&mainnet(), "t1Hsc1LR8yKnbbe3twRp88p6vFfC5t7DLbs").unwrap();

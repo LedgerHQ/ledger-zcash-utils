@@ -295,7 +295,8 @@ pub struct OutputRequestJs {
     /// recipient is another account of the wallet. The PCZT then carries that
     /// output's ZIP 32 derivation, and `parsePczt` returns it as
     /// `outputZip32Derivation`. Shielded destinations only; must differ from
-    /// the account being spent and be at most 100.
+    /// the account being spent and be at most 100. Every output paying the
+    /// same recipient must name the same account, or none of them.
     pub account: Option<u32>,
 }
 
@@ -578,7 +579,8 @@ pub struct IronwoodOutputRequestJs {
     /// recipient is another account of the wallet. The PCZT then carries that
     /// output's ZIP 32 derivation, and `parsePczt` returns it as
     /// `outputZip32Derivation`. Shielded destinations only; must differ from
-    /// the account being spent and be at most 100.
+    /// the account being spent and be at most 100. Every output paying the
+    /// same recipient must name the same account, or none of them.
     pub account: Option<u32>,
 }
 
@@ -1564,7 +1566,11 @@ pub async fn test_sign_pczt(
         let transparent_signatures =
             zcash_crypto::testing::sign_pczt_transparent_inputs(&pczt_bytes, &seed, network)?;
 
-        Ok((orchard_signatures, ironwood_signatures, transparent_signatures))
+        Ok((
+            orchard_signatures,
+            ironwood_signatures,
+            transparent_signatures,
+        ))
     })
     .await
     .map_err(|e| {
