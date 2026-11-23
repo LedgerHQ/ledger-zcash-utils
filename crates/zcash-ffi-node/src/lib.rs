@@ -291,6 +291,13 @@ pub struct OutputRequestJs {
     pub address: String,
     pub value_zat: String,
     pub memo: Option<String>,
+    /// ZIP 32 account of the **same seed** that this output pays, when the
+    /// recipient is another account of the wallet. The PCZT then carries that
+    /// output's ZIP 32 derivation, and `parsePczt` returns it as
+    /// `outputZip32Derivation`. Shielded destinations only; must differ from
+    /// the account being spent and be at most 100. Every output paying the
+    /// same recipient must name the same account, or none of them.
+    pub account: Option<u32>,
 }
 
 /// One transparent (P2PKH) UTXO to spend.
@@ -497,6 +504,7 @@ pub async fn build_transaction(
                 address: o.address,
                 value_zat: parse_u64(&o.value_zat, "value_zat")?,
                 memo: o.memo,
+                account: o.account,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -567,6 +575,13 @@ pub struct IronwoodOutputRequestJs {
     pub address: String,
     pub value_zat: String,
     pub memo: Option<String>,
+    /// ZIP 32 account of the **same seed** that this output pays, when the
+    /// recipient is another account of the wallet. The PCZT then carries that
+    /// output's ZIP 32 derivation, and `parsePczt` returns it as
+    /// `outputZip32Derivation`. Shielded destinations only; must differ from
+    /// the account being spent and be at most 100. Every output paying the
+    /// same recipient must name the same account, or none of them.
+    pub account: Option<u32>,
 }
 
 #[napi(object)]
@@ -681,6 +696,7 @@ pub async fn build_ironwood_transaction(
                 address: o.address,
                 value_zat: parse_u64(&o.value_zat, "value_zat")?,
                 memo: o.memo,
+                account: o.account,
             })
         })
         .collect::<napi::Result<Vec<_>>>()?;
@@ -1027,6 +1043,16 @@ pub struct PcztTransparentOutput {
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
 }
 
+/// A ZIP-32 derivation declared on an action output: the account of the signing
+/// seed that the output pays. Same shape as the signer's `PcztZip32Derivation`.
+#[napi(object)]
+pub struct PcztZip32Derivation {
+    /// ZIP-32 derivation path, e.g. `32'/133'/1'`.
+    pub path: String,
+    /// ZIP-32 seed fingerprint, 32 bytes.
+    pub seed_fingerprint: Uint8Array,
+}
+
 /// A single Orchard action (spend + output halves), flattened for the device.
 #[napi(object)]
 pub struct PcztOrchardAction {
@@ -1073,6 +1099,9 @@ pub struct PcztOrchardAction {
     /// address, or when it holds a receiver of an unknown type (the device then
     /// shows its fallback); empty when the paid receiver is the only one.
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
+    /// Present when the output was declared to pay another account of the same
+    /// seed (see the `account` of the output request); absent otherwise.
+    pub output_zip32_derivation: Option<PcztZip32Derivation>,
 }
 
 /// The Orchard action bundle plus its trailer.
@@ -1137,6 +1166,9 @@ pub struct PcztIronwoodAction {
     /// address, or when it holds a receiver of an unknown type (the device then
     /// shows its fallback); empty when the paid receiver is the only one.
     pub user_address_receivers: Option<Vec<PcztUserAddressReceiver>>,
+    /// Present when the output was declared to pay another account of the same
+    /// seed (see the `account` of the output request); absent otherwise.
+    pub output_zip32_derivation: Option<PcztZip32Derivation>,
     /// Note-plaintext lead byte (`0x03` for Ironwood), required for PCZT v2.
     pub note_plaintext_version: u32,
 }
@@ -1230,6 +1262,10 @@ fn orchard_action_to_napi(a: zcash_crypto::parse::ParsedOrchardAction) -> PcztOr
         rcv: bytes_to_napi(a.rcv.to_vec()),
         user_address: a.user_address,
         user_address_receivers: receivers_to_napi(a.user_address_receivers),
+        output_zip32_derivation: a.output_derivation.map(|d| PcztZip32Derivation {
+            path: d.signing_path,
+            seed_fingerprint: bytes_to_napi(d.seed_fingerprint.to_vec()),
+        }),
     }
 }
 
@@ -1270,6 +1306,7 @@ fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> Pczt
         rcv,
         user_address,
         user_address_receivers,
+        output_zip32_derivation,
     } = orchard_action_to_napi(a.action);
 
     PcztIronwoodAction {
@@ -1293,6 +1330,7 @@ fn ironwood_action_to_napi(a: zcash_crypto::parse::ParsedIronwoodAction) -> Pczt
         rcv,
         user_address,
         user_address_receivers,
+        output_zip32_derivation,
         note_plaintext_version,
     }
 }
@@ -1528,7 +1566,11 @@ pub async fn test_sign_pczt(
         let transparent_signatures =
             zcash_crypto::testing::sign_pczt_transparent_inputs(&pczt_bytes, &seed, network)?;
 
-        Ok((orchard_signatures, ironwood_signatures, transparent_signatures))
+        Ok((
+            orchard_signatures,
+            ironwood_signatures,
+            transparent_signatures,
+        ))
     })
     .await
     .map_err(|e| {
@@ -2122,6 +2164,7 @@ mod tests {
             rcv: [0x0fu8; 32],
             user_address: None,
             user_address_receivers: None,
+            output_derivation: None,
         }
     }
 
@@ -2318,6 +2361,47 @@ mod tests {
         assert_eq!(a.value, "222222", "value");
         assert_eq!(a.rseed.to_vec(), vec![0x0eu8; 32], "rseed");
         assert_eq!(a.rcv.to_vec(), vec![0x0fu8; 32], "rcv");
+    }
+
+    fn declared_orchard_action() -> ParsedOrchardAction {
+        let mut a = make_parsed_orchard_action();
+        a.output_derivation = Some(zcash_crypto::parse::ParsedZip32Derivation {
+            signing_path: "32'/133'/1'".to_string(),
+            seed_fingerprint: [0x31u8; 32],
+        });
+        a
+    }
+
+    #[test]
+    fn orchard_action_maps_the_output_derivation() {
+        let declared = orchard_action_to_napi(declared_orchard_action());
+        let d = declared
+            .output_zip32_derivation
+            .expect("a declared output must map to outputZip32Derivation");
+        assert_eq!(d.path, "32'/133'/1'");
+        assert_eq!(d.seed_fingerprint.to_vec(), vec![0x31u8; 32]);
+
+        let undeclared = orchard_action_to_napi(make_parsed_orchard_action());
+        assert!(undeclared.output_zip32_derivation.is_none());
+    }
+
+    #[test]
+    fn ironwood_action_maps_the_output_derivation() {
+        let declared = ironwood_action_to_napi(zcash_crypto::parse::ParsedIronwoodAction {
+            action: declared_orchard_action(),
+            note_plaintext_version: 3,
+        });
+        let d = declared
+            .output_zip32_derivation
+            .expect("a declared output must map to outputZip32Derivation");
+        assert_eq!(d.path, "32'/133'/1'");
+        assert_eq!(d.seed_fingerprint.to_vec(), vec![0x31u8; 32]);
+
+        let undeclared = ironwood_action_to_napi(zcash_crypto::parse::ParsedIronwoodAction {
+            action: make_parsed_orchard_action(),
+            note_plaintext_version: 3,
+        });
+        assert!(undeclared.output_zip32_derivation.is_none());
     }
 
     #[test]

@@ -188,7 +188,9 @@ const pczt: PcztTransaction = parsePczt(pcztHex);
 //                             userAddress?, userAddressReceivers?
 // pczt.orchardBundle        — actions[], flags, valueBalance (string), anchor
 //                             (null when there are no Orchard actions); each
-//                             action also has userAddress?, userAddressReceivers?
+//                             action also has userAddress?, userAddressReceivers?,
+//                             and outputZip32Derivation? when its output pays
+//                             another account of the same seed
 // pczt.ironwoodBundle       — same shape, plus each action's
 //                             notePlaintextVersion. Always null below tx
 //                             version 6 — the Ironwood pool is V6-only.
