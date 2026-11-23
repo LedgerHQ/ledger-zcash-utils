@@ -6423,38 +6423,40 @@ mod tests {
             .all(|a| a.action.output_derivation.is_none()));
     }
 
-    /// The declaration is signer metadata: stamping it onto a built PCZT leaves
-    /// the bytes different but the shielded sighash (hence the txid) unchanged.
+    /// The declaration is signer metadata: stamping it onto a built PCZT changes
+    /// the bytes but leaves the transaction id and every signature hash unchanged,
+    /// in both pools.
     #[test]
-    fn declaring_an_output_account_does_not_change_the_sighash() {
-        use pczt::roles::signer::Signer;
+    fn declaring_an_output_account_keeps_the_txid_and_sighashes() {
+        let declared =
+            declared_recipients([(&other_account_recipient(), Some(1u32))].into_iter()).unwrap();
+        let network: AnyZcashNetwork = Network::MainNetwork.into();
 
         let out = build_transaction(orchard_inputs_paying_account(Network::MainNetwork, None))
             .expect("build must succeed");
-        let sighash_before = Signer::new(Pczt::parse(&out.pczt_bytes).unwrap())
-            .expect("signer")
-            .shielded_sighash();
-
-        let declared =
-            declared_recipients([(&other_account_recipient(), Some(1u32))].into_iter()).unwrap();
-        let stamped = stamp_output_derivations(
-            Pczt::parse(&out.pczt_bytes).unwrap(),
-            &Network::MainNetwork.into(),
-            [0x42; 32],
-            &declared,
-        )
-        .expect("stamping must succeed");
-        let unstamped_bytes = Pczt::parse(&out.pczt_bytes).unwrap().serialize().unwrap();
-        let stamped_bytes = Pczt::parse(&stamped.clone().serialize().unwrap())
-            .unwrap()
-            .serialize()
-            .unwrap();
+        let bare = Pczt::parse(&out.pczt_bytes).unwrap();
+        let stamped = stamp_output_derivations(bare.clone(), &network, [0x42; 32], &declared)
+            .expect("stamping must succeed");
         assert_ne!(
-            stamped_bytes, unstamped_bytes,
-            "the declaration must be written into the PCZT"
+            stamped.clone().serialize().unwrap(),
+            bare.clone().serialize().unwrap(),
+            "the declaration must be written into the Orchard PCZT"
         );
-        let sighash_after = Signer::new(stamped).expect("signer").shielded_sighash();
-        assert_eq!(sighash_before, sighash_after);
+        assert_eq!(digests(bare), digests(stamped));
+
+        let out =
+            build_ironwood_transaction(ironwood_inputs_paying_account(Network::MainNetwork, None))
+                .expect("build must succeed");
+        let bare = Pczt::parse(&out.pczt_bytes).unwrap();
+        let stamped =
+            stamp_ironwood_output_derivations(bare.clone(), &network, [0x42; 32], &declared)
+                .expect("stamping must succeed");
+        assert_ne!(
+            stamped.clone().serialize().unwrap(),
+            bare.clone().serialize().unwrap(),
+            "the declaration must be written into the Ironwood PCZT"
+        );
+        assert_eq!(digests(bare), digests(stamped));
     }
 
     #[test]
@@ -6505,6 +6507,14 @@ mod tests {
             .unwrap_err(),
         );
         assert!(msg.contains("hardened range"));
+        let msg = craft_error_message(
+            build_ironwood_transaction(ironwood_inputs_paying_account(
+                Network::MainNetwork,
+                Some(1 << 31),
+            ))
+            .unwrap_err(),
+        );
+        assert!(msg.contains("hardened range"));
     }
 
     #[test]
@@ -6540,6 +6550,52 @@ mod tests {
             [(&recipient, Some(1u32)), (&recipient, Some(1u32))].into_iter()
         )
         .is_ok());
+    }
+
+    /// Two outputs to one recipient that name the same account are both stamped,
+    /// in both pools. The payment is split so the fee and the spent note stay the same.
+    #[test]
+    fn two_outputs_to_one_recipient_with_the_same_account_are_both_declared() {
+        let recipient = other_account_recipient().to_raw_address_bytes();
+
+        let mut inputs = orchard_inputs_paying_account(Network::MainNetwork, Some(1));
+        inputs.outputs[0].value /= 2;
+        inputs.outputs.push(inputs.outputs[0].clone());
+        let out = build_transaction(inputs).expect("build must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        let declared: Vec<_> = parsed
+            .orchard_bundle
+            .expect("orchard bundle")
+            .actions
+            .into_iter()
+            .filter(|a| a.recipient == recipient)
+            .map(|a| {
+                a.output_derivation
+                    .expect("each payment is declared")
+                    .signing_path
+            })
+            .collect();
+        assert_eq!(declared, ["32'/133'/1'", "32'/133'/1'"]);
+
+        let mut inputs = ironwood_inputs_paying_account(Network::MainNetwork, Some(1));
+        inputs.outputs[0].value /= 2;
+        inputs.outputs.push(inputs.outputs[0].clone());
+        let out = build_ironwood_transaction(inputs).expect("build must succeed");
+        let parsed = crate::parse::parse_pczt(&out.pczt_bytes).expect("parse_pczt must succeed");
+        let declared: Vec<_> = parsed
+            .ironwood_bundle
+            .expect("ironwood bundle")
+            .actions
+            .into_iter()
+            .filter(|a| a.action.recipient == recipient)
+            .map(|a| {
+                a.action
+                    .output_derivation
+                    .expect("each payment is declared")
+                    .signing_path
+            })
+            .collect();
+        assert_eq!(declared, ["32'/133'/1'", "32'/133'/1'"]);
     }
 
     /// Both actions pay one recipient, so a declaration on one would be stamped
