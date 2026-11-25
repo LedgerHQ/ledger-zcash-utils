@@ -18,6 +18,34 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Not applied to streaming RPCs (GetBlockRange) — those run until completion.
 pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Root certificates for the TLS handshake.
+///
+/// Mobile cannot use the native trust store. `rustls-native-certs` reads
+/// `/etc/ssl/certs` on Unix, which does not exist on Android (its CAs live in
+/// `/system/etc/security/cacerts`), and tonic treats an empty native store as a
+/// hard error before it would consider the bundled roots, so
+/// `with_enabled_roots()` fails outright instead of falling back. Observed on
+/// an Android emulator as "TLS config failed".
+///
+/// Mobile therefore gets the bundled Mozilla root store, and desktop keeps
+/// following the OS trust store, which lets an enterprise or user-installed CA
+/// work there.
+///
+/// iOS takes the bundled roots on the same reasoning (it has no
+/// `/etc/ssl/certs` either). That has not been exercised on an iOS build yet.
+fn tls_config() -> tonic::transport::ClientTlsConfig {
+    let config = tonic::transport::ClientTlsConfig::new();
+
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        config.with_webpki_roots()
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        config.with_enabled_roots()
+    }
+}
+
 /// Establish a gRPC channel to a lightwalletd / Zaino endpoint.
 ///
 /// TLS is applied automatically for `https://` URLs. Plaintext is used for
@@ -37,7 +65,7 @@ pub async fn connect(grpc_url: &str) -> Result<Channel> {
 
     let channel = if grpc_url.starts_with("https://") {
         endpoint
-            .tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+            .tls_config(tls_config())
             .map_err(|e| anyhow!("TLS config failed: {}", e))?
             .connect()
             .await

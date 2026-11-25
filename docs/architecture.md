@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository is a Cargo workspace that provides Zcash cryptographic operations across multiple targets: Node.js/Electron (napi-rs) and a standalone CLI.
+This repository is a Cargo workspace that provides Zcash cryptographic operations across multiple targets: Node.js/Electron (napi-rs), iOS and Android (C ABI and JNI), and a standalone CLI.
 
 ## Crate dependency graph
 
@@ -12,6 +12,7 @@ zcash-crypto   (pure logic, no FFI, no network I/O)
     └── zcash-sync          (async sync engine — tonic + tokio)
             │
             ├── zcash-ffi-node   (Node.js/Electron — napi-rs cdylib)
+            ├── zcash-ffi-mobile (iOS/Android — C ABI + JNI, read path)
             └── zcash-cli        (CLI binary — clap)
 ```
 
@@ -44,6 +45,10 @@ Thin napi-rs `cdylib` wrapper. Exports to JavaScript:
 - `getChainTip(grpcUrl)` — chain tip query
 - `TransactionStream` class — async iterator (`next()`) + statistics (`stats()`)
 
+### `zcash-ffi-mobile` — iOS/Android binding
+
+A `staticlib` (iOS), `cdylib` (Android) and `lib` (so `cargo test` can link). It exposes the read path of `zcash-ffi-node` — `getChainTip`, `findBlockHeight`, `startSync`, `orchardAddressFromUfvk` and `transactionDetails` — as `extern "C"` functions, with structured arguments and results as JSON in the shapes of `index.d.ts`. The write path is not bound yet. See [`ffi-mobile.md`](ffi-mobile.md).
+
 ### `zcash-cli` — CLI binary
 
 `clap`-based binary with three subcommands:
@@ -68,6 +73,7 @@ Example: adding an "craft Orchard transaction" function.
 4. Add a CLI subcommand in `zcash-cli/src/main.rs` — unless the feature is device-coupled (see exception below), in which case justify the omission here.
 5. Write tests in `zcash-crypto` (inline or in `tests/`).
 6. Update `docs/` as needed.
+7. Classify the new NAPI export in `zcash-ffi-mobile/tests/parity.rs` as read path, write path (pending) or test only. A read-path export must get its mobile counterpart (C function, header prototype, `READ_PATH_EXPORTS` entry) in the same change. The parity test fails on an unclassified export, on a read-path export with no counterpart, and on a JSON shape that drifts from `index.d.ts`.
 
 The CLI is a developer/debugging surface for self-contained operations (key derivation, chain queries, block scanning). It is not required for every feature. A feature may skip step 4 when a standalone CLI invocation cannot produce a useful result on its own — document the reason inline as below.
 

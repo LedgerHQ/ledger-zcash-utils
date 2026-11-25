@@ -1,0 +1,6 @@
+// Makes the XCFramework importable as a Clang module, so the header is usable
+// from Swift (`import ZcashFfiMobile`) as well as from the C++ JSI shim.
+module ZcashFfiMobile {
+    header "zcash_ffi_mobile.h"
+    export *
+}

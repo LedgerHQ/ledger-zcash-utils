@@ -1,0 +1,45 @@
+[package]
+name = "zcash-ffi-mobile"
+version = "0.1.0"
+edition = "2021"
+description = "iOS (C ABI) and Android (JNI) binding of the Zcash read path: chain queries, block scanning and transaction details"
+license.workspace = true
+
+[lib]
+name = "zcash_ffi_mobile"
+# `lib` is deliberate and load-bearing, not redundant with the other two:
+#   - staticlib -> libzcash_ffi_mobile.a, linked into the iOS .xcframework
+#   - cdylib    -> libzcash_ffi_mobile.so, packaged per Android ABI
+#   - lib       -> the rlib `cargo test` needs to link a test harness against.
+# Without `lib`, this crate would be untestable the same way `zcash-ffi-node` is
+# (see its Cargo.toml: `test = false`, because napi symbols come from the Node
+# host at runtime). A pure C ABI has no host-supplied symbols, so tests do run here.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+# No `multicore`: it only affects Halo2 proving, which the read path never does, and
+# zcash-crypto keeps it off for phones. docs/ffi-mobile.md records the choice and CI
+# fails if it changes by accident.
+zcash-crypto = { path = "../zcash-crypto" }
+zcash-sync   = { path = "../zcash-sync" }
+tokio        = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+
+# Android only. The JVM cannot call the C ABI, so `jni` provides the types for the
+# JNI-shaped entry points. Target-gated so no other platform, and no host test
+# build, links it.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }
+
+[dev-dependencies]
+# TcpListener for the mock gRPC endpoint.
+tokio                = { workspace = true, features = ["net"] }
+tonic                = { workspace = true }
+tonic-prost          = { workspace = true }
+hex                  = { workspace = true }
+futures              = { workspace = true }
+# Proto message types served by the mock endpoint.
+zcash_client_backend = { workspace = true, features = ["lightwalletd-tonic"] }
+zcash_protocol       = { workspace = true }

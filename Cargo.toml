@@ -4,6 +4,7 @@ members = [
     "crates/zcash-crypto",
     "crates/zcash-sync",
     "crates/zcash-ffi-node",
+    "crates/zcash-ffi-mobile",
     "crates/zcash-cli",
 ]
 default-members = ["crates/zcash-crypto"]
@@ -55,6 +56,8 @@ tonic = { version = "0.14", features = ["codegen", "transport", "tls-native-root
 # FFI
 napi         = { version = "2.16", features = ["async"] }
 napi-derive  = "2.16"
+# Android-only JNI binding of zcash-ffi-mobile (the JVM cannot call a C ABI directly).
+jni          = "0.22"
 
 # Key derivation
 bip39     = "2"
@@ -104,8 +107,25 @@ clap       = { version = "4", features = ["derive"] }
 
 # Test utilities (dev-only)
 assert_cmd = "2"
+# Server-side prost codec for the mock gRPC endpoint in the zcash-ffi-mobile tests;
+# same line as the dev-dependency in zcash-sync.
+tonic-prost = "0.14"
 
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
+
+# Mobile static/shared libraries MUST NOT use LTO.
+#
+# With `lto = true` rustc emits LLVM bitcode into the archive instead of native
+# object code. A bitcode archive built by a recent rustc is unreadable by Xcode's
+# linker (`Unknown attribute kind`), so `nm` cannot list the exported symbols and
+# the iOS link step cannot consume the archive. With `lto = false` the archive
+# holds native objects and exports its symbols.
+#
+# A separate profile keeps LTO for the Node and CLI release builds.
+# Build mobile artifacts with: cargo build --profile mobile --target <ios|android>
+[profile.mobile]
+inherits = "release"
+lto = false
