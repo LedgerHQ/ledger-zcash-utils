@@ -18,6 +18,7 @@ See [`docs/build-targets.md`](docs/build-targets.md) for prerequisites and detai
 zcash-crypto     Pure cryptographic logic (key derivation, trial/full decryption)
 zcash-sync       Async sync engine (lightwalletd / Zaino)
 zcash-ffi-node   Node.js / Electron native addon (napi-rs)
+zcash-ffi-mobile iOS / Android binding of the read path (C ABI + JNI)
 zcash-cli        CLI binary (ledger-zcash-cli)
 ```
 
@@ -82,6 +83,7 @@ pnpm format:check
 - [`docs/key-derivation.md`](docs/key-derivation.md) — BIP-39 → UFVK pipeline
 - [`docs/block-sync.md`](docs/block-sync.md) — gRPC trial + full decryption
 - [`docs/ffi-node.md`](docs/ffi-node.md) — Node.js/Electron integration
+- [`docs/ffi-mobile.md`](docs/ffi-mobile.md) — iOS/Android integration
 - [`docs/build-targets.md`](docs/build-targets.md) — build scripts reference
 
 ## Contributing workflow
@@ -96,7 +98,7 @@ release/2.2.0                          # version bump
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) — `type(scope): subject`. No CI check validates the format: it holds by review, so match the surrounding history (`git log --oneline`) when in doubt.
 
-`type` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, or `release` for a version bump. `scope` is optional and names either a crate (`zcash-crypto`, `zcash-sync`, `zcash-ffi-node`, `zcash-cli`) or the area touched (`craft`, `broadcast`, `ironwood`, `ci`, `deps`). The subject is lowercase and imperative with no trailing period, and the body carries why the change is needed and what it implies — the reasoning a diff cannot show, which most non-trivial commits here do have.
+`type` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, or `release` for a version bump. `scope` is optional and names either a crate (`zcash-crypto`, `zcash-sync`, `zcash-ffi-node`, `zcash-ffi-mobile`, `zcash-cli`) or the area touched (`craft`, `broadcast`, `ironwood`, `ci`, `deps`). The subject is lowercase and imperative with no trailing period, and the body carries why the change is needed and what it implies — the reasoning a diff cannot show, which most non-trivial commits here do have.
 
 ```
 fix(craft): reject a build with no account key up front
